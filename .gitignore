@@ -1,4 +1,13 @@
+# Zig build output
 zig-out/
 .zig-cache/
-token
+
+# Local secrets / runtime state
+/token
+/token.*
+.env
+.env.*
 *.log
+
+# OS noise
+.DS_Store

@@ -2,23 +2,69 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - name: Install Zig 0.16.0
         run: |
           set -euo pipefail
+          ZIG_VERSION=0.16.0
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".shasum')
           mkdir -p "$RUNNER_TEMP/zig"
-          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
       - name: Check formatting
-        run: zig fmt --check build.zig src/main.zig
+        run: zig fmt --check .
+
       - name: Unit tests
         run: zig build test
+
       - name: Release build
         run: zig build -Doptimize=ReleaseSafe
+
+      - name: Smoke test (auth gate + initialize)
+        run: |
+          set -euo pipefail
+          TOKEN_FILE=$RUNNER_TEMP/mcp-node-ci-token
+          printf 'ci-test-token' > "$TOKEN_FILE"
+          MCP_NODE_TOKEN_FILE=$TOKEN_FILE ./zig-out/bin/mcp-node &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -s -o /dev/null http://127.0.0.1:8341/mcp && break || sleep 0.1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8341/mcp \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}')
+          test "$code" = "401"
+          body=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'x-node-token: ci-test-token' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
+          echo "$body" | grep -q '"protocolVersion":"2025-11-25"'
+          echo "$body" | grep -q '"name":"mcp-node"'
+
+      - name: Upload ReleaseSafe binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-node-linux-x86_64
+          path: zig-out/bin/mcp-node
+          retention-days: 7

@@ -11,7 +11,6 @@ const Value = std.json.Value;
 pub const keep_sigpipe = false;
 
 const VERSION = "0.1.0";
-const DEFAULT_MAX_OUT: usize = 400_000;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 const Config = struct {
@@ -355,7 +354,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     const hosts_s = getEnv(arena, io, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
     const origins_s = getEnv(arena, io, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
     return .{
-        .name = tokenName(arena, name),
+        .name = name,
         .host = try arena.dupe(u8, host),
         .port = port,
         .token = try arena.dupe(u8, token),
@@ -367,11 +366,6 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .max_sessions = max_sessions,
         .session_ttl_s = session_ttl,
     };
-}
-
-fn tokenName(arena: Allocator, name: []const u8) []const u8 {
-    _ = arena;
-    return name;
 }
 
 fn getEnv(arena: Allocator, io: Io, key: []const u8) ?[]const u8 {
@@ -1421,7 +1415,7 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
         } else |_| {}
         try items.append(arena, .{ .name = try arena.dupe(u8, entry.name), .kind = kind, .size = size, .mtime = mtime });
     }
-    // Match Python's sorted-by-name listing.
+    // Sort by name: listings must be deterministic across calls.
     std.mem.sort(Item, items.items, {}, struct {
         fn lt(_: void, a: Item, b: Item) bool {
             return std.mem.order(u8, a.name, b.name) == .lt;
@@ -1627,7 +1621,7 @@ fn appendHexLower(out: *std.ArrayList(u8), arena: Allocator, bytes: []const u8) 
 }
 
 fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
-    // Match Python's Path.expanduser() for the common "~/x" and bare "~" forms.
+    // Expand "~" and "~/x" to $HOME; leave "~user" and everything else untouched.
     if (path.len == 0 or path[0] != '~') return path;
     if (path.len > 1 and path[1] != '/') return path; // "~user" unsupported
     const home = getEnv(arena, io, "HOME") orelse return path;
@@ -1659,9 +1653,8 @@ fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
     if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
     const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
     if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
-    // Disable Nagle: the 100-continue path writes twice per request, and the
-    // second write would otherwise stall until the first segment is ACKed
-    // (~1 RTT through a tunnel). Single-write responses are unaffected.
+    // Disable Nagle: the 100-continue path writes two segments per request;
+    // without TCP_NODELAY the second stalls until the first is ACKed (~1 RTT).
     const one = std.mem.asBytes(&@as(c_int, 1));
     const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
     if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
