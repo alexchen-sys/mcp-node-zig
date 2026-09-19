@@ -17,6 +17,7 @@ const Config = struct {
     allowed_origins: [][]const u8,
     max_out: usize,
     socket_timeout_s: u16,
+    max_conn: u16,
 };
 
 const Request = struct {
@@ -27,12 +28,41 @@ const Request = struct {
     content_type: ?[]const u8,
     content_length: usize,
     token: ?[]const u8,
+    connection: ?[]const u8,
     body: []const u8,
 };
 
 const RpcResponse = struct {
     status: u16,
     body: []const u8,
+};
+
+const ConnGate = struct {
+    mutex: std.Io.Mutex = .init,
+    io: Io,
+    active: u32 = 0,
+    max: u32,
+
+    fn tryAcquire(self: *ConnGate) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.active >= self.max) return false;
+        self.active += 1;
+        return true;
+    }
+
+    fn release(self: *ConnGate) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.active -= 1;
+    }
+};
+
+const Connection = struct {
+    io: Io,
+    cfg: *const Config,
+    gate: *ConnGate,
+    stream: Io.net.Stream,
 };
 
 pub fn main() !void {
@@ -46,6 +76,7 @@ pub fn main() !void {
     const io = threaded.io();
 
     const cfg = try loadConfig(arena, io);
+    var gate = ConnGate{ .io = io, .max = cfg.max_conn };
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -57,11 +88,45 @@ pub fn main() !void {
             std.debug.print("accept failed: {s}\n", .{@errorName(err)});
             continue;
         };
-        handleConnection(arena, io, &cfg, &stream) catch |err| {
-            std.debug.print("connection failed: {s}\n", .{@errorName(err)});
+        if (!gate.tryAcquire()) {
+            rejectBusy(io, &stream);
+            continue;
+        }
+        const conn = std.heap.page_allocator.create(Connection) catch {
+            gate.release();
+            stream.close(io);
+            continue;
         };
-        stream.close(io);
+        conn.* = .{ .io = io, .cfg = &cfg, .gate = &gate, .stream = stream };
+        const thread = std.Thread.spawn(.{}, connectionThread, .{conn}) catch {
+            gate.release();
+            stream.close(io);
+            std.heap.page_allocator.destroy(conn);
+            continue;
+        };
+        thread.detach();
     }
+}
+
+fn connectionThread(conn: *Connection) void {
+    defer std.heap.page_allocator.destroy(conn);
+    defer conn.gate.release();
+    defer conn.stream.close(conn.io);
+
+    while (true) {
+        const keep = serveOneRequest(conn.io, conn.cfg, &conn.stream) catch |err| {
+            std.debug.print("connection failed: {s}\n", .{@errorName(err)});
+            break;
+        };
+        if (!keep) break;
+    }
+}
+
+fn rejectBusy(io: Io, stream: *Io.net.Stream) void {
+    var buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    sendHttpError(fba.allocator(), stream.socket.handle, 503, "busy", "too many connections") catch {};
+    stream.close(io);
 }
 
 fn logLine(msg: []const u8, host: []const u8, port: u16) void {
@@ -80,6 +145,9 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     const socket_timeout_s = getEnv(arena, io, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
     var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
     if (socket_timeout == 0) socket_timeout = 60;
+    const max_conn_s = getEnv(arena, io, "MCP_NODE_MAX_CONN") orelse "128";
+    var max_conn = try std.fmt.parseInt(u16, max_conn_s, 10);
+    if (max_conn == 0) max_conn = 128;
 
     const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = readFileAllocMaybe(arena, io, token_path, 4096) catch |err| switch (err) {
@@ -107,6 +175,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .allowed_origins = try splitCsv(arena, origins_s),
         .max_out = max_out,
         .socket_timeout_s = socket_timeout,
+        .max_conn = max_conn,
     };
 }
 
@@ -164,8 +233,8 @@ fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
     return list.toOwnedSlice(arena);
 }
 
-fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.net.Stream) !void {
-    var req_arena_state = std.heap.ArenaAllocator.init(arena);
+fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
+    var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
 
@@ -178,17 +247,17 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
             error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
             else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
         }
-        return;
+        return false;
     };
 
     if (!hostAllowed(req.host, cfg.allowed_hosts)) {
         try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header");
-        return;
+        return false;
     }
     if (req.origin) |origin| {
         if (!originAllowed(origin, cfg.allowed_origins)) {
             try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header");
-            return;
+            return false;
         }
     }
     if (cfg.token.len != 0) {
@@ -199,29 +268,31 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
         std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
         if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
             try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized");
-            return;
+            return false;
         }
     }
     if (!std.mem.eql(u8, req.path, "/mcp")) {
         try sendHttpError(ra, fd, 404, "not_found", "not found");
-        return;
+        return false;
     }
     if (!std.mem.eql(u8, req.method, "POST")) {
         try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed");
-        return;
+        return false;
     }
     if (req.content_type) |ct| {
         if (!std.mem.startsWith(u8, ct, "application/json")) {
             try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
-            return;
+            return false;
         }
     } else {
         try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
-        return;
+        return false;
     }
 
+    const keep_alive = !connectionCloseRequested(req.connection);
     const rpc = try handleRpc(ra, io, cfg, req.body);
-    try sendHttpRaw(ra, fd, rpc.status, "application/json", rpc.body);
+    try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive);
+    return keep_alive;
 }
 
 fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
@@ -276,6 +347,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         .content_type = null,
         .content_length = content_length,
         .token = null,
+        .connection = null,
         .body = body,
     };
     while (lines.next()) |line| {
@@ -287,6 +359,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
         if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
         if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
+        if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
     }
     return req;
 }
@@ -330,6 +403,15 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
+}
+
+fn connectionCloseRequested(connection: ?[]const u8) bool {
+    const raw = connection orelse return false;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        if (asciiEqlIgnoreCase(std.mem.trim(u8, part, " \t"), "close")) return true;
+    }
+    return false;
 }
 
 fn hostAllowed(host_opt: ?[]const u8, allowed: [][]const u8) bool {
@@ -943,6 +1025,10 @@ fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
 }
 
 fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8) !void {
+    try sendHttpRawMode(arena, fd, status, content_type, body, false);
+}
+
+fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool) !void {
     var out: std.ArrayList(u8) = .empty;
     const reason = switch (status) {
         200 => "OK",
@@ -956,9 +1042,11 @@ fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: 
         415 => "Unsupported Media Type",
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         else => "OK",
     };
-    try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ status, reason, content_type, body.len });
+    const connection = if (keep_alive) "keep-alive" else "close";
+    try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ status, reason, content_type, body.len, connection });
     try out.appendSlice(arena, body);
     try writeAllFd(fd, out.items);
 }
@@ -1036,6 +1124,14 @@ test "origin allowlist supports exact and wildcard-port patterns" {
     try std.testing.expect(!originAllowed("https://evil.example", allowed));
 }
 
+test "connection close header parsing" {
+    try std.testing.expect(connectionCloseRequested("close"));
+    try std.testing.expect(connectionCloseRequested(" Close "));
+    try std.testing.expect(connectionCloseRequested("keep-alive, close"));
+    try std.testing.expect(!connectionCloseRequested(null));
+    try std.testing.expect(!connectionCloseRequested("keep-alive"));
+}
+
 test "rpc parse error and notification semantics" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1050,6 +1146,7 @@ test "rpc parse error and notification semantics" {
         .allowed_origins = try splitCsv(arena, "http://127.0.0.1:*"),
         .max_out = 1024,
         .socket_timeout_s = 1,
+        .max_conn = 4,
     };
 
     const bad = try handleRpc(arena, io, &cfg, "{");
