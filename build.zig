@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -9,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // Single source of truth for the version string is build.zig.zon;
+    // inject it so main.zig never carries a second copy.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", zon.version);
+    root.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "mcp-node",

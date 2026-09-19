@@ -1,5 +1,8 @@
 # mcp-node-zig
 
+[![ci](https://github.com/alexchen-sys/mcp-node-zig/actions/workflows/ci.yml/badge.svg)](https://github.com/alexchen-sys/mcp-node-zig/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A tiny, self-contained MCP node for remote machine operations, written in Zig.
 
 It exposes a single streamable-HTTP JSON-RPC endpoint (`POST /mcp`) with a fixed set of practical tools:
@@ -18,7 +21,11 @@ It exposes a single streamable-HTTP JSON-RPC endpoint (`POST /mcp`) with a fixed
 - `write_file` — base64 write with mkdirs and SHA-256 receipt
 - `list_dir` — directory listing with type/size/mtime, sorted by name
 
+Full input schemas are introspectable at runtime via `tools/list`.
+
 The design goal is a small trusted edge agent: static binary, explicit token auth, explicit Host allowlist, no framework sprawl.
+
+[Build](#build) • [Run](#run) • [Client setup](#mcp-client-setup) • [Examples](#examples) • [Troubleshooting](#troubleshooting)
 
 ## Status
 
@@ -29,11 +36,15 @@ Early `0.1.0`; the contract may evolve.
 Requires Zig 0.16.x. Linux only (uses `/proc` and POSIX process groups).
 
 ```sh
+git clone https://github.com/alexchen-sys/mcp-node-zig
+cd mcp-node-zig
 zig build test
 zig build -Doptimize=ReleaseSafe
 ```
 
 Binary: `zig-out/bin/mcp-node` (statically linked, no libc).
+
+There are no prebuilt releases yet; the build above takes seconds and yields a single static binary.
 
 ## Run
 
@@ -59,7 +70,36 @@ Configuration is environment-only:
 
 Auth header: `X-Node-Token: <token>`.
 
-## Example
+## MCP client setup
+
+The server speaks streamable HTTP with a token header, so any MCP client with HTTP transport support can attach:
+
+```sh
+claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
+  --header "X-Node-Token: $(cat token)"
+```
+
+Equivalent JSON (Claude Code, or any client that supports HTTP servers with headers):
+
+```json
+{
+  "mcpServers": {
+    "mcp-node": {
+      "type": "http",
+      "url": "http://127.0.0.1:8341/mcp",
+      "headers": {
+        "X-Node-Token": "<token>"
+      }
+    }
+  }
+}
+```
+
+Clients that only speak stdio need a bridge (e.g. `mcp-remote`) in front of this endpoint.
+
+## Examples
+
+One-shot call:
 
 ```sh
 curl -sS http://127.0.0.1:8341/mcp \
@@ -67,6 +107,37 @@ curl -sS http://127.0.0.1:8341/mcp \
   -H 'Accept: application/json' \
   -H "X-Node-Token: $(cat token)" \
   --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"argv":["uname","-a"]}}}'
+```
+
+Long-running work goes through sessions. With a small helper to keep the tour readable:
+
+```sh
+mcp() {
+  curl -sS http://127.0.0.1:8341/mcp \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json' \
+    -H "X-Node-Token: $(cat token)" \
+    --data "$1"
+}
+```
+
+Start a session; the reply carries an integer `session_id`:
+
+```sh
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_start","arguments":{"argv":["bash","-c","for i in 1 2 3; do echo tick$i; sleep 5; done"]}}}'
+```
+
+Block until it exits (or until `timeout` seconds pass), then drain output incrementally — offsets resume where the previous poll left off:
+
+```sh
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_wait","arguments":{"session_id":1,"timeout":30}}}'
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec_poll","arguments":{"session_id":1,"stdout_offset":0,"stderr_offset":0}}}'
+```
+
+Free the session state (`exec_close` is idempotent):
+
+```sh
+mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_close","arguments":{"session_id":1}}}'
 ```
 
 ## Async process sessions
@@ -94,6 +165,12 @@ curl -sS http://127.0.0.1:8341/mcp \
 - Connections are handled one thread per connection, capped by `MCP_NODE_MAX_CONN`; excess connections get HTTP 503.
 - `exec` does not pass through a shell; shell metacharacters are data. `exec_shell` is intentionally one explicit shell layer for pipelines and redirects.
 - `write_file` returns a SHA-256 digest for verification.
+
+## Troubleshooting
+
+- **HTTP 401** — missing or wrong `X-Node-Token`; the server also refuses to start with a missing/empty token file unless `MCP_NODE_INSECURE=1`.
+- **HTTP 421** — the request's `Host` header is not in `MCP_NODE_ALLOWED_HOSTS`; add the `host:port` you actually connect through (anything but loopback needs an explicit entry).
+- **HTTP 403** — an `Origin` header was present (browser-originated call) and is not in `MCP_NODE_ALLOWED_ORIGINS`.
 
 ## License
 

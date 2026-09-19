@@ -4,13 +4,30 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
-// real on two layers: Io.Threaded.init installs an ignore handler for
-// SIGPIPE, and on std versions honoring root's keep_sigpipe this opts out
-// explicitly. Writes to closed pipes surface as EPIPE errors instead.
+/// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
+/// real on two layers: Io.Threaded installs an ignore handler for
+/// SIGPIPE, and on std versions honoring root's keep_sigpipe this opts out
+/// explicitly. Writes to closed pipes surface as EPIPE errors instead.
 pub const keep_sigpipe = false;
 
-const VERSION = "0.1.0";
+const VERSION: []const u8 = @import("build_options").version;
+
+const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
+const IO_BUF_SIZE: usize = 16 * 1024; // shared read scratch: HTTP, session pipes, files
+const LIST_DIR_MAX_ENTRIES: usize = 2000;
+const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
+const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
+const ACCEPT_BACKOFF_NS: u64 = 50_000_000; // 50ms pause after accept failure
+const WAIT_POLL_NS: u64 = 50_000_000; // 50ms exec_wait sleep tick
+const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
+const EXEC_MAX_TIMEOUT_S: i64 = 1800;
+const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
+const WAIT_MAX_TIMEOUT_S: i64 = 300;
+const TOKEN_FILE_MAX_BYTES: usize = 4096;
+const ENVIRON_MAX_BYTES: usize = 1 << 20;
+const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
+const DEFAULT_SESSION_TTL_MS: i64 = 600_000;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 const Config = struct {
@@ -106,7 +123,7 @@ const SessionStore = struct {
     map: std.AutoHashMap(u64, *Session),
     next_id: u64 = 1,
     max: u16,
-    ttl_ms: i64 = 600_000,
+    ttl_ms: i64 = DEFAULT_SESSION_TTL_MS,
 
     fn init(io: Io, max_sessions: u16) SessionStore {
         return .{ .io = io, .map = std.AutoHashMap(u64, *Session).init(std.heap.page_allocator), .max = max_sessions };
@@ -175,7 +192,7 @@ const SessionStore = struct {
         // Sweep sessions that finished more than ttl_ms ago. Removal happens
         // under the lock, joins/frees outside it (victim threads are done or
         // exit within one 100ms reader tick via the closing flag).
-        var victims: [8]*Session = undefined;
+        var victims: [REAP_BATCH_SIZE]*Session = undefined;
         var n: usize = 0;
         {
             self.mutex.lockUncancelable(self.io);
@@ -265,7 +282,7 @@ pub fn main() !void {
     while (true) {
         var stream = server.accept(io) catch |err| {
             std.debug.print("accept failed: {s}\n", .{@errorName(err)});
-            var backoff_ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+            var backoff_ts = std.os.linux.timespec{ .sec = 0, .nsec = ACCEPT_BACKOFF_NS };
             _ = std.os.linux.nanosleep(&backoff_ts, null);
             continue;
         };
@@ -337,7 +354,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     if (session_ttl == 0) session_ttl = 600;
 
     const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = readFileAllocMaybe(arena, io, token_path, 4096) catch |err| switch (err) {
+    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| switch (err) {
         error.FileNotFound => blk: {
             const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
             if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
@@ -369,7 +386,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
 }
 
 fn getEnv(arena: Allocator, io: Io, key: []const u8) ?[]const u8 {
-    const data = readFileAllocMaybe(arena, io, "/proc/self/environ", 1 << 20) catch return null;
+    const data = readFileAllocMaybe(arena, io, "/proc/self/environ", ENVIRON_MAX_BYTES) catch return null;
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len <= key.len) continue;
@@ -382,7 +399,7 @@ fn getEnv(arena: Allocator, io: Io, key: []const u8) ?[]const u8 {
 
 fn loadPosixEnviron(gpa: Allocator) !std.process.Environ {
     if (@import("builtin").os.tag != .linux) return .empty;
-    const data = readFileAllocMaybe(gpa, Io.Threaded.global_single_threaded.io(), "/proc/self/environ", 1 << 20) catch return .empty;
+    const data = readFileAllocMaybe(gpa, Io.Threaded.global_single_threaded.io(), "/proc/self/environ", ENVIRON_MAX_BYTES) catch return .empty;
     if (data.len == 0) return .empty;
     var count: usize = 0;
     var start: usize = 0;
@@ -417,6 +434,10 @@ fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
     return list.toOwnedSlice(arena);
 }
 
+/// Serve one HTTP request on an accepted stream. Returns true while the
+/// connection stays usable (keep-alive), false when the caller must close.
+/// Never fails silently on security gates: host/origin/token rejections are
+/// answered with 421/403/401 before any RPC dispatch happens.
 fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
@@ -432,6 +453,7 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
         switch (err) {
             error.CleanEof => return false,
             error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
+            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large"),
             else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
         }
         return false;
@@ -487,7 +509,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
     var header_end: ?usize = null;
     var content_length: usize = 0;
     var continue_sent = false;
-    var buf: [16384]u8 = undefined;
+    var buf: [IO_BUF_SIZE]u8 = undefined;
     const started = std.Io.Clock.awake.now(io);
     const deadline_ms = @as(u64, timeout_s) * 1000;
 
@@ -505,7 +527,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         try data.appendSlice(arena, buf[0..n]);
         if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
-        if (header_end == null and data.items.len > 64 * 1024) return error.HeadersTooLarge;
+        if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
         if (header_end == null) {
             if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
@@ -631,6 +653,10 @@ fn originAllowed(origin: []const u8, allowed: [][]const u8) bool {
     return false;
 }
 
+/// JSON-RPC 2.0 dispatch for one MCP request body. Returns the HTTP status
+/// plus the serialized response body: transport errors (parse, shape) map to
+/// HTTP 4xx, method-level errors stay inside a 200 JSON-RPC error object.
+/// Notifications (no id, or method "notifications/*") get 202 with empty body.
 fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !RpcResponse {
     const req = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch {
         return .{ .status = 400, .body = try rpcError(arena, Value.null, -32700, "Parse error") };
@@ -815,9 +841,9 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
         argv[i] = item.string;
     }
     const cwd = strArg(args, "cwd") orelse "";
-    var timeout_s = intArg(args, "timeout") orelse 120;
+    var timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
-    if (timeout_s > 1800) timeout_s = 1800;
+    if (timeout_s > EXEC_MAX_TIMEOUT_S) timeout_s = EXEC_MAX_TIMEOUT_S;
     const started = std.Io.Clock.awake.now(io);
     const result = std.process.run(arena, io, .{
         .argv = argv,
@@ -861,7 +887,7 @@ fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     const shell = strArg(args, "shell") orelse "bash";
     if (!std.mem.eql(u8, shell, "bash") and !std.mem.eql(u8, shell, "sh") and !std.mem.eql(u8, shell, "fish") and !std.mem.eql(u8, shell, "zsh")) return error.UnsupportedShell;
     const cwd = strArg(args, "cwd") orelse "";
-    const timeout_s = intArg(args, "timeout") orelse 120;
+    const timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
     var new_args: std.ArrayList(u8) = .empty;
     try new_args.appendSlice(arena, "{\"argv\":[");
     try appendJsonString(&new_args, arena, shell);
@@ -896,14 +922,14 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
-    var buf: [16384]u8 = undefined;
+    var buf: [IO_BUF_SIZE]u8 = undefined;
     while (true) {
         // Poll instead of blind blocking read: exec_close must be able to reap
         // the session even if a grandchild escaped the process group and holds
         // the pipe write-end open forever.
         if (session.closing.load(.acquire)) break;
         var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&pfd, 100) catch break;
+        const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
         if (ready == 0) continue;
         if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
         const n = std.posix.read(fd, &buf) catch break;
@@ -953,6 +979,9 @@ fn sessionRelease(session: *Session) void {
     if (session.refs.fetchSub(1, .acq_rel) == 1) freeSession(session);
 }
 
+/// Resolve session_id to a live Session with +1 ref. Caller MUST balance
+/// with `defer sessionRelease(session)` — the store ref alone does not
+/// protect against concurrent exec_close freeing the session.
 fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const id_i = intArg(args, "session_id") orelse return error.MissingSession;
@@ -960,6 +989,10 @@ fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
     return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
 }
 
+/// Spawn a session process (piped stdio, own process group) and publish it.
+/// Ownership: argv/cwd/stdin_fd transfer to the Session on success; on any
+/// error path the errdefers free them exactly once. The child is always
+/// reaped — either by the session waiter thread or by the error path.
 fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const argv_v = objGet(args, "argv") orelse return error.MissingArgv;
@@ -1157,9 +1190,9 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     defer sessionRelease(session);
     const stdout_offset = intArg(args, "stdout_offset") orelse 0;
     const stderr_offset = intArg(args, "stderr_offset") orelse 0;
-    var timeout_s = intArg(args, "timeout") orelse 30;
+    var timeout_s = intArg(args, "timeout") orelse WAIT_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
-    if (timeout_s > 300) timeout_s = 300;
+    if (timeout_s > WAIT_MAX_TIMEOUT_S) timeout_s = WAIT_MAX_TIMEOUT_S;
     const store = cfg.sessions.?;
     const deadline = nowMs(store.io) + @as(i64, timeout_s) * 1000;
     while (true) {
@@ -1168,7 +1201,7 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
         session.mutex.unlock(store.io);
         if (done) break;
         if (nowMs(store.io) >= deadline) break;
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+        var ts = std.os.linux.timespec{ .sec = 0, .nsec = WAIT_POLL_NS };
         _ = std.os.linux.nanosleep(&ts, null);
     }
     try renderSessionState(arena, store, session, stdout_offset, stderr_offset, out);
@@ -1259,6 +1292,9 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
+/// Idempotent session teardown: kill if running, join all session threads,
+/// drop the store's ref. Safe against concurrent exec_close — the loser of
+/// the removal race reports already_closed and frees nothing.
 fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const store = cfg.sessions orelse return error.SessionsDisabled;
@@ -1327,9 +1363,9 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = cfg;
     const path = try expandPath(arena, io, strArg(args, "path") orelse return error.MissingPath);
     const offset = intArg(args, "offset") orelse 0;
-    const limit = intArg(args, "limit") orelse 200_000;
+    const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
-    const data = readFileAllocMaybe(arena, io, path, 64 * 1024 * 1024) catch |err| switch (err) {
+    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.IsDir => return error.IsDirectory,
         error.StreamTooLong => return error.FileTooLarge,
@@ -1400,7 +1436,7 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
     const Item = struct { name: []const u8, kind: []const u8, size: i64, mtime: i64 };
     var items: std.ArrayList(Item) = .empty;
     while (try it.next(io)) |entry| {
-        if (items.items.len >= 2000) break;
+        if (items.items.len >= LIST_DIR_MAX_ENTRIES) break;
         const kind: []const u8 = switch (entry.kind) {
             .directory => "d",
             .sym_link => "l",
@@ -1634,7 +1670,7 @@ fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) 
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
     defer _ = std.os.linux.close(fd);
     var out: std.ArrayList(u8) = .empty;
-    var buf: [16384]u8 = undefined;
+    var buf: [IO_BUF_SIZE]u8 = undefined;
     while (true) {
         const n = try std.posix.read(fd, &buf);
         if (n == 0) break;
@@ -1692,7 +1728,7 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
-        else => "OK",
+        else => "Unknown",
     };
     const connection = if (keep_alive) "keep-alive" else "close";
     try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ status, reason, content_type, body.len, connection });
