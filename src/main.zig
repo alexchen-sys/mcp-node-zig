@@ -4,8 +4,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
-// std.start ignores SIGPIPE unless the root opts into keeping it; a peer
-// disconnect must never kill the daemon. Declare the policy explicitly.
+// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
+// real on two layers: Io.Threaded.init installs an ignore handler for
+// SIGPIPE, and on std versions honoring root's keep_sigpipe this opts out
+// explicitly. Writes to closed pipes surface as EPIPE errors instead.
 pub const keep_sigpipe = false;
 
 const VERSION = "0.1.0";
@@ -130,7 +132,18 @@ const SessionStore = struct {
                 }
                 if (victim == null) return error.TooManySessions;
             }
-            try self.map.put(session.id, session);
+            self.map.put(session.id, session) catch |err| {
+                // Insert failed after an evict: don't strand the victim. Its
+                // session is done, so these joins return immediately.
+                if (victim) |s| {
+                    s.closing.store(true, .release);
+                    if (s.waiter_thread) |t| t.join();
+                    if (s.stdout_thread) |t| t.join();
+                    if (s.stderr_thread) |t| t.join();
+                    sessionRelease(s);
+                }
+                return err;
+            };
         }
         if (victim) |s| {
             s.closing.store(true, .release);
