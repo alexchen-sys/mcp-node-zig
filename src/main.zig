@@ -30,6 +30,11 @@ const Request = struct {
     body: []const u8,
 };
 
+const RpcResponse = struct {
+    status: u16,
+    body: []const u8,
+};
+
 pub fn main() !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -201,20 +206,16 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
     }
     if (req.content_type) |ct| {
         if (!std.mem.startsWith(u8, ct, "application/json")) {
-            try sendHttpError(ra, fd, 400, "bad_content_type", "Invalid Content-Type header");
+            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
             return;
         }
     } else {
-        try sendHttpError(ra, fd, 400, "bad_content_type", "Invalid Content-Type header");
+        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
         return;
     }
 
-    const response = try handleRpc(ra, io, cfg, req.body);
-    if (response.len == 0) {
-        try sendHttpRaw(ra, fd, 202, "application/json", "");
-    } else {
-        try sendHttpRaw(ra, fd, 200, "application/json", response);
-    }
+    const rpc = try handleRpc(ra, io, cfg, req.body);
+    try sendHttpRaw(ra, fd, rpc.status, "application/json", rpc.body);
 }
 
 fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
@@ -344,27 +345,53 @@ fn originAllowed(origin: []const u8, allowed: [][]const u8) bool {
     return false;
 }
 
-fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) ![]const u8 {
-    const req = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch return error.InvalidJson;
-    if (req != .object) return error.InvalidJson;
-    const id = req.object.get("id") orelse Value.null;
-    const method_v = req.object.get("method") orelse return rpcError(arena, id, -32600, "Invalid Request");
-    if (method_v != .string) return rpcError(arena, id, -32600, "Invalid Request");
-    const method = method_v.string;
-
-    if (std.mem.eql(u8, method, "notifications/initialized")) {
-        return try arena.dupe(u8, "");
+fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !RpcResponse {
+    const req = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch {
+        return .{ .status = 400, .body = try rpcError(arena, Value.null, -32700, "Parse error") };
+    };
+    if (req != .object) {
+        return .{ .status = 400, .body = try rpcError(arena, Value.null, -32600, "Invalid Request") };
     }
+    const id_opt = req.object.get("id");
+    const method_v = req.object.get("method") orelse {
+        return .{ .status = 400, .body = try rpcError(arena, id_opt orelse Value.null, -32600, "Invalid Request") };
+    };
+    if (method_v != .string) {
+        return .{ .status = 400, .body = try rpcError(arena, id_opt orelse Value.null, -32600, "Invalid Request") };
+    }
+    const method = method_v.string;
+    if (id_opt == null or std.mem.startsWith(u8, method, "notifications/")) {
+        return .{ .status = 202, .body = "" };
+    }
+    const id = id_opt.?;
+
     if (std.mem.eql(u8, method, "initialize")) {
+        var protocol_version: []const u8 = "2025-11-25";
+        if (req.object.get("params")) |params| {
+            if (params == .object) {
+                if (params.object.get("protocolVersion")) |pv| {
+                    if (pv == .string and supportedProtocolVersion(pv.string)) protocol_version = pv.string;
+                }
+            }
+        }
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
         try appendJsonValue(&out, arena, id);
-        try out.appendSlice(arena, ",\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":");
+        try out.appendSlice(arena, ",\"result\":{\"protocolVersion\":");
+        try appendJsonString(&out, arena, protocol_version);
+        try out.appendSlice(arena, ",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":");
         try appendJsonString(&out, arena, cfg.name);
         try out.appendSlice(arena, ",\"version\":");
         try appendJsonString(&out, arena, VERSION);
         try out.appendSlice(arena, "}}}");
-        return out.items;
+        return .{ .status = 200, .body = out.items };
+    }
+    if (std.mem.eql(u8, method, "ping")) {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(&out, arena, id);
+        try out.appendSlice(arena, ",\"result\":{}}");
+        return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "tools/list")) {
         var out: std.ArrayList(u8) = .empty;
@@ -373,68 +400,90 @@ fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) ![]
         try out.appendSlice(arena, ",\"result\":");
         try out.appendSlice(arena, TOOLS_JSON);
         try out.appendSlice(arena, "}");
-        return out.items;
+        return .{ .status = 200, .body = out.items };
+    }
+    if (std.mem.eql(u8, method, "resources/list")) {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(&out, arena, id);
+        try out.appendSlice(arena, ",\"result\":{\"resources\":[]}}");
+        return .{ .status = 200, .body = out.items };
+    }
+    if (std.mem.eql(u8, method, "prompts/list")) {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
+        try appendJsonValue(&out, arena, id);
+        try out.appendSlice(arena, ",\"result\":{\"prompts\":[]}}");
+        return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "tools/call")) {
         return handleToolCall(arena, io, cfg, id, req.object.get("params"));
     }
-    return rpcError(arena, id, -32601, "Method not found");
+    return .{ .status = 200, .body = try rpcError(arena, id, -32601, "Method not found") };
 }
 
-fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, params_v: ?Value) ![]const u8 {
-    const params = params_v orelse return rpcError(arena, id, -32602, "Invalid params");
-    if (params != .object) return rpcError(arena, id, -32602, "Invalid params");
-    const name_v = params.object.get("name") orelse return rpcError(arena, id, -32602, "Invalid params");
-    if (name_v != .string) return rpcError(arena, id, -32602, "Invalid params");
+fn supportedProtocolVersion(v: []const u8) bool {
+    return std.mem.eql(u8, v, "2024-11-05") or
+        std.mem.eql(u8, v, "2025-03-26") or
+        std.mem.eql(u8, v, "2025-06-18") or
+        std.mem.eql(u8, v, "2025-11-25");
+}
+
+fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, params_v: ?Value) !RpcResponse {
+    const params = params_v orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
+    if (params != .object) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
+    const name_v = params.object.get("name") orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
+    if (name_v != .string) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     const args = params.object.get("arguments") orelse Value.null;
 
     var payload: std.ArrayList(u8) = .empty;
-    var is_error = false;
     if (std.mem.eql(u8, name_v.string, "exec")) {
-        toolExec(arena, io, cfg, args, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolExec(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "exec_shell")) {
-        toolExecShell(arena, io, cfg, args, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolExecShell(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "sys_info")) {
-        toolSysInfo(arena, io, cfg, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolSysInfo(arena, io, cfg, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "read_file")) {
-        toolReadFile(arena, io, cfg, args, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolReadFile(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "write_file")) {
-        toolWriteFile(arena, io, cfg, args, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolWriteFile(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "list_dir")) {
-        toolListDir(arena, io, cfg, args, &payload) catch |err| {
-            is_error = true;
-            try buildErrorPayload(&payload, arena, @errorName(err));
-        };
+        toolListDir(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else {
-        return rpcError(arena, id, -32602, "Unknown tool");
+        return unknownToolResult(arena, id, name_v.string);
     }
 
+    return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
+}
+
+fn toolEnvelope(arena: Allocator, id: Value, payload: []const u8, is_error: bool, structured: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
     try appendJsonValue(&out, arena, id);
     try out.appendSlice(arena, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
-    try appendJsonString(&out, arena, payload.items);
-    try out.appendSlice(arena, "}],\"structuredContent\":");
-    try out.appendSlice(arena, payload.items);
+    try appendJsonString(&out, arena, payload);
+    try out.appendSlice(arena, "}]");
+    if (structured) {
+        try out.appendSlice(arena, ",\"structuredContent\":");
+        try out.appendSlice(arena, payload);
+    }
     try out.appendSlice(arena, ",\"isError\":");
     try out.appendSlice(arena, if (is_error) "true" else "false");
     try out.appendSlice(arena, "}}");
     return out.items;
+}
+
+fn unknownToolResult(arena: Allocator, id: Value, name: []const u8) !RpcResponse {
+    var msg: std.ArrayList(u8) = .empty;
+    try msg.appendSlice(arena, "Unknown tool: ");
+    try msg.appendSlice(arena, name);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendJsonValue(&out, arena, id);
+    try out.appendSlice(arena, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
+    try appendJsonString(&out, arena, msg.items);
+    try out.appendSlice(arena, "}],\"isError\":true}}");
+    return .{ .status = 200, .body = out.items };
 }
 
 fn rpcError(arena: Allocator, id: Value, code: i32, message: []const u8) ![]const u8 {
@@ -895,6 +944,7 @@ fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: 
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
         else => "OK",
@@ -975,4 +1025,35 @@ test "origin allowlist supports exact and wildcard-port patterns" {
     try std.testing.expect(originAllowed("http://127.0.0.1:8341", allowed));
     try std.testing.expect(originAllowed("https://node.example", allowed));
     try std.testing.expect(!originAllowed("https://evil.example", allowed));
+}
+
+test "rpc parse error and notification semantics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+    };
+
+    const bad = try handleRpc(arena, io, &cfg, "{");
+    try std.testing.expectEqual(@as(u16, 400), bad.status);
+    const bad_parsed = try std.json.parseFromSliceLeaky(Value, arena, bad.body, .{});
+    try std.testing.expectEqual(@as(i32, -32700), bad_parsed.object.get("error").?.object.get("code").?.integer);
+
+    const note = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}");
+    try std.testing.expectEqual(@as(u16, 202), note.status);
+    try std.testing.expectEqual(@as(usize, 0), note.body.len);
+
+    const ping = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}");
+    try std.testing.expectEqual(@as(u16, 200), ping.status);
+    const ping_parsed = try std.json.parseFromSliceLeaky(Value, arena, ping.body, .{});
+    try std.testing.expect(ping_parsed.object.get("result").? == .object);
 }

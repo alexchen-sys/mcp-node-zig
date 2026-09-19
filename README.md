@@ -15,7 +15,7 @@ The design goal is a small trusted edge agent: static binary, explicit token aut
 
 ## Status
 
-Early `0.1.0`. The contract is intentionally narrow: a fixed tool set, explicit auth, and no framework dependencies.
+Early `0.1.0`. The contract is intentionally narrow: a fixed tool set, explicit auth, and no framework dependencies. JSON-RPC parse errors return HTTP 400 with `-32700`; notifications without `id` return HTTP 202 with an empty body; tool domain errors return `{ok:false,...}` with `isError=false`; unknown tools return `isError=true`.
 
 ## Build
 
