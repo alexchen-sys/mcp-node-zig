@@ -16,12 +16,14 @@ const Config = struct {
     allowed_hosts: [][]const u8,
     allowed_origins: [][]const u8,
     max_out: usize,
+    socket_timeout_s: u16,
 };
 
 const Request = struct {
     method: []const u8,
     path: []const u8,
     host: ?[]const u8,
+    origin: ?[]const u8,
     content_type: ?[]const u8,
     content_length: usize,
     token: ?[]const u8,
@@ -70,6 +72,9 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     const port = try std.fmt.parseInt(u16, port_s, 10);
     const max_out_s = getEnv(arena, io, "MCP_NODE_MAX_OUT") orelse "400000";
     const max_out = try std.fmt.parseInt(usize, max_out_s, 10);
+    const socket_timeout_s = getEnv(arena, io, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
+    var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
+    if (socket_timeout == 0) socket_timeout = 60;
 
     const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = readFileAllocMaybe(arena, io, token_path, 4096) catch |err| switch (err) {
@@ -81,6 +86,10 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         else => return err,
     };
     const token = std.mem.trim(u8, token_raw, " \t\r\n");
+    if (token.len == 0) {
+        const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
+        if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
+    }
 
     const hosts_s = getEnv(arena, io, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
     const origins_s = getEnv(arena, io, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
@@ -92,6 +101,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .allowed_hosts = try splitCsv(arena, hosts_s),
         .allowed_origins = try splitCsv(arena, origins_s),
         .max_out = max_out,
+        .socket_timeout_s = socket_timeout,
     };
 }
 
@@ -155,14 +165,24 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
     const ra = req_arena_state.allocator();
 
     const fd = stream.socket.handle;
+    setSocketTimeouts(fd, cfg.socket_timeout_s) catch {};
     const req = readHttpRequest(ra, fd) catch |err| {
-        try sendHttpError(ra, fd, 400, "bad_request", @errorName(err));
+        switch (err) {
+            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
+            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
+        }
         return;
     };
 
     if (!hostAllowed(req.host, cfg.allowed_hosts)) {
         try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header");
         return;
+    }
+    if (req.origin) |origin| {
+        if (!originAllowed(origin, cfg.allowed_origins)) {
+            try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header");
+            return;
+        }
     }
     if (cfg.token.len != 0) {
         const got = req.token orelse "";
@@ -171,8 +191,12 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
             return;
         }
     }
-    if (!std.mem.eql(u8, req.method, "POST") or !std.mem.eql(u8, req.path, "/mcp")) {
+    if (!std.mem.eql(u8, req.path, "/mcp")) {
         try sendHttpError(ra, fd, 404, "not_found", "not found");
+        return;
+    }
+    if (!std.mem.eql(u8, req.method, "POST")) {
+        try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed");
         return;
     }
     if (req.content_type) |ct| {
@@ -197,6 +221,7 @@ fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
     var data: std.ArrayList(u8) = .empty;
     var header_end: ?usize = null;
     var content_length: usize = 0;
+    var continue_sent = false;
     var buf: [16384]u8 = undefined;
 
     while (true) {
@@ -204,20 +229,27 @@ fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
         const n = try std.posix.read(fd, &buf);
         if (n == 0) break;
         try data.appendSlice(arena, buf[0..n]);
+        if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
         if (header_end == null) {
             if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
                 content_length = try parseContentLength(data.items[0..idx]);
+                if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
+                    try writeAllFd(fd, "HTTP/1.1 100 Continue\r\n\r\n");
+                    continue_sent = true;
+                }
             }
         }
         if (header_end) |he| {
-            if (data.items.len >= he + content_length) break;
+            const total = he + content_length;
+            if (data.items.len >= total) break;
         }
     }
     const he = header_end orelse return error.BadHeaders;
-    if (data.items.len < he + content_length) return error.ShortBody;
+    const total = he + content_length;
+    if (data.items.len < total) return error.ShortBody;
     const head = data.items[0 .. he - 4];
-    const body = data.items[he .. he + content_length];
+    const body = data.items[he..total];
 
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     const request_line = lines.next() orelse return error.BadRequestLine;
@@ -229,6 +261,7 @@ fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
         .method = method,
         .path = path,
         .host = null,
+        .origin = null,
         .content_type = null,
         .content_length = content_length,
         .token = null,
@@ -240,24 +273,44 @@ fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (asciiEqlIgnoreCase(name, "host")) req.host = value;
+        if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
         if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
         if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
     }
     return req;
 }
 
-fn parseContentLength(head: []const u8) !usize {
+fn hasExpectContinue(head: []const u8) bool {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     _ = lines.next();
     while (lines.next()) |line| {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (asciiEqlIgnoreCase(name, "expect") and asciiEqlIgnoreCase(value, "100-continue")) return true;
+    }
+    return false;
+}
+
+fn parseContentLength(head: []const u8) !usize {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next();
+    var seen: ?usize = null;
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (asciiEqlIgnoreCase(name, "content-length")) {
-            return std.fmt.parseInt(usize, value, 10) catch error.BadContentLength;
+            const parsed = std.fmt.parseInt(usize, value, 10) catch return error.BadContentLength;
+            if (parsed > MAX_REQUEST_BYTES) return error.RequestTooLarge;
+            if (seen) |prev| {
+                if (prev != parsed) return error.BadContentLength;
+            } else {
+                seen = parsed;
+            }
         }
     }
-    return 0;
+    return seen orelse 0;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -275,6 +328,17 @@ fn hostAllowed(host_opt: ?[]const u8, allowed: [][]const u8) bool {
         if (std.mem.endsWith(u8, pat, ":*")) {
             const base = pat[0 .. pat.len - 2];
             if (std.mem.startsWith(u8, host, base) and host.len > base.len and host[base.len] == ':') return true;
+        }
+    }
+    return false;
+}
+
+fn originAllowed(origin: []const u8, allowed: [][]const u8) bool {
+    for (allowed) |pat| {
+        if (std.mem.eql(u8, origin, pat)) return true;
+        if (std.mem.endsWith(u8, pat, ":*")) {
+            const base = pat[0 .. pat.len - 2];
+            if (std.mem.startsWith(u8, origin, base) and origin.len > base.len and origin[base.len] == ':') return true;
         }
     }
     return false;
@@ -402,14 +466,16 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
         argv[i] = item.string;
     }
     const cwd = strArg(args, "cwd") orelse "";
-    const timeout_s = intArg(args, "timeout") orelse 120;
+    var timeout_s = intArg(args, "timeout") orelse 120;
+    if (timeout_s < 1) timeout_s = 1;
+    if (timeout_s > 1800) timeout_s = 1800;
     const started = std.Io.Clock.awake.now(io);
     const result = std.process.run(arena, io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
         .stdout_limit = .limited(cfg.max_out),
         .stderr_limit = .limited(cfg.max_out),
-        .timeout = if (timeout_s <= 0) .none else .{ .duration = .{ .clock = .awake, .raw = std.Io.Duration.fromSeconds(timeout_s) } },
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = std.Io.Duration.fromSeconds(timeout_s) } },
     }) catch |err| switch (err) {
         error.Timeout => return error.CommandTimeout,
         error.StreamTooLong => return error.OutputTooLong,
@@ -498,6 +564,7 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const path = strArg(args, "path") orelse return error.MissingPath;
     const offset = intArg(args, "offset") orelse 0;
     const limit = intArg(args, "limit") orelse 200_000;
+    if (offset < 0 or limit < 0) return error.BadOffset;
     const data = readFileAllocMaybe(arena, io, path, 64 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.IsDir => return error.IsDirectory,
@@ -525,6 +592,7 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     const content_b64 = strArg(args, "content_b64") orelse return error.MissingContent;
     const mode_i = intArg(args, "mode") orelse 0o644;
     const mkdirs = boolArg(args, "mkdirs") orelse true;
+    if (mode_i < 0 or mode_i > 0o7777) return error.BadMode;
 
     const size = try std.base64.standard.Decoder.calcSizeForSlice(content_b64);
     const data = try arena.alloc(u8, size);
@@ -617,10 +685,16 @@ fn intArg(args: Value, key: []const u8) ?i64 {
     const v = objGet(args, key) orelse return null;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @as(i64, @intFromFloat(f)),
+        .float => |f| floatToI64(f),
         .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
         else => null,
     };
+}
+
+fn floatToI64(f: f64) ?i64 {
+    if (!std.math.isFinite(f)) return null;
+    if (f >= 9223372036854775808.0 or f < -9223372036854775808.0) return null;
+    return @as(i64, @intFromFloat(f));
 }
 
 fn boolArg(args: Value, key: []const u8) ?bool {
@@ -791,6 +865,12 @@ fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) 
     return out.items;
 }
 
+fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
+    const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+}
+
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -811,7 +891,9 @@ fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: 
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
@@ -864,10 +946,33 @@ test "host allowlist supports exact and wildcard-port patterns" {
     try std.testing.expect(!hostAllowed("evil.example:8341", allowed));
 }
 
-test "utf8 lossy replaces invalid bytes" {
+test "utf8 lossy drops invalid bytes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const s = try utf8LossyAlloc(arena, "a\xffb");
     try std.testing.expectEqualStrings("ab", s);
+}
+
+test "content length rejects overflow and conflicting duplicates" {
+    try std.testing.expectError(error.RequestTooLarge, parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 18446744073709551615"));
+    try std.testing.expectError(error.BadContentLength, parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2"));
+    try std.testing.expectEqual(@as(usize, 2), try parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2"));
+}
+
+test "float to int rejects non finite and out of range values" {
+    try std.testing.expect(floatToI64(std.math.inf(f64)) == null);
+    try std.testing.expect(floatToI64(std.math.nan(f64)) == null);
+    try std.testing.expect(floatToI64(1e300) == null);
+    try std.testing.expectEqual(@as(i64, 42), floatToI64(42.0).?);
+}
+
+test "origin allowlist supports exact and wildcard-port patterns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const allowed = try splitCsv(arena, "http://127.0.0.1:*,https://node.example");
+    try std.testing.expect(originAllowed("http://127.0.0.1:8341", allowed));
+    try std.testing.expect(originAllowed("https://node.example", allowed));
+    try std.testing.expect(!originAllowed("https://evil.example", allowed));
 }

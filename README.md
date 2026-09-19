@@ -42,8 +42,9 @@ Configuration is environment-only:
 - `MCP_NODE_PORT` — bind port, default `8341`
 - `MCP_NODE_TOKEN_FILE` — token file path, default `./token`
 - `MCP_NODE_ALLOWED_HOSTS` — comma list, default `127.0.0.1:*,localhost:*,[::1]:*`
-- `MCP_NODE_ALLOWED_ORIGINS` — comma list reserved for future Origin checks
+- `MCP_NODE_ALLOWED_ORIGINS` — comma list enforced when an `Origin` header is present, default `http://127.0.0.1:*,http://localhost:*,http://[::1]:*`
 - `MCP_NODE_MAX_OUT` — per-stream stdout/stderr cap, default `400000`
+- `MCP_NODE_SOCKET_TIMEOUT_S` — accepted-socket read/write timeout, default `60`
 - `MCP_NODE_INSECURE=1` — allow startup with a missing token file (not recommended)
 
 Auth header: `X-Node-Token: <token>`.
@@ -60,8 +61,14 @@ curl -sS http://127.0.0.1:8341/mcp \
 
 ## Security notes
 
-- Missing token fails closed unless `MCP_NODE_INSECURE=1` is set.
+- Missing or empty token fails closed unless `MCP_NODE_INSECURE=1` is set.
 - `Host` is validated before JSON parsing; unknown hosts get HTTP 421.
+- A present `Origin` header is validated against `MCP_NODE_ALLOWED_ORIGINS`; unknown origins get HTTP 403.
+- Requests over 32 MiB get HTTP 413; conflicting duplicate `Content-Length` headers are rejected.
+- `Expect: 100-continue` is answered before the body is read.
+- `GET /mcp` gets HTTP 405; only `POST /mcp` is served.
+- `exec`/`exec_shell` timeouts are clamped to `[1, 1800]` seconds.
+- The accept loop is intentionally single-threaded; one long-running `exec` blocks other requests until it finishes or times out.
 - `exec` does not pass through a shell; shell metacharacters are data.
 - `exec_shell` is intentionally one explicit shell layer for pipelines and redirects.
 - `write_file` returns a SHA-256 digest for verification.
