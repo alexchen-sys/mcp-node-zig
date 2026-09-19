@@ -5,7 +5,7 @@
 //! (env, process, fd+sysinfo, net) call only the narrow API re-exported
 //! here.
 //!
-//! API surface (intentionally minimal):
+//! Core API surface:
 //!   * `closeFd(fd)`          — close a descriptor/handle, result discarded
 //!   * `sleepMs(ms)`          — monotonic-ish sleep on the calling thread
 //!   * `writeAllFd(fd, buf)`  — full-buffer write with short-write loop
@@ -58,9 +58,12 @@ pub const loadEnviron = env.loadEnviron;
 pub const environGet = env.environGet;
 pub const homeDir = env.homeDir;
 
+/// Cross-compile gate for the one remaining POSIX-only call site in
+/// `main.zig` (annotated inline): the token-file read in loadConfig.
+/// The gate is a deliberate fail-closed choice on Windows (missing token
+/// file fails startup there rather than degrading to insecure mode);
+/// remove it together with that call site.
 pub const gate_posix_file_io = builtin.os.tag == .windows;
-pub const stub_process_control = builtin.os.tag == .windows;
-pub const stub_pipe_poll = builtin.os.tag == .windows;
 
 comptime {
     // Fail loudly on targets nobody has thought about instead of silently

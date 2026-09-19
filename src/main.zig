@@ -380,6 +380,9 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
 
     const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
+        // Fail-closed on Windows by design: a missing token
+        // file fails startup there instead of degrading to insecure mode;
+        // the FileNotFound recovery branch is compiled out with the read.
         if (comptime os.gate_posix_file_io) {
             return err;
         } else {
