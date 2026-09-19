@@ -1,0 +1,101 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux
+          - aarch64-linux
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zig 0.16.0
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".shasum')
+          mkdir -p "$RUNNER_TEMP/zig"
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Unit tests (native arch only)
+        if: matrix.target == 'x86_64-linux'
+        run: zig build test
+
+      - name: Build static binary
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+
+      - name: Smoke test (native arch only)
+        if: matrix.target == 'x86_64-linux'
+        run: |
+          set -euo pipefail
+          printf 'release-smoke-token' > "$RUNNER_TEMP/token"
+          MCP_NODE_TOKEN_FILE="$RUNNER_TEMP/token" ./zig-out/bin/mcp-node &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -s -o /dev/null http://127.0.0.1:8341/mcp && break || sleep 0.1
+          done
+          body=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'x-node-token: release-smoke-token' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
+          echo "$body" | grep -q '"name":"mcp-node"'
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          pkg="mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$pkg"
+          cp zig-out/bin/mcp-node LICENSE README.md "dist/$pkg/"
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Build checksum manifest
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 > SHA256SUMS.txt
+          rm ./*.tar.gz.sha256
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            SHA256SUMS.txt
+          generate_release_notes: true
