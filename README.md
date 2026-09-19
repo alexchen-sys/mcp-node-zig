@@ -66,6 +66,14 @@ curl -sS http://127.0.0.1:8341/mcp \
   --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"argv":["uname","-a"]}}}'
 ```
 
+## Session lifecycle guarantees
+
+- Sessions are reference-counted; `exec_close` is idempotent (`already_closed: true` on repeat/late close) and safe to race against in-flight `exec_poll`/`exec_write`/`exec_kill` from other connections.
+- Session processes start in their own process group; `exec_kill`/`exec_close` kill the whole group (`SIGKILL` on `-pid`).
+- Output buffers are capped per stream (`MCP_NODE_MAX_OUT`, default 400000 bytes); overflow sets `truncated_stdout`/`truncated_stderr`.
+- `exec_poll` deltas never split a multi-byte UTF-8 sequence at the chunk edge while the process is alive; the returned offsets always point at the next unconsumed byte.
+- Full session store (`MCP_NODE_MAX_SESSIONS`, default 64) lazily evicts finished sessions before refusing new ones.
+
 ## Security notes
 
 - Missing or empty token fails closed unless `MCP_NODE_INSECURE=1` is set.
