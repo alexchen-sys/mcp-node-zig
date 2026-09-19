@@ -4,6 +4,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 
+// std.start ignores SIGPIPE unless the root opts into keeping it; a peer
+// disconnect must never kill the daemon. Declare the policy explicitly.
+pub const keep_sigpipe = false;
+
 const VERSION = "0.1.0";
 const DEFAULT_MAX_OUT: usize = 400_000;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
@@ -106,28 +110,35 @@ const SessionStore = struct {
     }
 
     fn put(self: *SessionStore, session: *Session) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.map.count() >= self.max) {
-            // Lazy evict: reclaim a finished session before refusing.
-            var it = self.map.iterator();
-            while (it.next()) |kv| {
-                const s = kv.value_ptr.*;
-                s.mutex.lockUncancelable(self.io);
-                const is_done = s.done;
-                s.mutex.unlock(self.io);
-                if (!is_done) continue;
-                _ = self.map.fetchRemove(kv.key_ptr.*);
-                s.closing.store(true, .release);
-                if (s.waiter_thread) |t| t.join();
-                if (s.stdout_thread) |t| t.join();
-                if (s.stderr_thread) |t| t.join();
-                sessionRelease(s); // drop the store's ref
-                break;
+        // Lazy evict: pick a finished victim under the lock, but join/free it
+        // AFTER unlocking so other connections are not blocked for the join.
+        var victim: ?*Session = null;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.map.count() >= self.max) {
+                var it = self.map.iterator();
+                while (it.next()) |kv| {
+                    const s = kv.value_ptr.*;
+                    s.mutex.lockUncancelable(self.io);
+                    const is_done = s.done;
+                    s.mutex.unlock(self.io);
+                    if (!is_done) continue;
+                    _ = self.map.fetchRemove(kv.key_ptr.*);
+                    victim = s;
+                    break;
+                }
+                if (victim == null) return error.TooManySessions;
             }
-            if (self.map.count() >= self.max) return error.TooManySessions;
+            try self.map.put(session.id, session);
         }
-        try self.map.put(session.id, session);
+        if (victim) |s| {
+            s.closing.store(true, .release);
+            if (s.waiter_thread) |t| t.join();
+            if (s.stdout_thread) |t| t.join();
+            if (s.stderr_thread) |t| t.join();
+            sessionRelease(s); // drop the store's ref
+        }
     }
 
     fn get(self: *SessionStore, id: u64) ?*Session {
@@ -851,10 +862,11 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
 }
 
 fn freeSession(session: *Session) void {
-    // Called only after all session threads were joined (close/evict/error paths).
+    // Called only after all session threads were joined (close/evict/error
+    // paths), i.e. always after child.wait() already closed child.stdin/
+    // stdout/stderr via std cleanup. The only fd we own is the dup'd stdin
+    // write-end taken over at exec_start.
     if (session.stdin_fd) |fd| _ = std.os.linux.close(fd);
-    if (session.child.stdout) |f| _ = std.os.linux.close(f.handle);
-    if (session.child.stderr) |f| _ = std.os.linux.close(f.handle);
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
     std.heap.page_allocator.free(session.cwd);
@@ -921,6 +933,25 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
 
+    // Take over stdin: child.wait() unconditionally closes child.stdin/stdout/
+    // stderr via std's cleanup. Dup the write end (CLOEXEC) and null the
+    // Child's copy, so our session.stdin_fd is the sole owner: exec_write can
+    // never race a std-cleanup close, and freeSession never double-closes.
+    var stdin_fd: ?std.posix.fd_t = null;
+    if (child.stdin) |f| {
+        const dup_rc = std.os.linux.fcntl(f.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
+        if (std.os.linux.errno(dup_rc) != .SUCCESS) return error.DupFailed;
+        stdin_fd = @intCast(dup_rc);
+        _ = std.os.linux.close(f.handle);
+        child.stdin = null;
+    }
+    var stdin_owned = false;
+    errdefer {
+        if (!stdin_owned) {
+            if (stdin_fd) |fd| _ = std.os.linux.close(fd);
+        }
+    }
+
     const session = try std.heap.page_allocator.create(Session);
     session.* = .{
         .id = store.allocId(),
@@ -928,12 +959,13 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         .argv = argv,
         .cwd = cwd,
         .child = child,
-        .stdin_fd = if (child.stdin) |f| f.handle else null,
+        .stdin_fd = stdin_fd,
         .started_ms = nowMs(io),
     };
     argv_owned = true;
     cwd_owned = true;
     child_owned = true;
+    stdin_owned = true;
 
     // Spawn threads before publishing: a session visible in the store always
     // has its threads running, so concurrent exec_close can never see null
@@ -1064,7 +1096,6 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     if (eof) {
         _ = std.os.linux.close(fd);
         session.stdin_fd = null;
-        session.child.stdin = null;
     }
     try out.appendSlice(arena, "{\"ok\":true,\"bytes\":");
     try out.print(arena, "{d}", .{data.len});
