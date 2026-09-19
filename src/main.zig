@@ -436,6 +436,7 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     };
     const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
         switch (err) {
+            error.CleanEof => return false,
             error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
             else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
         }
@@ -500,7 +501,13 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
         const n = try std.posix.read(fd, &buf);
-        if (n == 0) break;
+        if (n == 0) {
+            // Clean EOF before any bytes: the peer just closed a keep-alive
+            // connection. Not an error — answering here would write a zombie
+            // 400 into a dying socket.
+            if (data.items.len == 0) return error.CleanEof;
+            break;
+        }
         try data.appendSlice(arena, buf[0..n]);
         if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
