@@ -66,6 +66,19 @@ curl -sS http://127.0.0.1:8341/mcp \
   --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"argv":["uname","-a"]}}}'
 ```
 
+## Async process sessions
+
+`exec_start` spawns argv as a session (own process group, piped stdin/stdout/stderr) and returns `session_id`. Then:
+
+- `exec_poll` — output deltas by byte offsets, `done`, `exit_code`, truncation flags.
+- `exec_wait` — long-poll until completion or `timeout` (default 30s, max 300s); same payload as `exec_poll`.
+- `exec_write` — base64 bytes to stdin; `eof: true` closes stdin.
+- `exec_kill` — SIGKILL the whole process group.
+- `exec_close` — reap and free; idempotent (`already_closed: true`).
+- `exec_list` — live sessions with id, pid, argv, state, timestamps.
+
+Finished sessions are reaped automatically after `MCP_NODE_SESSION_TTL_S` seconds (default 600), and a full store lazily evicts finished sessions before refusing new ones.
+
 ## Session lifecycle guarantees
 
 - Sessions are reference-counted; `exec_close` is idempotent (`already_closed: true` on repeat/late close) and safe to race against in-flight `exec_poll`/`exec_write`/`exec_kill` from other connections.
