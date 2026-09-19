@@ -31,9 +31,11 @@ The design goal is a small trusted edge agent: static binary, explicit token aut
 
 Early `0.1.0`; the contract may evolve.
 
+Platform support: **Linux** is the primary, runtime-verified target. **macOS** and **Windows** are supported by the platform layer (`src/os/`) and are **compile-verified** via `zig build -Dtarget=x86_64-macos` / `-Dtarget=x86_64-windows-gnu`; they have not yet been runtime-verified on live hosts. On Windows, process trees are managed with Job Objects and socket timeouts use overlapped AFD I/O with software deadlines.
+
 ## Build
 
-Requires Zig 0.16.x. Linux only (uses `/proc` and POSIX process groups).
+Requires Zig 0.16.x. Linux, macOS, and Windows targets (see [Status](#status)).
 
 ```sh
 git clone https://github.com/alexchen-sys/mcp-node-zig
