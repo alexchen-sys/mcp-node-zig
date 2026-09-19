@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
 const os = @import("os.zig");
+const proc = @import("os/proc.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -92,11 +94,16 @@ const Connection = struct {
 
 const Session = struct {
     id: u64,
-    pid: std.posix.pid_t,
+    /// Integer pid on every OS (display-only on Windows; control goes
+    /// through the job/handle). See os/proc.zig.
+    pid: proc.ProcessId,
     argv: [][]const u8,
     cwd: []const u8,
     child: std.process.Child,
     stdin_fd: ?std.posix.fd_t,
+    /// Windows: Job Object owning the whole process tree (KILL_ON_JOB_CLOSE).
+    /// void on POSIX. Closed in freeSession.
+    job: proc.JobField = proc.no_job,
     stdin_mutex: std.Io.Mutex = .init,
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
@@ -243,30 +250,27 @@ fn nowMs(io: Io) i64 {
     return std.Io.Clock.real.now(io).toMilliseconds();
 }
 
-fn killSessionTree(pid: std.posix.pid_t) void {
-    if (comptime os.stub_process_control) {
-        return;
-    } else {
-        if (pid <= 0) return;
-        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
-        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-    }
+fn killSessionTree(pid: proc.ProcessId, job: proc.JobField) void {
+    // The real implementation lives in os/proc.zig — process-group
+    // SIGKILL on POSIX, TerminateJobObject on Windows.
+    proc.killTree(pid, job);
 }
 
-fn childPidOrZero(id: ?std.process.Child.Id) std.posix.pid_t {
-    if (comptime os.stub_process_control) {
-        return undefined;
+/// Child.id is a HANDLE on Windows: resolve the real integer pid through
+/// NtQueryInformationProcess (display-only). POSIX passes the pid through.
+fn childPidOrZero(id: ?std.process.Child.Id) proc.ProcessId {
+    if (comptime builtin.os.tag == .windows) {
+        const handle = id orelse return 0;
+        return proc.queryProcessId(handle) orelse 0;
     } else {
         return id orelse 0;
     }
 }
 
-fn pidJsonValue(pid: std.posix.pid_t) u64 {
-    if (comptime os.stub_process_control) {
-        return 0;
-    } else {
-        return @intCast(pid);
-    }
+/// ProcessId is an integer on every OS (pid_t on POSIX, u32 on Windows), so
+/// pid JSON rendering works everywhere.
+fn pidJsonValue(pid: proc.ProcessId) u64 {
+    return @intCast(pid);
 }
 
 fn termExitCode(term: std.process.Child.Term) i64 {
@@ -892,14 +896,25 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
 
 fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     const script = strArg(args, "script") orelse return error.MissingScript;
-    const shell = strArg(args, "shell") orelse "bash";
-    if (!std.mem.eql(u8, shell, "bash") and !std.mem.eql(u8, shell, "sh") and !std.mem.eql(u8, shell, "fish") and !std.mem.eql(u8, shell, "zsh")) return error.UnsupportedShell;
+    const default_shell: []const u8 = if (comptime builtin.os.tag == .windows) "cmd" else "bash";
+    const shell = strArg(args, "shell") orelse default_shell;
+    // Comptime platform allowlist: POSIX shells on POSIX, cmd/powershell on
+    // Windows (mirrored in TOOLS_JSON prose).
+    const shell_ok = if (comptime builtin.os.tag == .windows)
+        (std.mem.eql(u8, shell, "cmd") or std.mem.eql(u8, shell, "powershell"))
+    else
+        (std.mem.eql(u8, shell, "bash") or std.mem.eql(u8, shell, "sh") or std.mem.eql(u8, shell, "fish") or std.mem.eql(u8, shell, "zsh"));
+    if (!shell_ok) return error.UnsupportedShell;
     const cwd = strArg(args, "cwd") orelse "";
     const timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
     var new_args: std.ArrayList(u8) = .empty;
     try new_args.appendSlice(arena, "{\"argv\":[");
     try appendJsonString(&new_args, arena, shell);
-    try new_args.appendSlice(arena, ",\"-c\",");
+    // cmd takes /c; every other supported shell (incl. powershell) takes -c.
+    const script_flag: []const u8 = if (std.mem.eql(u8, shell, "cmd")) "/c" else "-c";
+    try new_args.appendSlice(arena, ",");
+    try appendJsonString(&new_args, arena, script_flag);
+    try new_args.appendSlice(arena, ",");
     try appendJsonString(&new_args, arena, script);
     try new_args.appendSlice(arena, "]");
     if (cwd.len != 0) {
@@ -930,9 +945,31 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
-    if (comptime os.stub_pipe_poll) {
+    if (comptime builtin.os.tag == .windows) {
+        // Blocking NtReadFile loop (no poll tick on this OS). Termination is
+        // guaranteed by the Job Object: exec_kill/exec_close run
+        // TerminateJobObject, the waiter terminates the job when the child
+        // exits, and grandchildren auto-join the job (Win8+) — so every write
+        // end of the pipe eventually closes and the pending read completes
+        // with PIPE_BROKEN (EOF). session.closing is still honored between
+        // reads for the already-EOF fast path.
+        var wbuf: [IO_BUF_SIZE]u8 = undefined;
+        while (true) {
+            if (session.closing.load(.acquire)) break;
+            const n = proc.readPipeBlocking(fd, &wbuf) orelse break;
+            if (n == 0) break;
+            session.mutex.lockUncancelable(io);
+            if (is_stdout) {
+                appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout);
+            } else {
+                appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr);
+            }
+            session.mutex.unlock(io);
+        }
         return;
-    } else {
+    }
+    // POSIX path: poll-tick loop (unchanged).
+    {
         var buf: [IO_BUF_SIZE]u8 = undefined;
         while (true) {
             // Poll instead of blind blocking read: exec_close must be able to reap
@@ -958,6 +995,11 @@ fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max
 
 fn sessionWaiterMain(session: *Session, io: Io) void {
     const term = session.child.wait(io) catch {
+        // Windows: same invariant as below — done=true must imply the job is
+        // dead, so close/reap joins of the blocking readers can never hang.
+        if (comptime builtin.os.tag == .windows) {
+            if (session.job) |j| proc.terminateJob(j);
+        }
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = null;
@@ -966,6 +1008,13 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
         return;
     };
     const code = termExitCode(term);
+    // Windows: the child is gone; terminate the Job Object so grandchildren
+    // cannot outlive the session pinning the pipe write ends open (the
+    // blocking readers have no poll tick — EOF is their only exit). done=true
+    // published after this point therefore implies the whole tree is dead.
+    if (comptime builtin.os.tag == .windows) {
+        if (session.job) |j| proc.terminateJob(j);
+    }
     session.mutex.lockUncancelable(io);
     session.done = true;
     session.exit_code = code;
@@ -975,10 +1024,16 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
 
 fn freeSession(session: *Session) void {
     // Called only after all session threads were joined (close/evict/error
-    // paths), i.e. always after child.wait() already closed child.stdin/
-    // stdout/stderr via std cleanup. The only fd we own is the dup'd stdin
-    // write-end taken over at exec_start.
+    // paths), i.e. always after child.wait() already closed child.stdout/
+    // stderr via std cleanup (child.stdin is null by construction: sessions
+    // spawn with .file stdio). The stdin write end is session-owned from the
+    // start, so closing it here can never double-close a std cleanup copy.
     if (session.stdin_fd) |fd| os.closeFd(fd);
+    // Windows: release the Job Object. The tree is already dead (waiter ran
+    // TerminateJobObject), so KILL_ON_JOB_CLOSE is a no-op here.
+    if (comptime builtin.os.tag == .windows) {
+        if (session.job) |j| os.closeFd(j);
+    }
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
     std.heap.page_allocator.free(session.cwd);
@@ -1034,43 +1089,65 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         if (!cwd_owned) std.heap.page_allocator.free(cwd);
     }
 
+    // Parent-owned stdin pipe: the read end goes to the child as .file
+    // stdio, the write end becomes Session.stdin_fd. std.process.Child.stdin
+    // stays null, so child.wait() cleanup can never close the write end from
+    // under exec_write — this replaces the pre-port F_DUPFD_CLOEXEC takeover
+    // hack on every OS.
+    const stdin_pipe = try proc.createStdinPipe(io);
+    var stdin_read_open = true;
+    errdefer if (stdin_read_open) os.closeFd(stdin_pipe.read);
+    const stdin_fd: std.posix.fd_t = stdin_pipe.write;
+    var stdin_owned = false;
+    errdefer if (!stdin_owned) os.closeFd(stdin_fd);
+
+    // Windows: the Job Object exists before the process so the
+    // assign-before-resume sequence can never leak an untracked tree.
+    const job: proc.JobField = if (comptime builtin.os.tag == .windows) try proc.createKillOnCloseJob() else proc.no_job;
+    var job_owned = false;
+    errdefer {
+        if (comptime builtin.os.tag == .windows) {
+            if (!job_owned) {
+                if (job) |j| os.closeFd(j);
+            }
+        }
+    }
+
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
-        .stdin = .pipe,
+        .stdin = .{ .file = proc.stdinFile(&stdin_pipe) },
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = if (comptime os.stub_process_control) null else 0,
+        // POSIX: child becomes process-group leader (kill(-pgid) reaches the
+        // tree). Windows: null (pid_t is a HANDLE there) — the Job Object
+        // takes over the tree role.
+        .pgid = proc.child_pgid,
+        // Windows only: CREATE_SUSPENDED so the child lands in the job before
+        // it can spawn anything. POSIX keeps running-start semantics.
+        .start_suspended = proc.spawn_suspended,
     });
+    // The child owns its stdin read end from here on; drop the parent's copy.
+    os.closeFd(stdin_pipe.read);
+    stdin_read_open = false;
 
     // Never leak a running child if session allocation fails after spawn.
     var child_owned = false;
     errdefer {
         if (!child_owned) {
-            if (child.id) |pid| killSessionTree(pid);
+            killSessionTree(childPidOrZero(child.id), job);
             _ = child.wait(io) catch null;
         }
     }
 
-    // Take over stdin: child.wait() unconditionally closes child.stdin/stdout/
-    // stderr via std's cleanup. Dup the write end (CLOEXEC) and null the
-    // Child's copy, so our session.stdin_fd is the sole owner: exec_write can
-    // never race a std-cleanup close, and freeSession never double-closes.
-    var stdin_fd: ?std.posix.fd_t = null;
-    if (child.stdin) |f| {
-        if (comptime !os.stub_process_control) {
-            const dup_rc = std.os.linux.fcntl(f.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
-            if (std.os.linux.errno(dup_rc) != .SUCCESS) return error.DupFailed;
-            stdin_fd = @intCast(dup_rc);
-            os.closeFd(f.handle);
-            child.stdin = null;
-        }
-    }
-    var stdin_owned = false;
-    errdefer {
-        if (!stdin_owned) {
-            if (stdin_fd) |fd| os.closeFd(fd);
-        }
+    if (comptime builtin.os.tag == .windows) {
+        proc.assignToJob(job.?, child.id.?) catch |err| {
+            // Not in the job yet: a job kill would miss the suspended child
+            // and the errdefer's child.wait() would hang. Kill by handle.
+            proc.terminateHandle(child.id.?);
+            return err;
+        };
+        try proc.resumeProcess(child.id.?);
     }
 
     const session = try std.heap.page_allocator.create(Session);
@@ -1081,12 +1158,14 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         .cwd = cwd,
         .child = child,
         .stdin_fd = stdin_fd,
+        .job = job,
         .started_ms = nowMs(io),
     };
     argv_owned = true;
     cwd_owned = true;
     child_owned = true;
     stdin_owned = true;
+    job_owned = true;
 
     // Spawn threads before publishing: a session visible in the store always
     // has its threads running, so concurrent exec_close can never see null
@@ -1096,7 +1175,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
     if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
         session.closing.store(true, .release);
-        killSessionTree(session.pid);
+        killSessionTree(session.pid, session.job);
         if (session.waiter_thread) |t| {
             t.join();
         } else {
@@ -1110,7 +1189,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
     store.put(session) catch |err| {
         session.closing.store(true, .release);
-        killSessionTree(session.pid);
+        killSessionTree(session.pid, session.job);
         if (session.waiter_thread) |t| t.join();
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
@@ -1281,7 +1360,7 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     const exited = session.done;
     session.mutex.unlock(sio);
     if (exited) return error.ProcessExited;
-    if (data.len != 0) try writeAllFd(fd, data);
+    if (data.len != 0) try proc.writeAllFd(fd, data);
     if (eof) {
         os.closeFd(fd);
         session.stdin_fd = null;
@@ -1301,7 +1380,7 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     session.mutex.lockUncancelable(sio);
     const done = session.done;
     session.mutex.unlock(sio);
-    if (!done) killSessionTree(session.pid);
+    if (!done) killSessionTree(session.pid, session.job);
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
@@ -1329,7 +1408,7 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.mutex.lockUncancelable(store.io);
     const done = session.done;
     session.mutex.unlock(store.io);
-    if (!done) killSessionTree(session.pid);
+    if (!done) killSessionTree(session.pid, session.job);
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();
@@ -1753,7 +1832,7 @@ const TOOLS_JSON =
     \\{"name":"exec_close","description":"Kill if needed, join session threads, and free session state. Idempotent.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"}},"required":["session_id"]}},
     \\{"name":"exec_wait","description":"Long-poll a session until it finishes or timeout (default 30s, max 300s); returns the same payload as exec_poll.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"},"timeout":{"type":"integer"},"stdout_offset":{"type":"integer"},"stderr_offset":{"type":"integer"}},"required":["session_id"]}},
     \\{"name":"exec_list","description":"List live sessions with id, pid, argv, done, exit_code, timestamps.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"exec_shell","description":"Run one shell script layer via bash/sh/fish/zsh -c.","inputSchema":{"type":"object","properties":{"script":{"type":"string"},"shell":{"type":"string"},"timeout":{"type":"integer"},"cwd":{"type":"string"}},"required":["script"]}},
+    \\{"name":"exec_shell","description":"Run one shell script layer via bash/sh/fish/zsh -c (cmd /c, powershell -c on Windows).","inputSchema":{"type":"object","properties":{"script":{"type":"string"},"shell":{"type":"string"},"timeout":{"type":"integer"},"cwd":{"type":"string"}},"required":["script"]}},
     \\{"name":"read_file","description":"Read a text file as UTF-8 with replacement. offset/limit are in characters.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}},
     \\{"name":"write_file","description":"Write base64 content to a file; returns sha256.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content_b64":{"type":"string"},"mode":{"type":"integer"},"mkdirs":{"type":"boolean"}},"required":["path","content_b64"]}},
     \\{"name":"list_dir","description":"List a directory with name/type/size/mtime.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}
