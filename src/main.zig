@@ -170,8 +170,10 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
     const ra = req_arena_state.allocator();
 
     const fd = stream.socket.handle;
-    setSocketTimeouts(fd, cfg.socket_timeout_s) catch {};
-    const req = readHttpRequest(ra, fd) catch |err| {
+    setSocketTimeouts(fd, cfg.socket_timeout_s) catch |err| {
+        std.debug.print("setsockopt timeouts failed: {s}\n", .{@errorName(err)});
+    };
+    const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
         switch (err) {
             error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
             else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
@@ -191,7 +193,11 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
     }
     if (cfg.token.len != 0) {
         const got = req.token orelse "";
-        if (!std.mem.eql(u8, got, cfg.token)) {
+        var got_hash: [32]u8 = undefined;
+        var cfg_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
+        std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
+        if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
             try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized");
             return;
         }
@@ -218,18 +224,22 @@ fn handleConnection(arena: Allocator, io: Io, cfg: *const Config, stream: *Io.ne
     try sendHttpRaw(ra, fd, rpc.status, "application/json", rpc.body);
 }
 
-fn readHttpRequest(arena: Allocator, fd: std.posix.fd_t) !Request {
+fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
     var data: std.ArrayList(u8) = .empty;
     var header_end: ?usize = null;
     var content_length: usize = 0;
     var continue_sent = false;
     var buf: [16384]u8 = undefined;
+    const started = std.Io.Clock.awake.now(io);
+    const deadline_ms = @as(u64, timeout_s) * 1000;
 
     while (true) {
+        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
         const n = try std.posix.read(fd, &buf);
         if (n == 0) break;
         try data.appendSlice(arena, buf[0..n]);
+        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
         if (header_end == null) {
             if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
@@ -866,7 +876,6 @@ fn utf8LossyAlloc(arena: Allocator, data: []const u8) ![]const u8 {
 const CharSlice = struct { text: []const u8, has_more: bool };
 
 fn utf8CharSlice(s: []const u8, offset_chars: usize, limit_chars: usize) !CharSlice {
-    if (offset_chars == 0 and limit_chars == 0) return .{ .text = s, .has_more = false };
     var char_idx: usize = 0;
     var byte_idx: usize = 0;
     var start_byte: usize = 0;
