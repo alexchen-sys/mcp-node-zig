@@ -311,7 +311,7 @@ pub fn main() !void {
             continue;
         };
         if (!gate.tryAcquire()) {
-            rejectBusy(io, &stream);
+            rejectBusy(&cfg, io, &stream);
             continue;
         }
         const conn = std.heap.page_allocator.create(Connection) catch {
@@ -344,10 +344,11 @@ fn connectionThread(conn: *Connection) void {
     }
 }
 
-fn rejectBusy(io: Io, stream: *Io.net.Stream) void {
+fn rejectBusy(cfg: *const Config, io: Io, stream: *Io.net.Stream) void {
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    sendHttpError(fba.allocator(), stream.socket.handle, 503, "busy", "too many connections") catch {};
+    const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
+    sendHttpError(fba.allocator(), stream.socket.handle, 503, "busy", "too many connections", timeout_ms) catch {};
     stream.close(io);
 }
 
@@ -448,32 +449,29 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     const ra = req_arena_state.allocator();
 
     const fd = stream.socket.handle;
-    setSocketTimeouts(fd, cfg.socket_timeout_s) catch {
+    const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
+    os.net.setSocketTimeouts(fd, cfg.socket_timeout_s) catch {
         // No read timeout -> a silent client could pin a connection slot
         // forever; refuse the connection instead of serving unprotected.
         return error.SocketOptionFailed;
     };
     const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
-        if (comptime os.stub_socket_read) {
-            try sendHttpError(ra, fd, 400, "bad_request", @errorName(err));
-        } else {
-            switch (err) {
-                error.CleanEof => return false,
-                error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
-                error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large"),
-                else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
-            }
+        switch (err) {
+            error.CleanEof => return false,
+            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large", timeout_ms),
+            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large", timeout_ms),
+            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err), timeout_ms),
         }
         return false;
     };
 
     if (!hostAllowed(req.host, cfg.allowed_hosts)) {
-        try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header");
+        try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header", timeout_ms);
         return false;
     }
     if (req.origin) |origin| {
         if (!originAllowed(origin, cfg.allowed_origins)) {
-            try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header");
+            try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header", timeout_ms);
             return false;
         }
     }
@@ -484,38 +482,39 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
         std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
         if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
-            try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized");
+            try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized", timeout_ms);
             return false;
         }
     }
     if (!std.mem.eql(u8, req.path, "/mcp")) {
-        try sendHttpError(ra, fd, 404, "not_found", "not found");
+        try sendHttpError(ra, fd, 404, "not_found", "not found", timeout_ms);
         return false;
     }
     if (!std.mem.eql(u8, req.method, "POST")) {
-        try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed");
+        try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed", timeout_ms);
         return false;
     }
     if (req.content_type) |ct| {
         if (!std.mem.startsWith(u8, ct, "application/json")) {
-            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
+            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
             return false;
         }
     } else {
-        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
+        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
         return false;
     }
 
     const keep_alive = !connectionCloseRequested(req.connection);
     const rpc = try handleRpc(ra, io, cfg, req.body);
-    try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive);
+    try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive, timeout_ms);
     return keep_alive;
 }
 
 fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
-    if (comptime os.stub_socket_read) {
-        return error.Unsupported;
-    } else {
+    // Socket I/O goes through os.net (POSIX keeps raw syscalls,
+    // Windows runs overlapped AFD ioctls with a software deadline; see
+    // os/net.zig for why the Io vtable is unsafe under SO_RCVTIMEO).
+    {
         var data: std.ArrayList(u8) = .empty;
         var header_end: ?usize = null;
         var content_length: usize = 0;
@@ -527,7 +526,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         while (true) {
             if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
             if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
-            const n = try std.posix.read(fd, &buf);
+            const n = try os.net.socketReadSome(fd, &buf, deadline_ms);
             if (n == 0) {
                 // Clean EOF before any bytes: the peer just closed a keep-alive
                 // connection. Not an error — answering here would write a zombie
@@ -544,7 +543,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
                     header_end = idx + 4;
                     content_length = try parseContentLength(data.items[0..idx]);
                     if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
-                        try writeAllFd(fd, "HTTP/1.1 100 Continue\r\n\r\n");
+                        try os.net.socketWriteAll(fd, "HTTP/1.1 100 Continue\r\n\r\n", deadline_ms);
                         continue_sent = true;
                     }
                 }
@@ -1760,35 +1759,15 @@ fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) 
     return os.fd.readFileAlloc(arena, io, path, limit);
 }
 
-fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
-    if (comptime os.stub_socket_options) {
-        return error.Unsupported;
-    } else {
-        const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
-        // Raw syscalls only: std.posix.setsockopt panics via `unreachable` on
-        // EBADF/ENOTSOCK, and under accept churn that must never kill the daemon.
-        const opt = std.mem.asBytes(&tv);
-        const rcv = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
-        if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
-        const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
-        if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
-        // Disable Nagle: the 100-continue path writes two segments per request;
-        // without TCP_NODELAY the second stalls until the first is ACKed (~1 RTT).
-        const one = std.mem.asBytes(&@as(c_int, 1));
-        const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
-        if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
-    }
-}
-
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     return os.writeAllFd(fd, bytes);
 }
 
-fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8) !void {
-    try sendHttpRawMode(arena, fd, status, content_type, body, false);
+fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, timeout_ms: u64) !void {
+    try sendHttpRawMode(arena, fd, status, content_type, body, false, timeout_ms);
 }
 
-fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool) !void {
+fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool, timeout_ms: u64) !void {
     var out: std.ArrayList(u8) = .empty;
     const reason = switch (status) {
         200 => "OK",
@@ -1808,17 +1787,17 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
     const connection = if (keep_alive) "keep-alive" else "close";
     try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ status, reason, content_type, body.len, connection });
     try out.appendSlice(arena, body);
-    try writeAllFd(fd, out.items);
+    try os.net.socketWriteAll(fd, out.items, timeout_ms);
 }
 
-fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8) !void {
+fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8, timeout_ms: u64) !void {
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(arena, "{\"error\":");
     try appendJsonString(&body, arena, code);
     try body.appendSlice(arena, ",\"message\":");
     try appendJsonString(&body, arena, message);
     try body.appendSlice(arena, "}");
-    try sendHttpRaw(arena, fd, status, "application/json", body.items);
+    try sendHttpRaw(arena, fd, status, "application/json", body.items, timeout_ms);
 }
 
 const TOOLS_JSON =

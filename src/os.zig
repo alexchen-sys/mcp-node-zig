@@ -15,12 +15,14 @@
 //!   * `loadEnviron(gpa)`            — one startup snapshot of the environ
 //!   * `environGet(arena, env, key)` — unified lookup over the snapshot
 //!   * `homeDir(arena, env)`         — "~" expansion source
+//! Connected-socket I/O, per-operation timeouts and
+//! socket options live in `os/net.zig`, re-exported below as `os.net`.
 //!
 //! Cross-compile gates registered here:
 //! none at this level — the dispatch itself is the only comptime switch.
 //! Call-site gates in `main.zig` for not-yet-ported Linux-only code
-//! (file I/O, process control, socket options) are annotated
-//! inline where they live.
+//! (file I/O token read, process control) are annotated inline where they
+//! live.
 
 const builtin = @import("builtin");
 
@@ -30,6 +32,9 @@ pub const windows = @import("os/windows.zig");
 // Cross-platform file I/O helpers and per-OS sysinfo.
 pub const fd = @import("os/fd.zig");
 pub const sysinfo = @import("os/sysinfo.zig");
+
+/// Connected-socket I/O, timeouts and socket options.
+pub const net = @import("os/net.zig");
 
 const impl = switch (builtin.os.tag) {
     .windows => windows,
@@ -56,8 +61,6 @@ pub const homeDir = env.homeDir;
 pub const gate_posix_file_io = builtin.os.tag == .windows;
 pub const stub_process_control = builtin.os.tag == .windows;
 pub const stub_pipe_poll = builtin.os.tag == .windows;
-pub const stub_socket_read = builtin.os.tag == .windows;
-pub const stub_socket_options = builtin.os.tag == .windows;
 
 comptime {
     // Fail loudly on targets nobody has thought about instead of silently
