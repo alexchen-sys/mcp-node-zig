@@ -1339,37 +1339,22 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const hostname = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/sys/kernel/hostname", 256) catch "", "\r\n ");
-    const loadavg = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/loadavg", 256) catch "", "\r\n ");
-    const uptime_s = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/uptime", 256) catch "", "\r\n ");
-    const meminfo = readFileAllocMaybe(arena, io, "/proc/meminfo", 16384) catch "";
-    var mem_total: u64 = 0;
-    var mem_avail: u64 = 0;
-    var it = std.mem.splitScalar(u8, meminfo, '\n');
-    while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "MemTotal:")) mem_total = parseKbLine(line);
-        if (std.mem.startsWith(u8, line, "MemAvailable:")) mem_avail = parseKbLine(line);
-    }
+    // Per-OS fetchers live in os.sysinfo; every field
+    // degrades independently to ""/0, exactly like the old `catch ""` sites.
+    const info = os.sysinfo.fetch(arena, io);
     try out.appendSlice(arena, "{\"node\":");
-    try appendJsonString(out, arena, hostname);
+    try appendJsonString(out, arena, info.hostname);
     try out.appendSlice(arena, ",\"hostname\":");
-    try appendJsonString(out, arena, hostname);
-    try out.appendSlice(arena, ",\"os\":\"Linux\",\"machine\":\"x86_64\",\"loadavg_raw\":");
-    try appendJsonString(out, arena, loadavg);
+    try appendJsonString(out, arena, info.hostname);
+    try out.appendSlice(arena, ",\"os\":\"" ++ os.sysinfo.os_name ++ "\",\"machine\":\"" ++ os.sysinfo.machine ++ "\",\"loadavg_raw\":");
+    try appendJsonString(out, arena, info.loadavg_raw);
     try out.appendSlice(arena, ",\"uptime_raw\":");
-    try appendJsonString(out, arena, uptime_s);
+    try appendJsonString(out, arena, info.uptime_raw);
     try out.appendSlice(arena, ",\"mem\":{\"MemTotal\":");
-    try out.print(arena, "{d}", .{mem_total * 1024});
+    try out.print(arena, "{d}", .{info.mem_total});
     try out.appendSlice(arena, ",\"MemAvailable\":");
-    try out.print(arena, "{d}", .{mem_avail * 1024});
+    try out.print(arena, "{d}", .{info.mem_available});
     try out.appendSlice(arena, "}}");
-}
-
-fn parseKbLine(line: []const u8) u64 {
-    var it = std.mem.tokenizeScalar(u8, line, ' ');
-    _ = it.next();
-    const num = it.next() orelse return 0;
-    return std.fmt.parseInt(u64, num, 10) catch 0;
 }
 
 fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
@@ -1379,15 +1364,14 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
     const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
-        if (comptime os.gate_posix_file_io) {
-            return err;
-        } else {
-            switch (err) {
-                error.FileNotFound => return error.FileNotFound,
-                error.IsDir => return error.IsDirectory,
-                error.StreamTooLong => return error.FileTooLarge,
-                else => return err,
-            }
+        // The read path is cross-platform, so the mapping holds
+        // on every target. error.IsDir surfaces at read time (opening a
+        // directory read-only succeeds, the first read fails).
+        switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.IsDir => return error.IsDirectory,
+            error.StreamTooLong => return error.FileTooLarge,
+            else => return err,
         }
     };
     const text = try utf8LossyAlloc(arena, data);
@@ -1425,13 +1409,10 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
     const mode: std.posix.mode_t = @intCast(mode_i);
-    if (comptime os.gate_posix_file_io) {
-        return error.Unsupported;
-    } else {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
-        defer os.closeFd(fd);
-        try writeAllFd(fd, data);
-    }
+    // POSIX applies `mode` exactly via openat(2); on Windows the
+    // mode is ignored (NTFS ACLs, not POSIX permission bits) — both paths and
+    // the rationale live in os.fd.writeFile.
+    try os.fd.writeFile(io, path, data, mode);
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(data);
@@ -1693,22 +1674,11 @@ fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
 }
 
 fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    _ = io;
-    if (comptime os.gate_posix_file_io) {
-        return error.Unsupported;
-    } else {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
-        defer os.closeFd(fd);
-        var out: std.ArrayList(u8) = .empty;
-        var buf: [IO_BUF_SIZE]u8 = undefined;
-        while (true) {
-            const n = try std.posix.read(fd, &buf);
-            if (n == 0) break;
-            if (out.items.len + n > limit) return error.StreamTooLong;
-            try out.appendSlice(arena, buf[0..n]);
-        }
-        return out.items;
-    }
+    // Cross-platform implementation lives in os.fd — open via
+    // Io.Dir, file.readStreaming to EOF, file.close(io). Reading to EOF (not
+    // to stat size) is load-bearing: Linux /proc files report a zero size
+    // yet yield content.
+    return os.fd.readFileAlloc(arena, io, path, limit);
 }
 
 fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
