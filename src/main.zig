@@ -25,7 +25,6 @@ const EXEC_MAX_TIMEOUT_S: i64 = 1800;
 const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
 const WAIT_MAX_TIMEOUT_S: i64 = 300;
 const TOKEN_FILE_MAX_BYTES: usize = 4096;
-const ENVIRON_MAX_BYTES: usize = 1 << 20;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
 const DEFAULT_SESSION_TTL_MS: i64 = 600_000;
@@ -284,8 +283,9 @@ pub fn main() !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const environ = try loadPosixEnviron(std.heap.page_allocator);
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = environ });
+    // Cross-platform environment snapshot (linux: /proc/self/environ).
+    process_environ = try os.loadEnviron(std.heap.page_allocator);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = process_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -354,33 +354,33 @@ fn logLine(msg: []const u8, host: []const u8, port: u16) void {
 }
 
 fn loadConfig(arena: Allocator, io: Io) !Config {
-    const name = getEnv(arena, io, "MCP_NODE_NAME") orelse "mcp-node";
-    const host = getEnv(arena, io, "MCP_NODE_HOST") orelse "127.0.0.1";
-    const port_s = getEnv(arena, io, "MCP_NODE_PORT") orelse "8341";
+    const name = getEnv(arena, "MCP_NODE_NAME") orelse "mcp-node";
+    const host = getEnv(arena, "MCP_NODE_HOST") orelse "127.0.0.1";
+    const port_s = getEnv(arena, "MCP_NODE_PORT") orelse "8341";
     const port = try std.fmt.parseInt(u16, port_s, 10);
-    const max_out_s = getEnv(arena, io, "MCP_NODE_MAX_OUT") orelse "400000";
+    const max_out_s = getEnv(arena, "MCP_NODE_MAX_OUT") orelse "400000";
     const max_out = try std.fmt.parseInt(usize, max_out_s, 10);
-    const socket_timeout_s = getEnv(arena, io, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
+    const socket_timeout_s = getEnv(arena, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
     var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
     if (socket_timeout == 0) socket_timeout = 60;
-    const max_conn_s = getEnv(arena, io, "MCP_NODE_MAX_CONN") orelse "128";
+    const max_conn_s = getEnv(arena, "MCP_NODE_MAX_CONN") orelse "128";
     var max_conn = try std.fmt.parseInt(u16, max_conn_s, 10);
     if (max_conn == 0) max_conn = 128;
-    const max_sessions_s = getEnv(arena, io, "MCP_NODE_MAX_SESSIONS") orelse "64";
+    const max_sessions_s = getEnv(arena, "MCP_NODE_MAX_SESSIONS") orelse "64";
     var max_sessions = try std.fmt.parseInt(u16, max_sessions_s, 10);
     if (max_sessions == 0) max_sessions = 64;
-    const session_ttl_s = getEnv(arena, io, "MCP_NODE_SESSION_TTL_S") orelse "600";
+    const session_ttl_s = getEnv(arena, "MCP_NODE_SESSION_TTL_S") orelse "600";
     var session_ttl = try std.fmt.parseInt(u32, session_ttl_s, 10);
     if (session_ttl == 0) session_ttl = 600;
 
-    const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
+    const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
         if (comptime os.gate_posix_file_io) {
             return err;
         } else {
             break :token_blk switch (err) {
                 error.FileNotFound => insecure_blk: {
-                    const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
+                    const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
                     if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
                     break :insecure_blk try arena.dupe(u8, "");
                 },
@@ -390,12 +390,12 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     };
     const token = std.mem.trim(u8, token_raw, " \t\r\n");
     if (token.len == 0) {
-        const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
+        const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
         if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
     }
 
-    const hosts_s = getEnv(arena, io, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
-    const origins_s = getEnv(arena, io, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
+    const hosts_s = getEnv(arena, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
+    const origins_s = getEnv(arena, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
     return .{
         .name = name,
         .host = try arena.dupe(u8, host),
@@ -411,42 +411,16 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     };
 }
 
-fn getEnv(arena: Allocator, io: Io, key: []const u8) ?[]const u8 {
-    const data = readFileAllocMaybe(arena, io, "/proc/self/environ", ENVIRON_MAX_BYTES) catch return null;
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len <= key.len) continue;
-        if (!std.mem.eql(u8, entry[0..key.len], key)) continue;
-        if (entry[key.len] != '=') continue;
-        return entry[key.len + 1 ..];
-    }
-    return null;
-}
+/// Process environment snapshot, loaded once in `main` before any
+/// connection thread spawns and only read afterwards (the daemon never
+/// calls setenv), so sharing it across threads needs no synchronization.
+var process_environ: std.process.Environ = .empty;
 
-fn loadPosixEnviron(gpa: Allocator) !std.process.Environ {
-    if (@import("builtin").os.tag != .linux) return .empty;
-    const data = readFileAllocMaybe(gpa, Io.Threaded.global_single_threaded.io(), "/proc/self/environ", ENVIRON_MAX_BYTES) catch return .empty;
-    if (data.len == 0) return .empty;
-    var count: usize = 0;
-    var start: usize = 0;
-    for (data, 0..) |b, i| {
-        if (b != 0) continue;
-        if (i > start) count += 1;
-        start = i + 1;
-    }
-    if (count == 0) return .empty;
-    const slice = try gpa.allocSentinel(?[*:0]const u8, count, null);
-    var idx: usize = 0;
-    start = 0;
-    for (data, 0..) |b, i| {
-        if (b != 0) continue;
-        if (i > start) {
-            slice[idx] = @ptrCast(data.ptr + start);
-            idx += 1;
-        }
-        start = i + 1;
-    }
-    return .{ .block = .{ .slice = slice } };
+/// All environment reads go through the OS layer's cross-platform
+/// snapshot lookup. Linux behavior is unchanged: same `/proc/self/environ`
+/// source, same parse, same degrade-to-null-on-missing semantics.
+fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
+    return os.environGet(arena, process_environ, key);
 }
 
 fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
@@ -1365,37 +1339,22 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const hostname = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/sys/kernel/hostname", 256) catch "", "\r\n ");
-    const loadavg = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/loadavg", 256) catch "", "\r\n ");
-    const uptime_s = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/uptime", 256) catch "", "\r\n ");
-    const meminfo = readFileAllocMaybe(arena, io, "/proc/meminfo", 16384) catch "";
-    var mem_total: u64 = 0;
-    var mem_avail: u64 = 0;
-    var it = std.mem.splitScalar(u8, meminfo, '\n');
-    while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "MemTotal:")) mem_total = parseKbLine(line);
-        if (std.mem.startsWith(u8, line, "MemAvailable:")) mem_avail = parseKbLine(line);
-    }
+    // Per-OS fetchers live in os.sysinfo; every field
+    // degrades independently to ""/0, exactly like the old `catch ""` sites.
+    const info = os.sysinfo.fetch(arena, io);
     try out.appendSlice(arena, "{\"node\":");
-    try appendJsonString(out, arena, hostname);
+    try appendJsonString(out, arena, info.hostname);
     try out.appendSlice(arena, ",\"hostname\":");
-    try appendJsonString(out, arena, hostname);
-    try out.appendSlice(arena, ",\"os\":\"Linux\",\"machine\":\"x86_64\",\"loadavg_raw\":");
-    try appendJsonString(out, arena, loadavg);
+    try appendJsonString(out, arena, info.hostname);
+    try out.appendSlice(arena, ",\"os\":\"" ++ os.sysinfo.os_name ++ "\",\"machine\":\"" ++ os.sysinfo.machine ++ "\",\"loadavg_raw\":");
+    try appendJsonString(out, arena, info.loadavg_raw);
     try out.appendSlice(arena, ",\"uptime_raw\":");
-    try appendJsonString(out, arena, uptime_s);
+    try appendJsonString(out, arena, info.uptime_raw);
     try out.appendSlice(arena, ",\"mem\":{\"MemTotal\":");
-    try out.print(arena, "{d}", .{mem_total * 1024});
+    try out.print(arena, "{d}", .{info.mem_total});
     try out.appendSlice(arena, ",\"MemAvailable\":");
-    try out.print(arena, "{d}", .{mem_avail * 1024});
+    try out.print(arena, "{d}", .{info.mem_available});
     try out.appendSlice(arena, "}}");
-}
-
-fn parseKbLine(line: []const u8) u64 {
-    var it = std.mem.tokenizeScalar(u8, line, ' ');
-    _ = it.next();
-    const num = it.next() orelse return 0;
-    return std.fmt.parseInt(u64, num, 10) catch 0;
 }
 
 fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
@@ -1405,15 +1364,14 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
     const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
-        if (comptime os.gate_posix_file_io) {
-            return err;
-        } else {
-            switch (err) {
-                error.FileNotFound => return error.FileNotFound,
-                error.IsDir => return error.IsDirectory,
-                error.StreamTooLong => return error.FileTooLarge,
-                else => return err,
-            }
+        // The read path is cross-platform, so the mapping holds
+        // on every target. error.IsDir surfaces at read time (opening a
+        // directory read-only succeeds, the first read fails).
+        switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.IsDir => return error.IsDirectory,
+            error.StreamTooLong => return error.FileTooLarge,
+            else => return err,
         }
     };
     const text = try utf8LossyAlloc(arena, data);
@@ -1451,13 +1409,10 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
     const mode: std.posix.mode_t = @intCast(mode_i);
-    if (comptime os.gate_posix_file_io) {
-        return error.Unsupported;
-    } else {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
-        defer os.closeFd(fd);
-        try writeAllFd(fd, data);
-    }
+    // POSIX applies `mode` exactly via openat(2); on Windows the
+    // mode is ignored (NTFS ACLs, not POSIX permission bits) — both paths and
+    // the rationale live in os.fd.writeFile.
+    try os.fd.writeFile(io, path, data, mode);
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(data);
@@ -1706,31 +1661,24 @@ fn appendHexLower(out: *std.ArrayList(u8), arena: Allocator, bytes: []const u8) 
 }
 
 fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
-    // Expand "~" and "~/x" to $HOME; leave "~user" and everything else untouched.
+    _ = io;
+    // Expand "~" and "~/x" to the user's home directory; leave "~user" and
+    // everything else untouched. Home resolution is cross-platform
+    // via the OS layer ($HOME on POSIX; %USERPROFILE% with a
+    // %HOMEDRIVE%%HOMEPATH% fallback on Windows).
     if (path.len == 0 or path[0] != '~') return path;
     if (path.len > 1 and path[1] != '/') return path; // "~user" unsupported
-    const home = getEnv(arena, io, "HOME") orelse return path;
+    const home = os.homeDir(arena, process_environ) orelse return path;
     if (home.len == 0) return path;
     return std.mem.concat(arena, u8, &.{ home, path[1..] });
 }
 
 fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    _ = io;
-    if (comptime os.gate_posix_file_io) {
-        return error.Unsupported;
-    } else {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
-        defer os.closeFd(fd);
-        var out: std.ArrayList(u8) = .empty;
-        var buf: [IO_BUF_SIZE]u8 = undefined;
-        while (true) {
-            const n = try std.posix.read(fd, &buf);
-            if (n == 0) break;
-            if (out.items.len + n > limit) return error.StreamTooLong;
-            try out.appendSlice(arena, buf[0..n]);
-        }
-        return out.items;
-    }
+    // Cross-platform implementation lives in os.fd — open via
+    // Io.Dir, file.readStreaming to EOF, file.close(io). Reading to EOF (not
+    // to stat size) is load-bearing: Linux /proc files report a zero size
+    // yet yield content.
+    return os.fd.readFileAlloc(arena, io, path, limit);
 }
 
 fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
