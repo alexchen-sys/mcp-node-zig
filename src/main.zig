@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
+const os = @import("os.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -17,8 +18,8 @@ const IO_BUF_SIZE: usize = 16 * 1024; // shared read scratch: HTTP, session pipe
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
 const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
-const ACCEPT_BACKOFF_NS: u64 = 50_000_000; // 50ms pause after accept failure
-const WAIT_POLL_NS: u64 = 50_000_000; // 50ms exec_wait sleep tick
+const ACCEPT_BACKOFF_MS: u64 = 50; // pause after accept failure
+const WAIT_POLL_MS: u64 = 50; // exec_wait sleep tick
 const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
 const EXEC_MAX_TIMEOUT_S: i64 = 1800;
 const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
@@ -244,9 +245,29 @@ fn nowMs(io: Io) i64 {
 }
 
 fn killSessionTree(pid: std.posix.pid_t) void {
-    if (pid <= 0) return;
-    std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
-    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    if (comptime os.stub_process_control) {
+        return;
+    } else {
+        if (pid <= 0) return;
+        std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    }
+}
+
+fn childPidOrZero(id: ?std.process.Child.Id) std.posix.pid_t {
+    if (comptime os.stub_process_control) {
+        return undefined;
+    } else {
+        return id orelse 0;
+    }
+}
+
+fn pidJsonValue(pid: std.posix.pid_t) u64 {
+    if (comptime os.stub_process_control) {
+        return 0;
+    } else {
+        return @intCast(pid);
+    }
 }
 
 fn termExitCode(term: std.process.Child.Term) i64 {
@@ -282,8 +303,7 @@ pub fn main() !void {
     while (true) {
         var stream = server.accept(io) catch |err| {
             std.debug.print("accept failed: {s}\n", .{@errorName(err)});
-            var backoff_ts = std.os.linux.timespec{ .sec = 0, .nsec = ACCEPT_BACKOFF_NS };
-            _ = std.os.linux.nanosleep(&backoff_ts, null);
+            os.sleepMs(ACCEPT_BACKOFF_MS);
             continue;
         };
         if (!gate.tryAcquire()) {
@@ -330,7 +350,7 @@ fn rejectBusy(io: Io, stream: *Io.net.Stream) void {
 fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} on {s}:{d} path=/mcp\n", .{ msg, host, port }) catch return;
-    writeAllFd(2, line) catch {};
+    writeAllFd(os.stderrFd(), line) catch {};
 }
 
 fn loadConfig(arena: Allocator, io: Io) !Config {
@@ -354,13 +374,19 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     if (session_ttl == 0) session_ttl = 600;
 
     const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
-            if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-            break :blk try arena.dupe(u8, "");
-        },
-        else => return err,
+    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
+        if (comptime os.gate_posix_file_io) {
+            return err;
+        } else {
+            break :token_blk switch (err) {
+                error.FileNotFound => insecure_blk: {
+                    const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
+                    if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
+                    break :insecure_blk try arena.dupe(u8, "");
+                },
+                else => return err,
+            };
+        }
     };
     const token = std.mem.trim(u8, token_raw, " \t\r\n");
     if (token.len == 0) {
@@ -450,11 +476,15 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
         return error.SocketOptionFailed;
     };
     const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
-        switch (err) {
-            error.CleanEof => return false,
-            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
-            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large"),
-            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
+        if (comptime os.stub_socket_read) {
+            try sendHttpError(ra, fd, 400, "bad_request", @errorName(err));
+        } else {
+            switch (err) {
+                error.CleanEof => return false,
+                error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
+                error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large"),
+                else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
+            }
         }
         return false;
     };
@@ -505,79 +535,83 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
 }
 
 fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
-    var data: std.ArrayList(u8) = .empty;
-    var header_end: ?usize = null;
-    var content_length: usize = 0;
-    var continue_sent = false;
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    const started = std.Io.Clock.awake.now(io);
-    const deadline_ms = @as(u64, timeout_s) * 1000;
+    if (comptime os.stub_socket_read) {
+        return error.Unsupported;
+    } else {
+        var data: std.ArrayList(u8) = .empty;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        var continue_sent = false;
+        var buf: [IO_BUF_SIZE]u8 = undefined;
+        const started = std.Io.Clock.awake.now(io);
+        const deadline_ms = @as(u64, timeout_s) * 1000;
 
-    while (true) {
-        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-        if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
-        const n = try std.posix.read(fd, &buf);
-        if (n == 0) {
-            // Clean EOF before any bytes: the peer just closed a keep-alive
-            // connection. Not an error — answering here would write a zombie
-            // 400 into a dying socket.
-            if (data.items.len == 0) return error.CleanEof;
-            break;
-        }
-        try data.appendSlice(arena, buf[0..n]);
-        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-        if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
-        if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
-        if (header_end == null) {
-            if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
-                header_end = idx + 4;
-                content_length = try parseContentLength(data.items[0..idx]);
-                if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
-                    try writeAllFd(fd, "HTTP/1.1 100 Continue\r\n\r\n");
-                    continue_sent = true;
+        while (true) {
+            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
+            if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
+            const n = try std.posix.read(fd, &buf);
+            if (n == 0) {
+                // Clean EOF before any bytes: the peer just closed a keep-alive
+                // connection. Not an error — answering here would write a zombie
+                // 400 into a dying socket.
+                if (data.items.len == 0) return error.CleanEof;
+                break;
+            }
+            try data.appendSlice(arena, buf[0..n]);
+            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
+            if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
+            if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
+            if (header_end == null) {
+                if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
+                    header_end = idx + 4;
+                    content_length = try parseContentLength(data.items[0..idx]);
+                    if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
+                        try writeAllFd(fd, "HTTP/1.1 100 Continue\r\n\r\n");
+                        continue_sent = true;
+                    }
                 }
             }
+            if (header_end) |he| {
+                const total = he + content_length;
+                if (data.items.len >= total) break;
+            }
         }
-        if (header_end) |he| {
-            const total = he + content_length;
-            if (data.items.len >= total) break;
+        const he = header_end orelse return error.BadHeaders;
+        const total = he + content_length;
+        if (data.items.len < total) return error.ShortBody;
+        const head = data.items[0 .. he - 4];
+        const body = data.items[he..total];
+
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        const request_line = lines.next() orelse return error.BadRequestLine;
+        var parts = std.mem.splitScalar(u8, request_line, ' ');
+        const method = parts.next() orelse return error.BadRequestLine;
+        const path = parts.next() orelse return error.BadRequestLine;
+
+        var req = Request{
+            .method = method,
+            .path = path,
+            .host = null,
+            .origin = null,
+            .content_type = null,
+            .content_length = content_length,
+            .token = null,
+            .connection = null,
+            .body = body,
+        };
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (asciiEqlIgnoreCase(name, "host")) req.host = value;
+            if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
+            if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
+            if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
+            if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
         }
+        return req;
     }
-    const he = header_end orelse return error.BadHeaders;
-    const total = he + content_length;
-    if (data.items.len < total) return error.ShortBody;
-    const head = data.items[0 .. he - 4];
-    const body = data.items[he..total];
-
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    const request_line = lines.next() orelse return error.BadRequestLine;
-    var parts = std.mem.splitScalar(u8, request_line, ' ');
-    const method = parts.next() orelse return error.BadRequestLine;
-    const path = parts.next() orelse return error.BadRequestLine;
-
-    var req = Request{
-        .method = method,
-        .path = path,
-        .host = null,
-        .origin = null,
-        .content_type = null,
-        .content_length = content_length,
-        .token = null,
-        .connection = null,
-        .body = body,
-    };
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (asciiEqlIgnoreCase(name, "host")) req.host = value;
-        if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
-        if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
-        if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
-        if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
-    }
-    return req;
 }
 
 fn hasExpectContinue(head: []const u8) bool {
@@ -922,25 +956,29 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    while (true) {
-        // Poll instead of blind blocking read: exec_close must be able to reap
-        // the session even if a grandchild escaped the process group and holds
-        // the pipe write-end open forever.
-        if (session.closing.load(.acquire)) break;
-        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
-        if (ready == 0) continue;
-        if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
-        const n = std.posix.read(fd, &buf) catch break;
-        if (n == 0) break;
-        session.mutex.lockUncancelable(io);
-        if (is_stdout) {
-            appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
-        } else {
-            appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+    if (comptime os.stub_pipe_poll) {
+        return;
+    } else {
+        var buf: [IO_BUF_SIZE]u8 = undefined;
+        while (true) {
+            // Poll instead of blind blocking read: exec_close must be able to reap
+            // the session even if a grandchild escaped the process group and holds
+            // the pipe write-end open forever.
+            if (session.closing.load(.acquire)) break;
+            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
+            if (ready == 0) continue;
+            if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
+            const n = std.posix.read(fd, &buf) catch break;
+            if (n == 0) break;
+            session.mutex.lockUncancelable(io);
+            if (is_stdout) {
+                appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
+            } else {
+                appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+            }
+            session.mutex.unlock(io);
         }
-        session.mutex.unlock(io);
     }
 }
 
@@ -966,7 +1004,7 @@ fn freeSession(session: *Session) void {
     // paths), i.e. always after child.wait() already closed child.stdin/
     // stdout/stderr via std cleanup. The only fd we own is the dup'd stdin
     // write-end taken over at exec_start.
-    if (session.stdin_fd) |fd| _ = std.os.linux.close(fd);
+    if (session.stdin_fd) |fd| os.closeFd(fd);
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
     std.heap.page_allocator.free(session.cwd);
@@ -1028,7 +1066,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = 0,
+        .pgid = if (comptime os.stub_process_control) null else 0,
     });
 
     // Never leak a running child if session allocation fails after spawn.
@@ -1046,23 +1084,25 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     // never race a std-cleanup close, and freeSession never double-closes.
     var stdin_fd: ?std.posix.fd_t = null;
     if (child.stdin) |f| {
-        const dup_rc = std.os.linux.fcntl(f.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
-        if (std.os.linux.errno(dup_rc) != .SUCCESS) return error.DupFailed;
-        stdin_fd = @intCast(dup_rc);
-        _ = std.os.linux.close(f.handle);
-        child.stdin = null;
+        if (comptime !os.stub_process_control) {
+            const dup_rc = std.os.linux.fcntl(f.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
+            if (std.os.linux.errno(dup_rc) != .SUCCESS) return error.DupFailed;
+            stdin_fd = @intCast(dup_rc);
+            os.closeFd(f.handle);
+            child.stdin = null;
+        }
     }
     var stdin_owned = false;
     errdefer {
         if (!stdin_owned) {
-            if (stdin_fd) |fd| _ = std.os.linux.close(fd);
+            if (stdin_fd) |fd| os.closeFd(fd);
         }
     }
 
     const session = try std.heap.page_allocator.create(Session);
     session.* = .{
         .id = store.allocId(),
-        .pid = child.id orelse 0,
+        .pid = childPidOrZero(child.id),
         .argv = argv,
         .cwd = cwd,
         .child = child,
@@ -1107,7 +1147,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "{\"ok\":true,\"session_id\":");
     try out.print(arena, "{d}", .{session.id});
     try out.appendSlice(arena, ",\"pid\":");
-    try out.print(arena, "{d}", .{session.pid});
+    try out.print(arena, "{d}", .{pidJsonValue(session.pid)});
     try out.appendSlice(arena, "}");
 }
 
@@ -1201,8 +1241,7 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
         session.mutex.unlock(store.io);
         if (done) break;
         if (nowMs(store.io) >= deadline) break;
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = WAIT_POLL_NS };
-        _ = std.os.linux.nanosleep(&ts, null);
+        os.sleepMs(WAIT_POLL_MS);
     }
     try renderSessionState(arena, store, session, stdout_offset, stderr_offset, out);
 }
@@ -1230,7 +1269,7 @@ fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayLis
         try out.appendSlice(arena, "{\"session_id\":");
         try out.print(arena, "{d}", .{s.id});
         try out.appendSlice(arena, ",\"pid\":");
-        try out.print(arena, "{d}", .{pid});
+        try out.print(arena, "{d}", .{pidJsonValue(pid)});
         try out.appendSlice(arena, ",\"argv\":[");
         for (s.argv, 0..) |arg, i| {
             if (i != 0) try out.appendSlice(arena, ",");
@@ -1270,7 +1309,7 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     if (exited) return error.ProcessExited;
     if (data.len != 0) try writeAllFd(fd, data);
     if (eof) {
-        _ = std.os.linux.close(fd);
+        os.closeFd(fd);
         session.stdin_fd = null;
     }
     try out.appendSlice(arena, "{\"ok\":true,\"bytes\":");
@@ -1365,11 +1404,17 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const offset = intArg(args, "offset") orelse 0;
     const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
-    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        error.IsDir => return error.IsDirectory,
-        error.StreamTooLong => return error.FileTooLarge,
-        else => return err,
+    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
+        if (comptime os.gate_posix_file_io) {
+            return err;
+        } else {
+            switch (err) {
+                error.FileNotFound => return error.FileNotFound,
+                error.IsDir => return error.IsDirectory,
+                error.StreamTooLong => return error.FileTooLarge,
+                else => return err,
+            }
+        }
     };
     const text = try utf8LossyAlloc(arena, data);
     const slice = try utf8CharSlice(text, @intCast(offset), @intCast(limit));
@@ -1406,9 +1451,13 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
     const mode: std.posix.mode_t = @intCast(mode_i);
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
-    defer _ = std.os.linux.close(fd);
-    try writeAllFd(fd, data);
+    if (comptime os.gate_posix_file_io) {
+        return error.Unsupported;
+    } else {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
+        defer os.closeFd(fd);
+        try writeAllFd(fd, data);
+    }
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(data);
@@ -1667,46 +1716,45 @@ fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
 
 fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
     _ = io;
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
-    defer _ = std.os.linux.close(fd);
-    var out: std.ArrayList(u8) = .empty;
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    while (true) {
-        const n = try std.posix.read(fd, &buf);
-        if (n == 0) break;
-        if (out.items.len + n > limit) return error.StreamTooLong;
-        try out.appendSlice(arena, buf[0..n]);
+    if (comptime os.gate_posix_file_io) {
+        return error.Unsupported;
+    } else {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
+        defer os.closeFd(fd);
+        var out: std.ArrayList(u8) = .empty;
+        var buf: [IO_BUF_SIZE]u8 = undefined;
+        while (true) {
+            const n = try std.posix.read(fd, &buf);
+            if (n == 0) break;
+            if (out.items.len + n > limit) return error.StreamTooLong;
+            try out.appendSlice(arena, buf[0..n]);
+        }
+        return out.items;
     }
-    return out.items;
 }
 
 fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
-    const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
-    // Raw syscalls only: std.posix.setsockopt panics via `unreachable` on
-    // EBADF/ENOTSOCK, and under accept churn that must never kill the daemon.
-    const opt = std.mem.asBytes(&tv);
-    const rcv = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
-    if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
-    const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
-    if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
-    // Disable Nagle: the 100-continue path writes two segments per request;
-    // without TCP_NODELAY the second stalls until the first is ACKed (~1 RTT).
-    const one = std.mem.asBytes(&@as(c_int, 1));
-    const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
-    if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
+    if (comptime os.stub_socket_options) {
+        return error.Unsupported;
+    } else {
+        const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
+        // Raw syscalls only: std.posix.setsockopt panics via `unreachable` on
+        // EBADF/ENOTSOCK, and under accept churn that must never kill the daemon.
+        const opt = std.mem.asBytes(&tv);
+        const rcv = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
+        if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
+        const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
+        if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
+        // Disable Nagle: the 100-continue path writes two segments per request;
+        // without TCP_NODELAY the second stalls until the first is ACKed (~1 RTT).
+        const one = std.mem.asBytes(&@as(c_int, 1));
+        const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
+        if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
+    }
 }
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const rc = std.os.linux.write(fd, bytes.ptr + off, bytes.len - off);
-        const errno = std.os.linux.errno(rc);
-        switch (errno) {
-            .SUCCESS => off += rc,
-            .INTR => continue,
-            else => return error.WriteFailed,
-        }
-    }
+    return os.writeAllFd(fd, bytes);
 }
 
 fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8) !void {
