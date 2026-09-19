@@ -87,6 +87,11 @@ const Session = struct {
     truncated_stderr: bool = false,
     started_ms: i64,
     ended_ms: ?i64 = null,
+    // Lifecycle: store holds 1 ref while the session is in the map; every
+    // in-flight tool call holds +1 via sessionFromArgs/defer sessionRelease.
+    // freeSession runs only when refs hit 0 (always after thread joins).
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 const SessionStore = struct {
@@ -103,14 +108,34 @@ const SessionStore = struct {
     fn put(self: *SessionStore, session: *Session) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.map.count() >= self.max) return error.TooManySessions;
+        if (self.map.count() >= self.max) {
+            // Lazy evict: reclaim a finished session before refusing.
+            var it = self.map.iterator();
+            while (it.next()) |kv| {
+                const s = kv.value_ptr.*;
+                s.mutex.lockUncancelable(self.io);
+                const is_done = s.done;
+                s.mutex.unlock(self.io);
+                if (!is_done) continue;
+                _ = self.map.fetchRemove(kv.key_ptr.*);
+                s.closing.store(true, .release);
+                if (s.waiter_thread) |t| t.join();
+                if (s.stdout_thread) |t| t.join();
+                if (s.stderr_thread) |t| t.join();
+                sessionRelease(s); // drop the store's ref
+                break;
+            }
+            if (self.map.count() >= self.max) return error.TooManySessions;
+        }
         try self.map.put(session.id, session);
     }
 
     fn get(self: *SessionStore, id: u64) ?*Session {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.map.get(id);
+        const session = self.map.get(id) orelse return null;
+        _ = session.refs.fetchAdd(1, .acq_rel);
+        return session;
     }
 
     fn remove(self: *SessionStore, id: u64) ?*Session {
@@ -171,6 +196,8 @@ pub fn main() !void {
     while (true) {
         var stream = server.accept(io) catch |err| {
             std.debug.print("accept failed: {s}\n", .{@errorName(err)});
+            var backoff_ts = std.os.linux.timespec{ .sec = 0, .nsec = 50_000_000 };
+            _ = std.os.linux.nanosleep(&backoff_ts, null);
             continue;
         };
         if (!gate.tryAcquire()) {
@@ -328,8 +355,10 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     const ra = req_arena_state.allocator();
 
     const fd = stream.socket.handle;
-    setSocketTimeouts(fd, cfg.socket_timeout_s) catch |err| {
-        std.debug.print("setsockopt timeouts failed: {s}\n", .{@errorName(err)});
+    setSocketTimeouts(fd, cfg.socket_timeout_s) catch {
+        // No read timeout -> a silent client could pin a connection slot
+        // forever; refuse the connection instead of serving unprotected.
+        return error.SocketOptionFailed;
     };
     const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
         switch (err) {
@@ -401,6 +430,7 @@ fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16)
         try data.appendSlice(arena, buf[0..n]);
         if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
         if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
+        if (header_end == null and data.items.len > 64 * 1024) return error.HeadersTooLarge;
         if (header_end == null) {
             if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
@@ -783,6 +813,14 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
     var buf: [16384]u8 = undefined;
     while (true) {
+        // Poll instead of blind blocking read: exec_close must be able to reap
+        // the session even if a grandchild escaped the process group and holds
+        // the pipe write-end open forever.
+        if (session.closing.load(.acquire)) break;
+        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, 100) catch break;
+        if (ready == 0) continue;
+        if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
         const n = std.posix.read(fd, &buf) catch break;
         if (n == 0) break;
         session.mutex.lockUncancelable(io);
@@ -813,12 +851,20 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
 }
 
 fn freeSession(session: *Session) void {
+    // Called only after all session threads were joined (close/evict/error paths).
+    if (session.stdin_fd) |fd| _ = std.os.linux.close(fd);
+    if (session.child.stdout) |f| _ = std.os.linux.close(f.handle);
+    if (session.child.stderr) |f| _ = std.os.linux.close(f.handle);
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
     std.heap.page_allocator.free(session.cwd);
     session.stdout.deinit(std.heap.page_allocator);
     session.stderr.deinit(std.heap.page_allocator);
     std.heap.page_allocator.destroy(session);
+}
+
+fn sessionRelease(session: *Session) void {
+    if (session.refs.fetchSub(1, .acq_rel) == 1) freeSession(session);
 }
 
 fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
@@ -836,9 +882,14 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
     const argv = try std.heap.page_allocator.alloc([]const u8, argv_v.array.items.len);
     var argv_filled: usize = 0;
+    // Ownership transfers to the Session once it is created; the flags keep
+    // errdefers from double-freeing what freeSession (via sessionRelease) freed.
+    var argv_owned = false;
     errdefer {
-        for (argv[0..argv_filled]) |arg| std.heap.page_allocator.free(arg);
-        std.heap.page_allocator.free(argv);
+        if (!argv_owned) {
+            for (argv[0..argv_filled]) |arg| std.heap.page_allocator.free(arg);
+            std.heap.page_allocator.free(argv);
+        }
     }
     for (argv_v.array.items, 0..) |item, i| {
         if (item != .string) return error.BadArgv;
@@ -847,9 +898,12 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     }
     const cwd_s = strArg(args, "cwd") orelse "";
     const cwd = try std.heap.page_allocator.dupe(u8, cwd_s);
-    errdefer std.heap.page_allocator.free(cwd);
+    var cwd_owned = false;
+    errdefer {
+        if (!cwd_owned) std.heap.page_allocator.free(cwd);
+    }
 
-    const child = try std.process.spawn(io, .{
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
         .stdin = .pipe,
@@ -857,6 +911,15 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         .stderr = .pipe,
         .pgid = 0,
     });
+
+    // Never leak a running child if session allocation fails after spawn.
+    var child_owned = false;
+    errdefer {
+        if (!child_owned) {
+            if (child.id) |pid| killSessionTree(pid);
+            _ = child.wait(io) catch null;
+        }
+    }
 
     const session = try std.heap.page_allocator.create(Session);
     session.* = .{
@@ -868,17 +931,18 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         .stdin_fd = if (child.stdin) |f| f.handle else null,
         .started_ms = nowMs(io),
     };
+    argv_owned = true;
+    cwd_owned = true;
+    child_owned = true;
 
-    store.put(session) catch |err| {
-        session.child.kill(io);
-        freeSession(session);
-        return err;
-    };
-
+    // Spawn threads before publishing: a session visible in the store always
+    // has its threads running, so concurrent exec_close can never see null
+    // thread handles and skip the join while exec_start keeps writing.
     session.stdout_thread = std.Thread.spawn(.{}, sessionReaderMain, .{ session, session.child.stdout.?.handle, true, cfg.max_out, io }) catch null;
     session.stderr_thread = std.Thread.spawn(.{}, sessionReaderMain, .{ session, session.child.stderr.?.handle, false, cfg.max_out, io }) catch null;
     session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
     if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
+        session.closing.store(true, .release);
         killSessionTree(session.pid);
         if (session.waiter_thread) |t| {
             t.join();
@@ -887,16 +951,48 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
-        _ = store.remove(session.id);
-        freeSession(session);
+        sessionRelease(session);
         return error.SessionThreadFailed;
     }
+
+    store.put(session) catch |err| {
+        session.closing.store(true, .release);
+        killSessionTree(session.pid);
+        if (session.waiter_thread) |t| t.join();
+        if (session.stdout_thread) |t| t.join();
+        if (session.stderr_thread) |t| t.join();
+        sessionRelease(session);
+        return err;
+    };
 
     try out.appendSlice(arena, "{\"ok\":true,\"session_id\":");
     try out.print(arena, "{d}", .{session.id});
     try out.appendSlice(arena, ",\"pid\":");
     try out.print(arena, "{d}", .{session.pid});
     try out.appendSlice(arena, "}");
+}
+
+fn utf8CompletePrefix(bytes: []const u8) []const u8 {
+    // Longest prefix ending on a UTF-8 codepoint boundary; invalid start bytes
+    // are left to the lossy renderer, only a partial valid tail is held back.
+    var end: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+            i += 1;
+            end = i;
+            continue;
+        };
+        if (i + n > bytes.len) break;
+        _ = std.unicode.utf8Decode(bytes[i..][0..n]) catch {
+            i += 1;
+            end = i;
+            continue;
+        };
+        i += n;
+        end = i;
+    }
+    return bytes[0..end];
 }
 
 fn sliceFromOffset(items: []const u8, offset_i: i64) ![]const u8 {
@@ -909,12 +1005,18 @@ fn sliceFromOffset(items: []const u8, offset_i: i64) ![]const u8 {
 fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const session = try sessionFromArgs(cfg, args);
+    defer sessionRelease(session);
     const stdout_offset = intArg(args, "stdout_offset") orelse 0;
     const stderr_offset = intArg(args, "stderr_offset") orelse 0;
     session.mutex.lockUncancelable((cfg.sessions.?).io);
     defer session.mutex.unlock((cfg.sessions.?).io);
-    const stdout_delta = try sliceFromOffset(session.stdout.items, stdout_offset);
-    const stderr_delta = try sliceFromOffset(session.stderr.items, stderr_offset);
+    const stdout_raw = try sliceFromOffset(session.stdout.items, stdout_offset);
+    const stderr_raw = try sliceFromOffset(session.stderr.items, stderr_offset);
+    // While the process is alive never split a multi-byte UTF-8 sequence at
+    // the delta edge: hold the partial tail back; reported offsets let the
+    // client re-fetch it once completed.
+    const stdout_delta = if (session.done) stdout_raw else utf8CompletePrefix(stdout_raw);
+    const stderr_delta = if (session.done) stderr_raw else utf8CompletePrefix(stderr_raw);
     const stdout_text = try utf8LossyAlloc(arena, stdout_delta);
     const stderr_text = try utf8LossyAlloc(arena, stderr_delta);
     const ended = session.ended_ms orelse nowMs((cfg.sessions.?).io);
@@ -927,9 +1029,9 @@ fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     try out.appendSlice(arena, ",\"stderr\":");
     try appendJsonString(out, arena, stderr_text);
     try out.appendSlice(arena, ",\"stdout_offset\":");
-    try out.print(arena, "{d}", .{session.stdout.items.len});
+    try out.print(arena, "{d}", .{stdout_offset + @as(i64, @intCast(stdout_delta.len))});
     try out.appendSlice(arena, ",\"stderr_offset\":");
-    try out.print(arena, "{d}", .{session.stderr.items.len});
+    try out.print(arena, "{d}", .{stderr_offset + @as(i64, @intCast(stderr_delta.len))});
     try out.appendSlice(arena, ",\"truncated_stdout\":");
     try out.appendSlice(arena, if (session.truncated_stdout) "true" else "false");
     try out.appendSlice(arena, ",\"truncated_stderr\":");
@@ -942,6 +1044,7 @@ fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
 fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const session = try sessionFromArgs(cfg, args);
+    defer sessionRelease(session);
     const data_b64 = strArg(args, "data_b64") orelse return error.MissingData;
     const eof = boolArg(args, "eof") orelse false;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
@@ -953,7 +1056,10 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.stdin_mutex.lockUncancelable(sio);
     defer session.stdin_mutex.unlock(sio);
     const fd = session.stdin_fd orelse return error.StdinClosed;
-    if (session.done) return error.ProcessExited;
+    session.mutex.lockUncancelable(sio);
+    const exited = session.done;
+    session.mutex.unlock(sio);
+    if (exited) return error.ProcessExited;
     if (data.len != 0) try writeAllFd(fd, data);
     if (eof) {
         _ = std.os.linux.close(fd);
@@ -970,25 +1076,42 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const session = try sessionFromArgs(cfg, args);
-    if (!session.done) {
-        killSessionTree(session.pid);
-    }
+    defer sessionRelease(session);
+    const sio = (cfg.sessions.?).io;
+    session.mutex.lockUncancelable(sio);
+    const done = session.done;
+    session.mutex.unlock(sio);
+    if (!done) killSessionTree(session.pid);
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
 fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    _ = io;
     const store = cfg.sessions orelse return error.SessionsDisabled;
-    const session = try sessionFromArgs(cfg, args);
-    _ = store.remove(session.id);
-    if (!session.done) {
-        killSessionTree(session.pid);
-    }
+    const session = sessionFromArgs(cfg, args) catch |err| switch (err) {
+        error.UnknownSession => {
+            // Idempotent close: already removed from the map.
+            try out.appendSlice(arena, "{\"ok\":true,\"already_closed\":true}");
+            return;
+        },
+        else => return err,
+    };
+    defer sessionRelease(session); // caller's ref
+    const removed = store.remove(session.id) orelse {
+        // A concurrent exec_close won the removal race and owns kill+join.
+        try out.appendSlice(arena, "{\"ok\":true,\"already_closed\":true}");
+        return;
+    };
+    session.closing.store(true, .release);
+    session.mutex.lockUncancelable(store.io);
+    const done = session.done;
+    session.mutex.unlock(store.io);
+    if (!done) killSessionTree(session.pid);
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();
-    freeSession(session);
+    sessionRelease(removed); // store's ref; frees once the last holder releases
     try out.appendSlice(arena, "{\"ok\":true}");
-    _ = io;
 }
 
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
@@ -1073,7 +1196,7 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
     const mode: std.posix.mode_t = @intCast(mode_i);
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, mode);
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
     defer _ = std.os.linux.close(fd);
     try writeAllFd(fd, data);
 
@@ -1318,7 +1441,7 @@ fn appendHexLower(out: *std.ArrayList(u8), arena: Allocator, bytes: []const u8) 
 
 fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
     _ = io;
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{}, 0);
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
     defer _ = std.os.linux.close(fd);
     var out: std.ArrayList(u8) = .empty;
     var buf: [16384]u8 = undefined;
@@ -1333,8 +1456,13 @@ fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) 
 
 fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
     const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
-    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    // Raw syscalls only: std.posix.setsockopt panics via `unreachable` on
+    // EBADF/ENOTSOCK, and under accept churn that must never kill the daemon.
+    const opt = std.mem.asBytes(&tv);
+    const rcv = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
+    if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
+    const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
+    if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
 }
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
