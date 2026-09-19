@@ -1652,6 +1652,12 @@ fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
     if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
     const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
     if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
+    // Disable Nagle: the 100-continue path writes twice per request, and the
+    // second write would otherwise stall until the first segment is ACKed
+    // (~1 RTT through a tunnel). Single-write responses are unaffected.
+    const one = std.mem.asBytes(&@as(c_int, 1));
+    const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
+    if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
 }
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
