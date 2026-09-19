@@ -18,6 +18,8 @@ const Config = struct {
     max_out: usize,
     socket_timeout_s: u16,
     max_conn: u16,
+    max_sessions: u16,
+    sessions: ?*SessionStore = null,
 };
 
 const Request = struct {
@@ -65,6 +67,87 @@ const Connection = struct {
     stream: Io.net.Stream,
 };
 
+const Session = struct {
+    id: u64,
+    pid: std.posix.pid_t,
+    argv: [][]const u8,
+    cwd: []const u8,
+    child: std.process.Child,
+    stdin_fd: ?std.posix.fd_t,
+    stdin_mutex: std.Io.Mutex = .init,
+    stdout_thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
+    waiter_thread: ?std.Thread = null,
+    mutex: std.Io.Mutex = .init,
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+    done: bool = false,
+    exit_code: ?i64 = null,
+    truncated_stdout: bool = false,
+    truncated_stderr: bool = false,
+    started_ms: i64,
+    ended_ms: ?i64 = null,
+};
+
+const SessionStore = struct {
+    mutex: std.Io.Mutex = .init,
+    io: Io,
+    map: std.AutoHashMap(u64, *Session),
+    next_id: u64 = 1,
+    max: u16,
+
+    fn init(io: Io, max_sessions: u16) SessionStore {
+        return .{ .io = io, .map = std.AutoHashMap(u64, *Session).init(std.heap.page_allocator), .max = max_sessions };
+    }
+
+    fn put(self: *SessionStore, session: *Session) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.map.count() >= self.max) return error.TooManySessions;
+        try self.map.put(session.id, session);
+    }
+
+    fn get(self: *SessionStore, id: u64) ?*Session {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.map.get(id);
+    }
+
+    fn remove(self: *SessionStore, id: u64) ?*Session {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const kv = self.map.fetchRemove(id) orelse return null;
+        return kv.value;
+    }
+
+    fn allocId(self: *SessionStore) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+};
+
+fn nowMs(io: Io) i64 {
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
+fn killSessionTree(pid: std.posix.pid_t) void {
+    if (pid <= 0) return;
+    std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+}
+
+fn termExitCode(term: std.process.Child.Term) i64 {
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |sig| 128 + @as(i64, @intCast(@intFromEnum(sig))),
+        .stopped => |sig| 128 + @as(i64, @intCast(@intFromEnum(sig))),
+        .unknown => |code| @as(i64, @intCast(code)),
+    };
+}
+
 pub fn main() !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -75,7 +158,9 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cfg = try loadConfig(arena, io);
+    var cfg = try loadConfig(arena, io);
+    var sessions = SessionStore.init(io, cfg.max_sessions);
+    cfg.sessions = &sessions;
     var gate = ConnGate{ .io = io, .max = cfg.max_conn };
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
@@ -148,6 +233,9 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     const max_conn_s = getEnv(arena, io, "MCP_NODE_MAX_CONN") orelse "128";
     var max_conn = try std.fmt.parseInt(u16, max_conn_s, 10);
     if (max_conn == 0) max_conn = 128;
+    const max_sessions_s = getEnv(arena, io, "MCP_NODE_MAX_SESSIONS") orelse "64";
+    var max_sessions = try std.fmt.parseInt(u16, max_sessions_s, 10);
+    if (max_sessions == 0) max_sessions = 64;
 
     const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = readFileAllocMaybe(arena, io, token_path, 4096) catch |err| switch (err) {
@@ -176,6 +264,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .max_out = max_out,
         .socket_timeout_s = socket_timeout,
         .max_conn = max_conn,
+        .max_sessions = max_sessions,
     };
 }
 
@@ -531,6 +620,16 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, param
     var payload: std.ArrayList(u8) = .empty;
     if (std.mem.eql(u8, name_v.string, "exec")) {
         toolExec(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
+    } else if (std.mem.eql(u8, name_v.string, "exec_start")) {
+        toolExecStart(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
+    } else if (std.mem.eql(u8, name_v.string, "exec_poll")) {
+        toolExecPoll(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
+    } else if (std.mem.eql(u8, name_v.string, "exec_write")) {
+        toolExecWrite(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
+    } else if (std.mem.eql(u8, name_v.string, "exec_kill")) {
+        toolExecKill(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
+    } else if (std.mem.eql(u8, name_v.string, "exec_close")) {
+        toolExecClose(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "exec_shell")) {
         toolExecShell(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
     } else if (std.mem.eql(u8, name_v.string, "sys_info")) {
@@ -663,6 +762,233 @@ fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try new_args.appendSlice(arena, "}");
     const parsed = try std.json.parseFromSliceLeaky(Value, arena, new_args.items, .{});
     return toolExec(arena, io, cfg, parsed, out);
+}
+
+fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usize, truncated: *bool) void {
+    if (list.items.len >= max_out) {
+        truncated.* = true;
+        return;
+    }
+    const avail = max_out - list.items.len;
+    const take = @min(avail, bytes.len);
+    if (take > 0) {
+        list.appendSlice(std.heap.page_allocator, bytes[0..take]) catch {
+            truncated.* = true;
+            return;
+        };
+    }
+    if (take < bytes.len) truncated.* = true;
+}
+
+fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch break;
+        if (n == 0) break;
+        session.mutex.lockUncancelable(io);
+        if (is_stdout) {
+            appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
+        } else {
+            appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+        }
+        session.mutex.unlock(io);
+    }
+}
+
+fn sessionWaiterMain(session: *Session, io: Io) void {
+    const term = session.child.wait(io) catch {
+        session.mutex.lockUncancelable(io);
+        session.done = true;
+        session.exit_code = null;
+        session.ended_ms = nowMs(io);
+        session.mutex.unlock(io);
+        return;
+    };
+    const code = termExitCode(term);
+    session.mutex.lockUncancelable(io);
+    session.done = true;
+    session.exit_code = code;
+    session.ended_ms = nowMs(io);
+    session.mutex.unlock(io);
+}
+
+fn freeSession(session: *Session) void {
+    for (session.argv) |arg| std.heap.page_allocator.free(arg);
+    std.heap.page_allocator.free(session.argv);
+    std.heap.page_allocator.free(session.cwd);
+    session.stdout.deinit(std.heap.page_allocator);
+    session.stderr.deinit(std.heap.page_allocator);
+    std.heap.page_allocator.destroy(session);
+}
+
+fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
+    const store = cfg.sessions orelse return error.SessionsDisabled;
+    const id_i = intArg(args, "session_id") orelse return error.MissingSession;
+    if (id_i <= 0) return error.BadSession;
+    return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
+}
+
+fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    const store = cfg.sessions orelse return error.SessionsDisabled;
+    const argv_v = objGet(args, "argv") orelse return error.MissingArgv;
+    if (argv_v != .array) return error.BadArgv;
+    if (argv_v.array.items.len == 0) return error.BadArgv;
+
+    const argv = try std.heap.page_allocator.alloc([]const u8, argv_v.array.items.len);
+    var argv_filled: usize = 0;
+    errdefer {
+        for (argv[0..argv_filled]) |arg| std.heap.page_allocator.free(arg);
+        std.heap.page_allocator.free(argv);
+    }
+    for (argv_v.array.items, 0..) |item, i| {
+        if (item != .string) return error.BadArgv;
+        argv[i] = try std.heap.page_allocator.dupe(u8, item.string);
+        argv_filled += 1;
+    }
+    const cwd_s = strArg(args, "cwd") orelse "";
+    const cwd = try std.heap.page_allocator.dupe(u8, cwd_s);
+    errdefer std.heap.page_allocator.free(cwd);
+
+    const child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+
+    const session = try std.heap.page_allocator.create(Session);
+    session.* = .{
+        .id = store.allocId(),
+        .pid = child.id orelse 0,
+        .argv = argv,
+        .cwd = cwd,
+        .child = child,
+        .stdin_fd = if (child.stdin) |f| f.handle else null,
+        .started_ms = nowMs(io),
+    };
+
+    store.put(session) catch |err| {
+        session.child.kill(io);
+        freeSession(session);
+        return err;
+    };
+
+    session.stdout_thread = std.Thread.spawn(.{}, sessionReaderMain, .{ session, session.child.stdout.?.handle, true, cfg.max_out, io }) catch null;
+    session.stderr_thread = std.Thread.spawn(.{}, sessionReaderMain, .{ session, session.child.stderr.?.handle, false, cfg.max_out, io }) catch null;
+    session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
+    if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
+        killSessionTree(session.pid);
+        if (session.waiter_thread) |t| {
+            t.join();
+        } else {
+            _ = session.child.wait(io) catch null;
+        }
+        if (session.stdout_thread) |t| t.join();
+        if (session.stderr_thread) |t| t.join();
+        _ = store.remove(session.id);
+        freeSession(session);
+        return error.SessionThreadFailed;
+    }
+
+    try out.appendSlice(arena, "{\"ok\":true,\"session_id\":");
+    try out.print(arena, "{d}", .{session.id});
+    try out.appendSlice(arena, ",\"pid\":");
+    try out.print(arena, "{d}", .{session.pid});
+    try out.appendSlice(arena, "}");
+}
+
+fn sliceFromOffset(items: []const u8, offset_i: i64) ![]const u8 {
+    if (offset_i < 0) return error.BadOffset;
+    const offset: usize = @intCast(offset_i);
+    if (offset > items.len) return error.BadOffset;
+    return items[offset..];
+}
+
+fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    _ = io;
+    const session = try sessionFromArgs(cfg, args);
+    const stdout_offset = intArg(args, "stdout_offset") orelse 0;
+    const stderr_offset = intArg(args, "stderr_offset") orelse 0;
+    session.mutex.lockUncancelable((cfg.sessions.?).io);
+    defer session.mutex.unlock((cfg.sessions.?).io);
+    const stdout_delta = try sliceFromOffset(session.stdout.items, stdout_offset);
+    const stderr_delta = try sliceFromOffset(session.stderr.items, stderr_offset);
+    const stdout_text = try utf8LossyAlloc(arena, stdout_delta);
+    const stderr_text = try utf8LossyAlloc(arena, stderr_delta);
+    const ended = session.ended_ms orelse nowMs((cfg.sessions.?).io);
+    try out.appendSlice(arena, "{\"ok\":true,\"done\":");
+    try out.appendSlice(arena, if (session.done) "true" else "false");
+    try out.appendSlice(arena, ",\"exit_code\":");
+    if (session.exit_code) |code| try out.print(arena, "{d}", .{code}) else try out.appendSlice(arena, "null");
+    try out.appendSlice(arena, ",\"stdout\":");
+    try appendJsonString(out, arena, stdout_text);
+    try out.appendSlice(arena, ",\"stderr\":");
+    try appendJsonString(out, arena, stderr_text);
+    try out.appendSlice(arena, ",\"stdout_offset\":");
+    try out.print(arena, "{d}", .{session.stdout.items.len});
+    try out.appendSlice(arena, ",\"stderr_offset\":");
+    try out.print(arena, "{d}", .{session.stderr.items.len});
+    try out.appendSlice(arena, ",\"truncated_stdout\":");
+    try out.appendSlice(arena, if (session.truncated_stdout) "true" else "false");
+    try out.appendSlice(arena, ",\"truncated_stderr\":");
+    try out.appendSlice(arena, if (session.truncated_stderr) "true" else "false");
+    try out.appendSlice(arena, ",\"duration_ms\":");
+    try out.print(arena, "{d}", .{ended - session.started_ms});
+    try out.appendSlice(arena, "}");
+}
+
+fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    _ = io;
+    const session = try sessionFromArgs(cfg, args);
+    const data_b64 = strArg(args, "data_b64") orelse return error.MissingData;
+    const eof = boolArg(args, "eof") orelse false;
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
+    const data = try std.heap.page_allocator.alloc(u8, size);
+    defer std.heap.page_allocator.free(data);
+    try std.base64.standard.Decoder.decode(data, data_b64);
+
+    const sio = (cfg.sessions.?).io;
+    session.stdin_mutex.lockUncancelable(sio);
+    defer session.stdin_mutex.unlock(sio);
+    const fd = session.stdin_fd orelse return error.StdinClosed;
+    if (session.done) return error.ProcessExited;
+    if (data.len != 0) try writeAllFd(fd, data);
+    if (eof) {
+        _ = std.os.linux.close(fd);
+        session.stdin_fd = null;
+        session.child.stdin = null;
+    }
+    try out.appendSlice(arena, "{\"ok\":true,\"bytes\":");
+    try out.print(arena, "{d}", .{data.len});
+    try out.appendSlice(arena, ",\"eof\":");
+    try out.appendSlice(arena, if (eof) "true" else "false");
+    try out.appendSlice(arena, "}");
+}
+
+fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    _ = io;
+    const session = try sessionFromArgs(cfg, args);
+    if (!session.done) {
+        killSessionTree(session.pid);
+    }
+    try out.appendSlice(arena, "{\"ok\":true}");
+}
+
+fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    const store = cfg.sessions orelse return error.SessionsDisabled;
+    const session = try sessionFromArgs(cfg, args);
+    _ = store.remove(session.id);
+    if (!session.done) {
+        killSessionTree(session.pid);
+    }
+    if (session.waiter_thread) |t| t.join();
+    if (session.stdout_thread) |t| t.join();
+    if (session.stderr_thread) |t| t.join();
+    freeSession(session);
+    try out.appendSlice(arena, "{\"ok\":true}");
+    _ = io;
 }
 
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
@@ -1064,7 +1390,12 @@ fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []cons
 const TOOLS_JSON =
     \\{"tools":[
     \\{"name":"sys_info","description":"Host summary: hostname, OS, load, memory, uptime.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"exec","description":"Run argv without a shell layer.","inputSchema":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout":{"type":"integer"}},"required":["argv"]}},
+    \\{"name":"exec","description":"Run argv without a shell layer and wait for completion.","inputSchema":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout":{"type":"integer"}},"required":["argv"]}},
+    \\{"name":"exec_start","description":"Start a long-running argv process as a session with piped stdin/stdout/stderr.","inputSchema":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}},"required":["argv"]}},
+    \\{"name":"exec_poll","description":"Poll a session by byte offsets; returns output deltas, done, exit_code, truncation flags.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"},"stdout_offset":{"type":"integer"},"stderr_offset":{"type":"integer"}},"required":["session_id"]}},
+    \\{"name":"exec_write","description":"Write base64 bytes to a session stdin; eof=true closes stdin.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"},"data_b64":{"type":"string"},"eof":{"type":"boolean"}},"required":["session_id","data_b64"]}},
+    \\{"name":"exec_kill","description":"Kill a running session process with SIGKILL.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"}},"required":["session_id"]}},
+    \\{"name":"exec_close","description":"Kill if needed, join session threads, and free session state.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"}},"required":["session_id"]}},
     \\{"name":"exec_shell","description":"Run one shell script layer via bash/sh/fish/zsh -c.","inputSchema":{"type":"object","properties":{"script":{"type":"string"},"shell":{"type":"string"},"timeout":{"type":"integer"},"cwd":{"type":"string"}},"required":["script"]}},
     \\{"name":"read_file","description":"Read a text file as UTF-8 with replacement. offset/limit are in characters.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}},
     \\{"name":"write_file","description":"Write base64 content to a file; returns sha256.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content_b64":{"type":"string"},"mode":{"type":"integer"},"mkdirs":{"type":"boolean"}},"required":["path","content_b64"]}},
@@ -1147,6 +1478,7 @@ test "rpc parse error and notification semantics" {
         .max_out = 1024,
         .socket_timeout_s = 1,
         .max_conn = 4,
+        .max_sessions = 4,
     };
 
     const bad = try handleRpc(arena, io, &cfg, "{");

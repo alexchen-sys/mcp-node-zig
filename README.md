@@ -2,10 +2,15 @@
 
 A tiny, self-contained MCP node for remote machine operations, written in Zig.
 
-It exposes a single streamable-HTTP JSON-RPC endpoint (`POST /mcp`) with six practical tools:
+It exposes a single streamable-HTTP JSON-RPC endpoint (`POST /mcp`) with practical tools:
 
 - `sys_info` — hostname, OS, load, memory, uptime
-- `exec` — run an argv array directly, with no shell layer
+- `exec` — run an argv array directly, with no shell layer, and wait for completion
+- `exec_start` — start a long-running argv process as a session with piped stdin/stdout/stderr
+- `exec_poll` — poll session output by byte offsets, with done/exit_code/truncation flags
+- `exec_write` — write base64 bytes to session stdin; `eof=true` closes stdin
+- `exec_kill` — kill the whole session process group
+- `exec_close` — join session threads and free session state
 - `exec_shell` — run one script through `bash`/`sh`/`fish`/`zsh -c`
 - `read_file` — UTF-8 text read with replacement, character offset/limit
 - `write_file` — base64 write with mkdirs and SHA-256 receipt
@@ -46,6 +51,7 @@ Configuration is environment-only:
 - `MCP_NODE_MAX_OUT` — per-stream stdout/stderr cap, default `400000`
 - `MCP_NODE_SOCKET_TIMEOUT_S` — per-read and total request deadline, default `60` (`0` -> `60`)
 - `MCP_NODE_MAX_CONN` — max concurrent TCP connections, default `128` (`0` -> `128`)
+- `MCP_NODE_MAX_SESSIONS` — max live exec sessions, default `64` (`0` -> `64`)
 - `MCP_NODE_INSECURE=1` — allow startup with a missing token file (not recommended)
 
 Auth header: `X-Node-Token: <token>`.
@@ -71,6 +77,8 @@ curl -sS http://127.0.0.1:8341/mcp \
 - `exec`/`exec_shell` timeouts are clamped to `[1, 1800]` seconds.
 - Connections are handled one thread per connection, capped by `MCP_NODE_MAX_CONN`; excess connections get HTTP 503.
 - HTTP/1.1 keep-alive is supported for sequential requests on one connection; `Connection: close` closes after the response.
+- `exec_start` sessions run in their own process group; `exec_kill`/`exec_close` kill the group so shell children cannot hold pipes open.
+- Session stdout/stderr are capped by `MCP_NODE_MAX_OUT`; overflow sets `truncated_*` instead of failing the process.
 - `exec` does not pass through a shell; shell metacharacters are data.
 - `exec_shell` is intentionally one explicit shell layer for pipelines and redirects.
 - `write_file` returns a SHA-256 digest for verification.
