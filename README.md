@@ -75,7 +75,7 @@ curl -sS http://127.0.0.1:8341/mcp \
 - `exec_write` — base64 bytes to stdin; `eof: true` closes stdin.
 - `exec_kill` — SIGKILL the whole process group.
 - `exec_close` — reap and free; idempotent (`already_closed: true`).
-- `exec_list` — live sessions with id, pid, argv, state, timestamps.
+- `exec_list` — live sessions with id, pid, argv, done, exit_code, timestamps.
 
 Finished sessions are reaped automatically after `MCP_NODE_SESSION_TTL_S` seconds (default 600), and a full store lazily evicts finished sessions before refusing new ones.
 
