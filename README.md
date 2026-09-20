@@ -9,7 +9,7 @@ It exposes a single streamable-HTTP JSON-RPC endpoint (`POST /mcp`) with a fixed
 
 - `sys_info` — hostname, OS, load, memory, uptime
 - `exec` — run an argv array directly, with no shell layer, and wait for completion
-- `exec_shell` — run one script through `bash`/`sh`/`fish`/`zsh -c`
+- `exec_shell` — run one script through a shell (`bash`/`sh`/`fish`/`zsh -c`; `cmd`/`powershell` on Windows)
 - `exec_start` — start a long-running argv process as a session with piped stdin/stdout/stderr
 - `exec_poll` — poll session output by byte offsets, with done/exit_code/truncation flags
 - `exec_wait` — long-poll a session to completion or `timeout` (default 30s, max 300s)
@@ -31,7 +31,7 @@ The design goal is a small trusted edge agent: static binary, explicit token aut
 
 Early `0.1.0`; the contract may evolve.
 
-Platform support: **Linux** is the primary, runtime-verified target. **macOS** and **Windows** are supported by the platform layer (`src/os/`) and are **compile-verified** via `zig build -Dtarget=x86_64-macos` / `-Dtarget=x86_64-windows-gnu`; they have not yet been runtime-verified on live hosts. On Windows, process trees are managed with Job Objects and socket timeouts use overlapped AFD I/O with software deadlines.
+Platform support: **Linux**, **macOS**, and **Windows** — all three are built, unit-tested, and smoke-tested (auth gate, `initialize`, `sys_info`) on every push by the CI matrix. Linux is the primary production target. On Windows, process trees are managed with Job Objects and socket timeouts use overlapped AFD I/O with software deadlines.
 
 ## Build
 
@@ -44,9 +44,9 @@ zig build test
 zig build -Doptimize=ReleaseSafe
 ```
 
-Binary: `zig-out/bin/mcp-node` (statically linked, no libc).
+Binary: `zig-out/bin/mcp-node` (on Linux statically linked with no libc; macOS links libSystem, Windows links kernel32/ntdll — no other dependencies).
 
-There are no prebuilt releases yet; the build above takes seconds and yields a single static binary.
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (aarch64), and Windows (x86_64) are attached to each [GitHub release](https://github.com/alexchen-sys/mcp-node-zig/releases) with a SHA-256 checksum manifest.
 
 ## Run
 
@@ -147,7 +147,7 @@ mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_close"
 `exec_start` spawns argv as a session (own process group, piped stdin/stdout/stderr) and returns `session_id`; drive it with `exec_poll`/`exec_wait`/`exec_write`/`exec_kill`/`exec_close`, and inspect the live set with `exec_list`.
 
 - Sessions are reference-counted; `exec_close` is idempotent (`already_closed: true` on repeat/late close) and safe to race against in-flight `exec_poll`/`exec_write`/`exec_kill` from other connections.
-- `exec_kill`/`exec_close` kill the whole process group (`SIGKILL` on `-pid`), so shell children cannot hold pipes open.
+- `exec_kill`/`exec_close` kill the whole process tree (process-group `SIGKILL` on POSIX, Job Object termination on Windows), so shell children cannot hold pipes open.
 - Output buffers are capped per stream (`MCP_NODE_MAX_OUT`); overflow sets `truncated_stdout`/`truncated_stderr` instead of failing the process.
 - `exec_poll` deltas never split a multi-byte UTF-8 sequence at the chunk edge while the process is alive; the returned offsets always point at the next unconsumed byte.
 - Finished sessions are reaped automatically after `MCP_NODE_SESSION_TTL_S` seconds; a full store (`MCP_NODE_MAX_SESSIONS`) lazily evicts finished sessions before refusing new ones.

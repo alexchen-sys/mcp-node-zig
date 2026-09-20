@@ -8,71 +8,104 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-linux
-          - aarch64-linux
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            zig_key: x86_64-linux
+            archive: tar
+            binary: mcp-node
+            native: true
+          - target: aarch64-linux
+            runner: ubuntu-latest
+            zig_key: x86_64-linux
+            archive: tar
+            binary: mcp-node
+            native: false
+          - target: aarch64-macos
+            runner: macos-latest
+            zig_key: aarch64-macos
+            archive: tar
+            binary: mcp-node
+            native: true
+          - target: x86_64-windows
+            runner: windows-latest
+            zig_key: x86_64-windows
+            archive: zip
+            binary: mcp-node.exe
+            native: true
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Zig 0.16.0
+        shell: bash
         run: |
           set -euo pipefail
           ZIG_VERSION=0.16.0
           INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
-          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".tarball')
-          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".shasum')
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_key }}" '.[$v][$k].tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_key }}" '.[$v][$k].shasum')
           mkdir -p "$RUNNER_TEMP/zig"
-          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
-          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.pkg"
+          echo "$SHA  $RUNNER_TEMP/zig.pkg" | sha256sum -c -
+          case "$URL" in
+            *.zip) unzip -q "$RUNNER_TEMP/zig.pkg" -d "$RUNNER_TEMP/zig" && mv "$RUNNER_TEMP/zig"/zig-*/* "$RUNNER_TEMP/zig/" ;;
+            *) tar -xJf "$RUNNER_TEMP/zig.pkg" -C "$RUNNER_TEMP/zig" --strip-components=1 ;;
+          esac
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Unit tests (native arch only)
-        if: matrix.target == 'x86_64-linux'
+      - name: Unit tests (native targets)
+        if: matrix.native
+        shell: bash
         run: zig build test
 
-      - name: Build static binary
+      - name: Build release binary
+        shell: bash
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
 
-      - name: Smoke test (native arch only)
-        if: matrix.target == 'x86_64-linux'
-        run: |
-          set -euo pipefail
-          printf 'release-smoke-token' > "$RUNNER_TEMP/token"
-          MCP_NODE_TOKEN_FILE="$RUNNER_TEMP/token" ./zig-out/bin/mcp-node &
-          PID=$!
-          trap 'kill $PID 2>/dev/null || true' EXIT
-          for i in $(seq 1 50); do
-            curl -s -o /dev/null http://127.0.0.1:8341/mcp && break || sleep 0.1
-          done
-          body=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
-            -H 'Content-Type: application/json' \
-            -H 'x-node-token: release-smoke-token' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
-          echo "$body" | grep -q '"name":"mcp-node"'
+      - name: Smoke test (native targets)
+        if: matrix.native && runner.os != 'Windows'
+        shell: bash
+        run: ci/smoke.sh
 
-      - name: Package tarball
+      - name: Smoke test (native Windows)
+        if: matrix.native && runner.os == 'Windows'
+        shell: pwsh
+        run: ci/smoke.ps1
+
+      - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           pkg="mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$pkg"
-          cp zig-out/bin/mcp-node LICENSE README.md "dist/$pkg/"
-          tar -C dist -czf "$pkg.tar.gz" "$pkg"
-          sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
+          cp "zig-out/bin/${{ matrix.binary }}" LICENSE README.md "dist/$pkg/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && zip -qr "$pkg.zip" "$pkg")
+            sha256sum "dist/$pkg.zip" > "dist/$pkg.zip.sha256"
+          else
+            tar -C dist -czf "$pkg.tar.gz" "$pkg"
+            sha256sum "$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: |
-            *.tar.gz
-            *.tar.gz.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
           retention-days: 7
 
   release:
@@ -88,8 +121,8 @@ jobs:
       - name: Build checksum manifest
         run: |
           set -euo pipefail
-          cat ./*.tar.gz.sha256 > SHA256SUMS.txt
-          rm ./*.tar.gz.sha256
+          cat ./*.sha256 > SHA256SUMS.txt
+          rm ./*.sha256
           cat SHA256SUMS.txt
 
       - name: Publish GitHub release
@@ -97,5 +130,6 @@ jobs:
         with:
           files: |
             *.tar.gz
+            *.zip
             SHA256SUMS.txt
           generate_release_notes: true
