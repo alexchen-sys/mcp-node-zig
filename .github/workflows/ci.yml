@@ -28,6 +28,7 @@ jobs:
             smoke_script: ci/smoke.sh
           - os: windows-latest
             zig_tarball_key: x86_64-windows
+            zig_archive: zip
             binary: mcp-node.exe
             smoke_script: ci/smoke.ps1
     runs-on: ${{ matrix.os }}
@@ -43,9 +44,16 @@ jobs:
           URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].tarball')
           SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].shasum')
           mkdir -p "$RUNNER_TEMP/zig"
-          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
-          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          if [ "${{ matrix.zig_archive }}" = "zip" ]; then
+            curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.zip"
+            echo "$SHA  $RUNNER_TEMP/zig.zip" | sha256sum -c -
+            unzip -q "$RUNNER_TEMP/zig.zip" -d "$RUNNER_TEMP/zig"
+            mv "$RUNNER_TEMP/zig"/zig-*/* "$RUNNER_TEMP/zig/"
+          else
+            curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+            echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+            tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          fi
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Check formatting
