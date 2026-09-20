@@ -1,10 +1,7 @@
 //! Windows platform path.
 //!
-//! Only `closeFd` is a real implementation (std exposes
-//! `std.os.windows.CloseHandle`, and on Windows `std.posix.fd_t` is a
-//! `HANDLE`). The other two entry points are documented stubs so the file
-//! compiles for `x86_64-windows-gnu`; real implementations land with their
-//! respective follow-ups.
+//! `std.posix.fd_t` is a `HANDLE` here, so `closeFd` maps to
+//! `std.os.windows.CloseHandle`; writes go through `WriteFile`.
 
 const std = @import("std");
 
@@ -12,6 +9,13 @@ pub const fd_t = std.posix.fd_t; // HANDLE on Windows
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) void;
 extern "kernel32" fn GetStdHandle(nStdHandle: u32) ?std.os.windows.HANDLE;
+extern "kernel32" fn WriteFile(
+    hFile: std.os.windows.HANDLE,
+    lpBuffer: [*]const u8,
+    nNumberOfBytesToWrite: u32,
+    lpNumberOfBytesWritten: ?*u32,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) i32;
 
 /// Win32 STD_ERROR_HANDLE constant: (DWORD)-12.
 const STD_ERROR_HANDLE: u32 = 0xffff_fff4;
@@ -28,8 +32,8 @@ pub fn closeFd(fd: fd_t) void {
     std.os.windows.CloseHandle(fd);
 }
 
-/// TODO: works, but should be re-evaluated together with the
-/// timer/Io side (std.Io.sleep or a waitable timer) instead of a bare
+/// TODO: works, but should be re-evaluated against
+/// std.Io.sleep or a waitable timer instead of a bare
 /// kernel32 Sleep.
 pub fn sleepMs(ms: u64) void {
     Sleep(@intCast(ms));
@@ -37,12 +41,16 @@ pub fn sleepMs(ms: u64) void {
 
 pub const WriteAllError = error{WriteFailed};
 
-/// TODO: real implementation is a WriteFile loop over
-/// `std.os.windows.WriteFile`. Returns an error instead
-/// of silently succeeding so no caller can mistake the stub for a working
-/// write.
+/// Write the whole buffer to a synchronous handle (stderr, files, pipe
+/// write ends opened without FILE_FLAG_OVERLAPPED). Loops on short writes.
 pub fn writeAllFd(fd: fd_t, bytes: []const u8) WriteAllError!void {
-    _ = fd;
-    _ = bytes;
-    return error.WriteFailed;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const chunk: u32 = @intCast(@min(bytes.len - off, 1 << 30));
+        var written: u32 = 0;
+        if (WriteFile(fd, bytes.ptr + off, chunk, &written, null) == 0)
+            return error.WriteFailed;
+        if (written == 0) return error.WriteFailed;
+        off += written;
+    }
 }

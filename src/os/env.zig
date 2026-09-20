@@ -8,10 +8,8 @@
 //!   * `homeDir(arena, env)`         — source for "~" expansion.
 //!
 //! Snapshot source per platform:
-//!   * Linux:   `/proc/self/environ`, read with the same code path, size cap
-//!              and parse loop the pre-port `loadPosixEnviron` used, so Linux
-//!              behavior is bit-identical (including degrade-to-empty on any
-//!              read error).
+//!   * Linux:   `/proc/self/environ`, read with a 1 MiB cap, degrading to
+//!              empty on any read error.
 //!   * macOS:   the `std.c.environ` extern, borrowed without copying. Apple
 //!              targets always link libSystem, so the extern resolves, and
 //!              the array lives for the whole process. Same counting pattern
@@ -23,8 +21,7 @@
 //!              std's (`Environ.getAlloc` / `createMap`), never hand-rolled.
 //!
 //! The environment is treated as immutable after startup (the daemon never
-//! calls setenv), so one snapshot is behavior-equivalent to the old per-call
-//! `/proc/self/environ` re-read on Linux and is safe to share across
+//! calls setenv), so one snapshot is sufficient and safe to share across
 //! connection threads read-only.
 
 const std = @import("std");
@@ -32,21 +29,20 @@ const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
-/// Upper bound on the Linux environ blob. Moved verbatim from `main.zig`
-/// (was `ENVIRON_MAX_BYTES`); the daemon's real environment is a few KB.
-pub const ENVIRON_MAX_BYTES: usize = 1 << 20;
+/// Upper bound on the Linux environ blob; the real environment is a few KB.
+const ENVIRON_MAX_BYTES: usize = 1 << 20;
 
 /// Linux procfs path supplying the initial process environment.
 const ENVIRON_PROC_PATH = "/proc/self/environ";
 
-/// Scratch size for the Linux read loop (matches main.zig's IO_BUF_SIZE).
+/// Scratch size for the Linux read loop.
 const READ_SCRATCH_SIZE: usize = 16 * 1024;
 
 /// Snapshot the process environment once at startup.
 ///
-/// Only allocation failure is propagated (matches the pre-port contract:
-/// `main` does `try loadEnviron(...)`); every read/parsing problem on Linux
-/// degrades to `.empty`, exactly like the old `loadPosixEnviron`.
+/// Only allocation failure is propagated (`main` does
+/// `try loadEnviron(...)`); every read/parse problem on Linux
+/// degrades to `.empty`.
 pub fn loadEnviron(gpa: Allocator) error{OutOfMemory}!std.process.Environ {
     switch (builtin.os.tag) {
         .linux => {
@@ -54,9 +50,8 @@ pub fn loadEnviron(gpa: Allocator) error{OutOfMemory}!std.process.Environ {
             // `data` is intentionally never freed: the parsed block points
             // into it and the snapshot lives until process exit.
             if (data.len == 0) return .empty;
-            // Parse loop below is byte-for-byte the pre-port one: count
-            // NUL-terminated entries (skipping empty runs), then build a
-            // sentinel slice of pointers into `data`.
+            // Parse loop: count NUL-terminated entries (skipping empty
+            // runs), then build a sentinel slice of pointers into `data`.
             var count: usize = 0;
             var start: usize = 0;
             for (data, 0..) |b, i| {
@@ -104,7 +99,7 @@ pub fn loadEnviron(gpa: Allocator) error{OutOfMemory}!std.process.Environ {
 /// expansion; revisit with a cached map if a hot path ever needs it).
 ///
 /// Any failure (missing key, conversion error, OOM on Windows) degrades to
-/// null, mirroring the pre-port Linux semantics where an unreadable environ
+/// null, matching the Linux semantics where an unreadable environ
 /// was indistinguishable from a missing variable.
 pub fn environGet(arena: Allocator, environ: std.process.Environ, key: []const u8) ?[]const u8 {
     if (comptime builtin.os.tag == .windows) {
@@ -120,10 +115,9 @@ pub fn environGet(arena: Allocator, environ: std.process.Environ, key: []const u
 
 /// Home directory used for "~" expansion.
 ///
-/// POSIX: `$HOME` (returned as-is, including an empty value — callers keep
-/// the pre-port empty-check). Windows: `%USERPROFILE%` when set and
-/// non-empty, else `%HOMEDRIVE%` + `%HOMEPATH%` concatenated (both required
-/// and non-empty), else null.
+/// POSIX: `$HOME` as-is; an empty value yields null. Windows:
+/// `%USERPROFILE%` when set and non-empty, else `%HOMEDRIVE%` +
+/// `%HOMEPATH%` concatenated (both required and non-empty), else null.
 pub fn homeDir(arena: Allocator, environ: std.process.Environ) ?[]const u8 {
     if (comptime builtin.os.tag == .windows) {
         if (environGet(arena, environ, "USERPROFILE")) |profile| {
@@ -143,7 +137,7 @@ pub fn homeDir(arena: Allocator, environ: std.process.Environ) ?[]const u8 {
 /// Referenced only from the `.linux` branch of `loadEnviron`, so it is
 /// analyzed solely on Linux where these `std.posix` calls lower to raw
 /// syscalls; macOS/Windows never see it (same lazy-analysis contract the
-/// `gate_posix_file_io` call site relies on in `main.zig`).
+/// lazy-analysis call sites rely on in `main.zig`).
 fn readFileAlloc(gpa: Allocator, path: []const u8, limit: usize) ![]u8 {
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
     // std.posix.close was removed in 0.16; raw syscall result discarded,

@@ -7,7 +7,7 @@ license your contribution under the project's MIT license.
 
 - **Zig 0.16.x** (see `minimum_zig_version` in `build.zig.zon`) — other
   versions may fail to build
-- Linux only: the daemon uses `/proc` and POSIX process groups
+- Linux, macOS, and Windows: platform specifics live behind the `src/os/` layer (POSIX process groups, Windows Job Objects) — put new platform code there, not in `main.zig`
 
 ## Gates
 

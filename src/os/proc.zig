@@ -10,7 +10,7 @@
 //!   * `createStdinPipe`/`stdinFile` — a parent-owned stdin pipe. The read
 //!     end is handed to the child via `SpawnOptions.stdin = .file`, so
 //!     `std.process.Child.stdin` stays null and `child.wait()` cleanup can
-//!     never close the write end from under `exec_write` (the pre-port code
+//!     never close the write end from under `exec_write`.
 //!     needed an F_DUPFD_CLOEXEC takeover hack because std created that pipe
 //!     itself for `.pipe` stdio).
 //!   * `child_pgid`/`spawn_suspended` — comptime SpawnOptions gates: process
@@ -267,7 +267,7 @@ pub fn readPipeBlocking(handle: windows.HANDLE, buf: []u8) ?usize {
 pub const WriteAllError = os_layer.WriteAllError;
 
 /// Full-buffer write with short-write loop. POSIX delegates to the shared os
-/// layer (bit-identical to the pre-port behavior). Windows loops NtWriteFile
+/// layer. Windows loops NtWriteFile
 /// on the synchronous stdin pipe end; a dead child surfaces as an error
 /// (PIPE_BROKEN), matching EPIPE on POSIX.
 pub fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) WriteAllError!void {

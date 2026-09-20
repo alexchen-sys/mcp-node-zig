@@ -6,7 +6,17 @@ $tokenFile = Join-Path $env:RUNNER_TEMP "mcp-node-ci-token"
 $env:MCP_NODE_TOKEN_FILE = $tokenFile
 
 $proc = Start-Process -FilePath ".\zig-out\bin\mcp-node.exe" -PassThru -NoNewWindow
-Start-Sleep -Seconds 3
+$ready = $false
+foreach ($i in 1..50) {
+    try {
+        $null = Invoke-WebRequest -Uri "http://127.0.0.1:8341/mcp" -UseBasicParsing -TimeoutSec 1
+        $ready = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 200
+    }
+}
+if (-not $ready) { throw "server did not start listening in time" }
 
 try {
     # 401 without token

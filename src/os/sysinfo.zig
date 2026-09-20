@@ -1,6 +1,6 @@
 //! Per-OS sysinfo fetchers.
 //!
-//! Best-effort contract, mirroring the pre-port `catch ""` behavior of the
+//! Best-effort contract: missing fields degrade to empty values.
 //! old toolSysInfo: every field degrades independently to "" / 0 on failure
 //! and `fetch` itself never fails. JSON field parity with the Linux daemon
 //! is the contract; other OSes fill the same fields from their native
@@ -14,7 +14,7 @@ const Io = std.Io;
 const fd = @import("fd.zig");
 
 /// Comptime OS identity for the sys_info payload; replaces the hardcoded
-/// `"os":"Linux","machine":"x86_64"` strings of the Linux-only daemon.
+/// comptime per target.
 pub const os_name: []const u8 = switch (builtin.os.tag) {
     .linux => "Linux",
     .macos => "macOS",
@@ -63,7 +63,7 @@ fn fetchLinux(arena: Allocator, io: Io) SysInfo {
 }
 
 /// Parse a "/proc/meminfo"-style line ("MemTotal:       16384 kB") into the
-/// kB value. Moved verbatim from main.zig (only sysinfo ever used it).
+/// kB value (only sysinfo uses it).
 fn parseKbLine(line: []const u8) u64 {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     _ = it.next();

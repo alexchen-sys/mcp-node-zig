@@ -57,7 +57,7 @@ pub const WriteAllError = error{WriteFailed};
 /// Write the whole buffer to `fd`, looping over short writes and EINTR.
 ///
 /// Linux keeps the exact raw-syscall loop the daemon had in `main.zig`
-/// (`std.os.linux.write` + errno switch) so behavior is bit-identical.
+/// (`std.os.linux.write` + errno switch).
 pub fn writeAllFd(fd: fd_t, bytes: []const u8) WriteAllError!void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -71,7 +71,7 @@ pub fn writeAllFd(fd: fd_t, bytes: []const u8) WriteAllError!void {
         } else {
             // libc POSIX path (macOS et al.).
             // TODO(darwin): grade errno (EINTR retry vs hard failure) like the
-            // Linux branch once the Darwin port lands; NOCANCEL is not applied
+            // Linux branch; NOCANCEL is not applied
             // to write(2), so EINTR is theoretically reachable.
             const rc = std.c.write(fd, bytes.ptr + off, bytes.len - off);
             if (rc <= 0) return error.WriteFailed;

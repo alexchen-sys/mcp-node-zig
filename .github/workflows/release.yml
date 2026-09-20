@@ -43,8 +43,9 @@ jobs:
             binary: mcp-node.exe
             native: true
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.16.0
         shell: bash
@@ -90,8 +91,7 @@ jobs:
           pkg="mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$pkg"
           cp "zig-out/bin/${{ matrix.binary }}" LICENSE README.md "dist/$pkg/"
-          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
-          sha256sum "dist/$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
+          (cd dist && tar -czf "$pkg.tar.gz" "$pkg" && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
 
       - name: Package (zip, Windows)
         if: matrix.archive == 'zip'
@@ -106,7 +106,7 @@ jobs:
           "$h  $pkg.zip" | Out-File -FilePath "dist/$pkg.zip.sha256" -Encoding ascii -NoNewline
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -115,13 +115,14 @@ jobs:
             dist/*.zip
             dist/*.zip.sha256
           retention-days: 7
+          if-no-files-found: error
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: dist-*
           merge-multiple: true
@@ -134,7 +135,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             *.tar.gz

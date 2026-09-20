@@ -23,14 +23,14 @@
 //! never routes them through `IOCTL.AFD.SOCKOPT` (its own
 //! `socketOptionAfd`, Threaded.zig, is only used for address- and
 //! protocol-level options), and no std code or bundled doc confirms that
-//! afd.sys honors them — the architect's "unconfirmed → fallback" trigger.
+//! afd.sys honors them, so deadlines are enforced in software below.
 //! The Windows path therefore enforces the deadline in software: every
 //! read/write is an overlapped AFD ioctl waited on with
 //! `NtWaitForSingleObject(event, timeout)` and cancelled on expiry via
 //! `NtCancelIoFileEx`. `setSocketTimeouts` on Windows sets only
 //! TCP_NODELAY (a real transport-level option) and documents this.
 //!
-//! The architect's brief mentioned `NtReadFile` for the fallback; AFD
+//! Note: AFD handles are not file objects, so `NtReadFile` does not apply; AFD
 //! socket handles are not file objects and reject NtReadFile, so the
 //! equivalent overlapped primitive is `NtDeviceIoControlFile` with
 //! `IOCTL.AFD.RECEIVE`/`IOCTL.AFD.SEND` — the same ioctls std's own
@@ -50,8 +50,7 @@ pub const SetTimeoutError = error{SocketOptionFailed};
 /// Arm per-operation timeouts and TCP_NODELAY on a freshly accepted socket.
 ///
 /// Semantics per platform:
-///   * linux   — raw `std.os.linux.setsockopt`, bit-identical to the
-///               pre-port daemon (see the inline comment: std.posix wraps
+///   * linux   — raw `std.os.linux.setsockopt` (std.posix wraps
 ///               EBADF/ENOTSOCK in `unreachable`, which under accept churn
 ///               must never kill the daemon).
 ///   * darwin  — same setsockopt triple via libc (`std.c`); Darwin always
@@ -127,7 +126,7 @@ pub fn socketReadSome(handle: Handle, buf: []u8, timeout_ms: u64) !usize {
 ///
 /// `timeout_ms` mirrors SO_SNDTIMEO: on POSIX the armed socket option
 /// bounds each syscall; on Windows each overlapped send chunk is waited on
-/// with that deadline. Error mapping is identical to the pre-port daemon:
+/// with that deadline. Error mapping:
 /// any failure collapses to `error.WriteFailed`.
 pub fn socketWriteAll(handle: Handle, bytes: []const u8, timeout_ms: u64) posix_impl.WriteAllError!void {
     if (comptime builtin.os.tag == .windows) {

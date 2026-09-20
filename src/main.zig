@@ -250,12 +250,6 @@ fn nowMs(io: Io) i64 {
     return std.Io.Clock.real.now(io).toMilliseconds();
 }
 
-fn killSessionTree(pid: proc.ProcessId, job: proc.JobField) void {
-    // The real implementation lives in os/proc.zig — process-group
-    // SIGKILL on POSIX, TerminateJobObject on Windows.
-    proc.killTree(pid, job);
-}
-
 /// Child.id is a HANDLE on Windows: resolve the real integer pid through
 /// NtQueryInformationProcess (display-only). POSIX passes the pid through.
 fn childPidOrZero(id: ?std.process.Child.Id) proc.ProcessId {
@@ -355,7 +349,7 @@ fn rejectBusy(cfg: *const Config, io: Io, stream: *Io.net.Stream) void {
 fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} on {s}:{d} path=/mcp\n", .{ msg, host, port }) catch return;
-    writeAllFd(os.stderrFd(), line) catch {};
+    os.writeAllFd(os.stderrFd(), line) catch {};
 }
 
 fn loadConfig(arena: Allocator, io: Io) !Config {
@@ -379,7 +373,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     if (session_ttl == 0) session_ttl = 600;
 
     const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
+    const token_raw = os.fd.readFileAlloc(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
         // Fail-closed on Windows by design: a missing token
         // file fails startup there instead of degrading to insecure mode;
         // the FileNotFound recovery branch is compiled out with the read.
@@ -425,7 +419,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
 var process_environ: std.process.Environ = .empty;
 
 /// All environment reads go through the OS layer's cross-platform
-/// snapshot lookup. Linux behavior is unchanged: same `/proc/self/environ`
+/// snapshot lookup. Linux reads `/proc/self/environ`
 /// source, same parse, same degrade-to-null-on-missing semantics.
 fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
     return os.environGet(arena, process_environ, key);
@@ -644,27 +638,24 @@ fn connectionCloseRequested(connection: ?[]const u8) bool {
     return false;
 }
 
-fn hostAllowed(host_opt: ?[]const u8, allowed: [][]const u8) bool {
-    const host = host_opt orelse return false;
+/// Wildcard list match: exact string, or `base:*` matches `base:anything`.
+fn listAllowed(value: []const u8, allowed: [][]const u8) bool {
     for (allowed) |pat| {
-        if (std.mem.eql(u8, host, pat)) return true;
+        if (std.mem.eql(u8, value, pat)) return true;
         if (std.mem.endsWith(u8, pat, ":*")) {
             const base = pat[0 .. pat.len - 2];
-            if (std.mem.startsWith(u8, host, base) and host.len > base.len and host[base.len] == ':') return true;
+            if (std.mem.startsWith(u8, value, base) and value.len > base.len and value[base.len] == ':') return true;
         }
     }
     return false;
 }
 
+fn hostAllowed(host_opt: ?[]const u8, allowed: [][]const u8) bool {
+    return listAllowed(host_opt orelse return false, allowed);
+}
+
 fn originAllowed(origin: []const u8, allowed: [][]const u8) bool {
-    for (allowed) |pat| {
-        if (std.mem.eql(u8, origin, pat)) return true;
-        if (std.mem.endsWith(u8, pat, ":*")) {
-            const base = pat[0 .. pat.len - 2];
-            if (std.mem.startsWith(u8, origin, base) and origin.len > base.len and origin[base.len] == ':') return true;
-        }
-    }
-    return false;
+    return listAllowed(origin, allowed);
 }
 
 /// JSON-RPC 2.0 dispatch for one MCP request body. Returns the HTTP status
@@ -970,7 +961,7 @@ fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max
         }
         return;
     }
-    // POSIX path: poll-tick loop (unchanged).
+    // POSIX path: poll-tick loop.
     {
         var buf: [IO_BUF_SIZE]u8 = undefined;
         while (true) {
@@ -1094,7 +1085,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     // Parent-owned stdin pipe: the read end goes to the child as .file
     // stdio, the write end becomes Session.stdin_fd. std.process.Child.stdin
     // stays null, so child.wait() cleanup can never close the write end from
-    // under exec_write — this replaces the pre-port F_DUPFD_CLOEXEC takeover
+    // under exec_write — the pipe is owned by the session,
     // hack on every OS.
     const stdin_pipe = try proc.createStdinPipe(io);
     var stdin_read_open = true;
@@ -1137,7 +1128,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     var child_owned = false;
     errdefer {
         if (!child_owned) {
-            killSessionTree(childPidOrZero(child.id), job);
+            proc.killTree(childPidOrZero(child.id), job);
             _ = child.wait(io) catch null;
         }
     }
@@ -1177,7 +1168,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
     if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
         session.closing.store(true, .release);
-        killSessionTree(session.pid, session.job);
+        proc.killTree(session.pid, session.job);
         if (session.waiter_thread) |t| {
             t.join();
         } else {
@@ -1191,7 +1182,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
     store.put(session) catch |err| {
         session.closing.store(true, .release);
-        killSessionTree(session.pid, session.job);
+        proc.killTree(session.pid, session.job);
         if (session.waiter_thread) |t| t.join();
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
@@ -1382,7 +1373,7 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     session.mutex.lockUncancelable(sio);
     const done = session.done;
     session.mutex.unlock(sio);
-    if (!done) killSessionTree(session.pid, session.job);
+    if (!done) proc.killTree(session.pid, session.job);
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
@@ -1410,7 +1401,7 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.mutex.lockUncancelable(store.io);
     const done = session.done;
     session.mutex.unlock(store.io);
-    if (!done) killSessionTree(session.pid, session.job);
+    if (!done) proc.killTree(session.pid, session.job);
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();
@@ -1421,7 +1412,7 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
     _ = cfg;
     // Per-OS fetchers live in os.sysinfo; every field
-    // degrades independently to ""/0, exactly like the old `catch ""` sites.
+    // degrades independently to ""/0.
     const info = os.sysinfo.fetch(arena, io);
     try out.appendSlice(arena, "{\"node\":");
     try appendJsonString(out, arena, info.hostname);
@@ -1444,7 +1435,7 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const offset = intArg(args, "offset") orelse 0;
     const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
-    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
+    const data = os.fd.readFileAlloc(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
         // The read path is cross-platform, so the mapping holds
         // on every target. error.IsDir surfaces at read time (opening a
         // directory read-only succeeds, the first read fails).
@@ -1752,18 +1743,6 @@ fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
     const home = os.homeDir(arena, process_environ) orelse return path;
     if (home.len == 0) return path;
     return std.mem.concat(arena, u8, &.{ home, path[1..] });
-}
-
-fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    // Cross-platform implementation lives in os.fd — open via
-    // Io.Dir, file.readStreaming to EOF, file.close(io). Reading to EOF (not
-    // to stat size) is load-bearing: Linux /proc files report a zero size
-    // yet yield content.
-    return os.fd.readFileAlloc(arena, io, path, limit);
-}
-
-fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
-    return os.writeAllFd(fd, bytes);
 }
 
 fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, timeout_ms: u64) !void {

@@ -50,7 +50,7 @@ pub fn readFileAlloc(arena: Allocator, io: Io, path: []const u8, limit: usize) !
 ///
 /// * POSIX (Linux, macOS): `mode` is applied exactly as the openat(2)
 ///   creation mode, subject to the process umask — identical to the
-///   pre-port behavior.
+///   semantics.
 /// * Windows: `mode` is IGNORED. NTFS has no POSIX permission bits; the
 ///   file inherits the containing directory's ACLs. Callers must not rely
 ///   on `mode` having any effect on this target.
@@ -78,7 +78,7 @@ fn writeFileWindows(io: Io, path: []const u8, data: []const u8) !void {
 }
 
 /// POSIX (Linux, macOS): openat(2) applies `mode` exactly, subject to the
-/// process umask — bit-identical to the pre-port daemon.
+/// process umask.
 fn writeFilePosix(path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
     const file_fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
         .ACCMODE = .WRONLY,

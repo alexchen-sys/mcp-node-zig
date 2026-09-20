@@ -68,7 +68,7 @@ Configuration is environment-only:
 - `MCP_NODE_MAX_CONN` — max concurrent TCP connections, default `128` (`0` -> `128`)
 - `MCP_NODE_MAX_SESSIONS` — max live exec sessions, default `64` (`0` -> `64`)
 - `MCP_NODE_SESSION_TTL_S` — finished-session reap delay, default `600` (`0` -> `600`)
-- `MCP_NODE_INSECURE=1` — allow startup with a missing token file (not recommended)
+- `MCP_NODE_INSECURE=1` — allow startup without a token (not recommended); on Windows a missing token file always fails startup, so create an empty one instead
 
 Auth header: `X-Node-Token: <token>`.
 
@@ -162,7 +162,7 @@ mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_close"
 
 - Auth is a constant-time SHA-256 comparison of the `X-Node-Token` header; a missing token or a wrong one gets HTTP 401, and a missing/empty token file fails closed unless `MCP_NODE_INSECURE=1`.
 - `Host` is validated before JSON parsing; unknown hosts get HTTP 421. A present `Origin` header is validated against `MCP_NODE_ALLOWED_ORIGINS`; unknown origins get HTTP 403.
-- Requests over 32 MiB get HTTP 413; conflicting duplicate `Content-Length` headers are rejected. `Expect: 100-continue` is answered before the body is read. Only `POST /mcp` with `Content-Type: application/json` is served (405/415 otherwise).
+- Requests over 32 MiB get HTTP 413; conflicting duplicate `Content-Length` headers are rejected. `Expect: 100-continue` is answered before the body is read. Only `POST /mcp` with `Content-Type: application/json` is served (404/405/415 otherwise; headers over 64 KiB get 431).
 - `exec`/`exec_shell` timeouts are clamped to `[1, 1800]` seconds (default 120s).
 - Connections are handled one thread per connection, capped by `MCP_NODE_MAX_CONN`; excess connections get HTTP 503.
 - `exec` does not pass through a shell; shell metacharacters are data. `exec_shell` is intentionally one explicit shell layer for pipelines and redirects.

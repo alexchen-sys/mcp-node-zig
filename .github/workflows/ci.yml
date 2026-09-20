@@ -21,19 +21,17 @@ jobs:
           - os: ubuntu-latest
             zig_tarball_key: x86_64-linux
             binary: mcp-node
-            smoke_script: ci/smoke.sh
           - os: macos-latest
             zig_tarball_key: aarch64-macos
             binary: mcp-node
-            smoke_script: ci/smoke.sh
           - os: windows-latest
             zig_tarball_key: x86_64-windows
             zig_archive: zip
             binary: mcp-node.exe
-            smoke_script: ci/smoke.ps1
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Zig 0.16.0
         shell: bash
@@ -79,8 +77,9 @@ jobs:
         run: ci/smoke.ps1
 
       - name: Upload ReleaseSafe binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: mcp-node-${{ matrix.os }}
           path: zig-out/bin/${{ matrix.binary }}
           retention-days: 7
+          if-no-files-found: error
