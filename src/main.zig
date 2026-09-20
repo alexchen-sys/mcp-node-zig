@@ -1,8 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
+const os = @import("os.zig");
+const proc = @import("os/proc.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -17,14 +20,13 @@ const IO_BUF_SIZE: usize = 16 * 1024; // shared read scratch: HTTP, session pipe
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
 const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
-const ACCEPT_BACKOFF_NS: u64 = 50_000_000; // 50ms pause after accept failure
-const WAIT_POLL_NS: u64 = 50_000_000; // 50ms exec_wait sleep tick
+const ACCEPT_BACKOFF_MS: u64 = 50; // pause after accept failure
+const WAIT_POLL_MS: u64 = 50; // exec_wait sleep tick
 const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
 const EXEC_MAX_TIMEOUT_S: i64 = 1800;
 const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
 const WAIT_MAX_TIMEOUT_S: i64 = 300;
 const TOKEN_FILE_MAX_BYTES: usize = 4096;
-const ENVIRON_MAX_BYTES: usize = 1 << 20;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
 const DEFAULT_SESSION_TTL_MS: i64 = 600_000;
@@ -92,11 +94,16 @@ const Connection = struct {
 
 const Session = struct {
     id: u64,
-    pid: std.posix.pid_t,
+    /// Integer pid on every OS (display-only on Windows; control goes
+    /// through the job/handle). See os/proc.zig.
+    pid: proc.ProcessId,
     argv: [][]const u8,
     cwd: []const u8,
     child: std.process.Child,
     stdin_fd: ?std.posix.fd_t,
+    /// Windows: Job Object owning the whole process tree (KILL_ON_JOB_CLOSE).
+    /// void on POSIX. Closed in freeSession.
+    job: proc.JobField = proc.no_job,
     stdin_mutex: std.Io.Mutex = .init,
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
@@ -243,10 +250,27 @@ fn nowMs(io: Io) i64 {
     return std.Io.Clock.real.now(io).toMilliseconds();
 }
 
-fn killSessionTree(pid: std.posix.pid_t) void {
-    if (pid <= 0) return;
-    std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
-    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+fn killSessionTree(pid: proc.ProcessId, job: proc.JobField) void {
+    // The real implementation lives in os/proc.zig — process-group
+    // SIGKILL on POSIX, TerminateJobObject on Windows.
+    proc.killTree(pid, job);
+}
+
+/// Child.id is a HANDLE on Windows: resolve the real integer pid through
+/// NtQueryInformationProcess (display-only). POSIX passes the pid through.
+fn childPidOrZero(id: ?std.process.Child.Id) proc.ProcessId {
+    if (comptime builtin.os.tag == .windows) {
+        const handle = id orelse return 0;
+        return proc.queryProcessId(handle) orelse 0;
+    } else {
+        return id orelse 0;
+    }
+}
+
+/// ProcessId is an integer on every OS (pid_t on POSIX, u32 on Windows), so
+/// pid JSON rendering works everywhere.
+fn pidJsonValue(pid: proc.ProcessId) u64 {
+    return @intCast(pid);
 }
 
 fn termExitCode(term: std.process.Child.Term) i64 {
@@ -263,8 +287,9 @@ pub fn main() !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const environ = try loadPosixEnviron(std.heap.page_allocator);
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = environ });
+    // Cross-platform environment snapshot (linux: /proc/self/environ).
+    process_environ = try os.loadEnviron(std.heap.page_allocator);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = process_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -282,12 +307,11 @@ pub fn main() !void {
     while (true) {
         var stream = server.accept(io) catch |err| {
             std.debug.print("accept failed: {s}\n", .{@errorName(err)});
-            var backoff_ts = std.os.linux.timespec{ .sec = 0, .nsec = ACCEPT_BACKOFF_NS };
-            _ = std.os.linux.nanosleep(&backoff_ts, null);
+            os.sleepMs(ACCEPT_BACKOFF_MS);
             continue;
         };
         if (!gate.tryAcquire()) {
-            rejectBusy(io, &stream);
+            rejectBusy(&cfg, io, &stream);
             continue;
         }
         const conn = std.heap.page_allocator.create(Connection) catch {
@@ -320,56 +344,66 @@ fn connectionThread(conn: *Connection) void {
     }
 }
 
-fn rejectBusy(io: Io, stream: *Io.net.Stream) void {
+fn rejectBusy(cfg: *const Config, io: Io, stream: *Io.net.Stream) void {
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    sendHttpError(fba.allocator(), stream.socket.handle, 503, "busy", "too many connections") catch {};
+    const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
+    sendHttpError(fba.allocator(), stream.socket.handle, 503, "busy", "too many connections", timeout_ms) catch {};
     stream.close(io);
 }
 
 fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} on {s}:{d} path=/mcp\n", .{ msg, host, port }) catch return;
-    writeAllFd(2, line) catch {};
+    writeAllFd(os.stderrFd(), line) catch {};
 }
 
 fn loadConfig(arena: Allocator, io: Io) !Config {
-    const name = getEnv(arena, io, "MCP_NODE_NAME") orelse "mcp-node";
-    const host = getEnv(arena, io, "MCP_NODE_HOST") orelse "127.0.0.1";
-    const port_s = getEnv(arena, io, "MCP_NODE_PORT") orelse "8341";
+    const name = getEnv(arena, "MCP_NODE_NAME") orelse "mcp-node";
+    const host = getEnv(arena, "MCP_NODE_HOST") orelse "127.0.0.1";
+    const port_s = getEnv(arena, "MCP_NODE_PORT") orelse "8341";
     const port = try std.fmt.parseInt(u16, port_s, 10);
-    const max_out_s = getEnv(arena, io, "MCP_NODE_MAX_OUT") orelse "400000";
+    const max_out_s = getEnv(arena, "MCP_NODE_MAX_OUT") orelse "400000";
     const max_out = try std.fmt.parseInt(usize, max_out_s, 10);
-    const socket_timeout_s = getEnv(arena, io, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
+    const socket_timeout_s = getEnv(arena, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
     var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
     if (socket_timeout == 0) socket_timeout = 60;
-    const max_conn_s = getEnv(arena, io, "MCP_NODE_MAX_CONN") orelse "128";
+    const max_conn_s = getEnv(arena, "MCP_NODE_MAX_CONN") orelse "128";
     var max_conn = try std.fmt.parseInt(u16, max_conn_s, 10);
     if (max_conn == 0) max_conn = 128;
-    const max_sessions_s = getEnv(arena, io, "MCP_NODE_MAX_SESSIONS") orelse "64";
+    const max_sessions_s = getEnv(arena, "MCP_NODE_MAX_SESSIONS") orelse "64";
     var max_sessions = try std.fmt.parseInt(u16, max_sessions_s, 10);
     if (max_sessions == 0) max_sessions = 64;
-    const session_ttl_s = getEnv(arena, io, "MCP_NODE_SESSION_TTL_S") orelse "600";
+    const session_ttl_s = getEnv(arena, "MCP_NODE_SESSION_TTL_S") orelse "600";
     var session_ttl = try std.fmt.parseInt(u32, session_ttl_s, 10);
     if (session_ttl == 0) session_ttl = 600;
 
-    const token_path = getEnv(arena, io, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
-            if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-            break :blk try arena.dupe(u8, "");
-        },
-        else => return err,
+    const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
+    const token_raw = readFileAllocMaybe(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
+        // Fail-closed on Windows by design: a missing token
+        // file fails startup there instead of degrading to insecure mode;
+        // the FileNotFound recovery branch is compiled out with the read.
+        if (comptime os.gate_posix_file_io) {
+            return err;
+        } else {
+            break :token_blk switch (err) {
+                error.FileNotFound => insecure_blk: {
+                    const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
+                    if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
+                    break :insecure_blk try arena.dupe(u8, "");
+                },
+                else => return err,
+            };
+        }
     };
     const token = std.mem.trim(u8, token_raw, " \t\r\n");
     if (token.len == 0) {
-        const insecure = getEnv(arena, io, "MCP_NODE_INSECURE") orelse "0";
+        const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
         if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
     }
 
-    const hosts_s = getEnv(arena, io, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
-    const origins_s = getEnv(arena, io, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
+    const hosts_s = getEnv(arena, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
+    const origins_s = getEnv(arena, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
     return .{
         .name = name,
         .host = try arena.dupe(u8, host),
@@ -385,42 +419,16 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     };
 }
 
-fn getEnv(arena: Allocator, io: Io, key: []const u8) ?[]const u8 {
-    const data = readFileAllocMaybe(arena, io, "/proc/self/environ", ENVIRON_MAX_BYTES) catch return null;
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len <= key.len) continue;
-        if (!std.mem.eql(u8, entry[0..key.len], key)) continue;
-        if (entry[key.len] != '=') continue;
-        return entry[key.len + 1 ..];
-    }
-    return null;
-}
+/// Process environment snapshot, loaded once in `main` before any
+/// connection thread spawns and only read afterwards (the daemon never
+/// calls setenv), so sharing it across threads needs no synchronization.
+var process_environ: std.process.Environ = .empty;
 
-fn loadPosixEnviron(gpa: Allocator) !std.process.Environ {
-    if (@import("builtin").os.tag != .linux) return .empty;
-    const data = readFileAllocMaybe(gpa, Io.Threaded.global_single_threaded.io(), "/proc/self/environ", ENVIRON_MAX_BYTES) catch return .empty;
-    if (data.len == 0) return .empty;
-    var count: usize = 0;
-    var start: usize = 0;
-    for (data, 0..) |b, i| {
-        if (b != 0) continue;
-        if (i > start) count += 1;
-        start = i + 1;
-    }
-    if (count == 0) return .empty;
-    const slice = try gpa.allocSentinel(?[*:0]const u8, count, null);
-    var idx: usize = 0;
-    start = 0;
-    for (data, 0..) |b, i| {
-        if (b != 0) continue;
-        if (i > start) {
-            slice[idx] = @ptrCast(data.ptr + start);
-            idx += 1;
-        }
-        start = i + 1;
-    }
-    return .{ .block = .{ .slice = slice } };
+/// All environment reads go through the OS layer's cross-platform
+/// snapshot lookup. Linux behavior is unchanged: same `/proc/self/environ`
+/// source, same parse, same degrade-to-null-on-missing semantics.
+fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
+    return os.environGet(arena, process_environ, key);
 }
 
 fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
@@ -444,7 +452,8 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     const ra = req_arena_state.allocator();
 
     const fd = stream.socket.handle;
-    setSocketTimeouts(fd, cfg.socket_timeout_s) catch {
+    const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
+    os.net.setSocketTimeouts(fd, cfg.socket_timeout_s) catch {
         // No read timeout -> a silent client could pin a connection slot
         // forever; refuse the connection instead of serving unprotected.
         return error.SocketOptionFailed;
@@ -452,20 +461,20 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
     const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
         switch (err) {
             error.CleanEof => return false,
-            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large"),
-            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large"),
-            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err)),
+            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large", timeout_ms),
+            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large", timeout_ms),
+            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err), timeout_ms),
         }
         return false;
     };
 
     if (!hostAllowed(req.host, cfg.allowed_hosts)) {
-        try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header");
+        try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header", timeout_ms);
         return false;
     }
     if (req.origin) |origin| {
         if (!originAllowed(origin, cfg.allowed_origins)) {
-            try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header");
+            try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header", timeout_ms);
             return false;
         }
     }
@@ -476,108 +485,113 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
         std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
         if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
-            try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized");
+            try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized", timeout_ms);
             return false;
         }
     }
     if (!std.mem.eql(u8, req.path, "/mcp")) {
-        try sendHttpError(ra, fd, 404, "not_found", "not found");
+        try sendHttpError(ra, fd, 404, "not_found", "not found", timeout_ms);
         return false;
     }
     if (!std.mem.eql(u8, req.method, "POST")) {
-        try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed");
+        try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed", timeout_ms);
         return false;
     }
     if (req.content_type) |ct| {
         if (!std.mem.startsWith(u8, ct, "application/json")) {
-            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
+            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
             return false;
         }
     } else {
-        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header");
+        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
         return false;
     }
 
     const keep_alive = !connectionCloseRequested(req.connection);
     const rpc = try handleRpc(ra, io, cfg, req.body);
-    try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive);
+    try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive, timeout_ms);
     return keep_alive;
 }
 
 fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
-    var data: std.ArrayList(u8) = .empty;
-    var header_end: ?usize = null;
-    var content_length: usize = 0;
-    var continue_sent = false;
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    const started = std.Io.Clock.awake.now(io);
-    const deadline_ms = @as(u64, timeout_s) * 1000;
+    // Socket I/O goes through os.net (POSIX keeps raw syscalls,
+    // Windows runs overlapped AFD ioctls with a software deadline; see
+    // os/net.zig for why the Io vtable is unsafe under SO_RCVTIMEO).
+    {
+        var data: std.ArrayList(u8) = .empty;
+        var header_end: ?usize = null;
+        var content_length: usize = 0;
+        var continue_sent = false;
+        var buf: [IO_BUF_SIZE]u8 = undefined;
+        const started = std.Io.Clock.awake.now(io);
+        const deadline_ms = @as(u64, timeout_s) * 1000;
 
-    while (true) {
-        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-        if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
-        const n = try std.posix.read(fd, &buf);
-        if (n == 0) {
-            // Clean EOF before any bytes: the peer just closed a keep-alive
-            // connection. Not an error — answering here would write a zombie
-            // 400 into a dying socket.
-            if (data.items.len == 0) return error.CleanEof;
-            break;
-        }
-        try data.appendSlice(arena, buf[0..n]);
-        if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-        if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
-        if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
-        if (header_end == null) {
-            if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
-                header_end = idx + 4;
-                content_length = try parseContentLength(data.items[0..idx]);
-                if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
-                    try writeAllFd(fd, "HTTP/1.1 100 Continue\r\n\r\n");
-                    continue_sent = true;
+        while (true) {
+            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
+            if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
+            const n = try os.net.socketReadSome(fd, &buf, deadline_ms);
+            if (n == 0) {
+                // Clean EOF before any bytes: the peer just closed a keep-alive
+                // connection. Not an error — answering here would write a zombie
+                // 400 into a dying socket.
+                if (data.items.len == 0) return error.CleanEof;
+                break;
+            }
+            try data.appendSlice(arena, buf[0..n]);
+            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
+            if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
+            if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
+            if (header_end == null) {
+                if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
+                    header_end = idx + 4;
+                    content_length = try parseContentLength(data.items[0..idx]);
+                    if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
+                        try os.net.socketWriteAll(fd, "HTTP/1.1 100 Continue\r\n\r\n", deadline_ms);
+                        continue_sent = true;
+                    }
                 }
             }
+            if (header_end) |he| {
+                const total = he + content_length;
+                if (data.items.len >= total) break;
+            }
         }
-        if (header_end) |he| {
-            const total = he + content_length;
-            if (data.items.len >= total) break;
+        const he = header_end orelse return error.BadHeaders;
+        const total = he + content_length;
+        if (data.items.len < total) return error.ShortBody;
+        const head = data.items[0 .. he - 4];
+        const body = data.items[he..total];
+
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        const request_line = lines.next() orelse return error.BadRequestLine;
+        var parts = std.mem.splitScalar(u8, request_line, ' ');
+        const method = parts.next() orelse return error.BadRequestLine;
+        const path = parts.next() orelse return error.BadRequestLine;
+
+        var req = Request{
+            .method = method,
+            .path = path,
+            .host = null,
+            .origin = null,
+            .content_type = null,
+            .content_length = content_length,
+            .token = null,
+            .connection = null,
+            .body = body,
+        };
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (asciiEqlIgnoreCase(name, "host")) req.host = value;
+            if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
+            if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
+            if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
+            if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
         }
+        return req;
     }
-    const he = header_end orelse return error.BadHeaders;
-    const total = he + content_length;
-    if (data.items.len < total) return error.ShortBody;
-    const head = data.items[0 .. he - 4];
-    const body = data.items[he..total];
-
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    const request_line = lines.next() orelse return error.BadRequestLine;
-    var parts = std.mem.splitScalar(u8, request_line, ' ');
-    const method = parts.next() orelse return error.BadRequestLine;
-    const path = parts.next() orelse return error.BadRequestLine;
-
-    var req = Request{
-        .method = method,
-        .path = path,
-        .host = null,
-        .origin = null,
-        .content_type = null,
-        .content_length = content_length,
-        .token = null,
-        .connection = null,
-        .body = body,
-    };
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (asciiEqlIgnoreCase(name, "host")) req.host = value;
-        if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
-        if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
-        if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
-        if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
-    }
-    return req;
 }
 
 fn hasExpectContinue(head: []const u8) bool {
@@ -884,14 +898,25 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
 
 fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     const script = strArg(args, "script") orelse return error.MissingScript;
-    const shell = strArg(args, "shell") orelse "bash";
-    if (!std.mem.eql(u8, shell, "bash") and !std.mem.eql(u8, shell, "sh") and !std.mem.eql(u8, shell, "fish") and !std.mem.eql(u8, shell, "zsh")) return error.UnsupportedShell;
+    const default_shell: []const u8 = if (comptime builtin.os.tag == .windows) "cmd" else "bash";
+    const shell = strArg(args, "shell") orelse default_shell;
+    // Comptime platform allowlist: POSIX shells on POSIX, cmd/powershell on
+    // Windows (mirrored in TOOLS_JSON prose).
+    const shell_ok = if (comptime builtin.os.tag == .windows)
+        (std.mem.eql(u8, shell, "cmd") or std.mem.eql(u8, shell, "powershell"))
+    else
+        (std.mem.eql(u8, shell, "bash") or std.mem.eql(u8, shell, "sh") or std.mem.eql(u8, shell, "fish") or std.mem.eql(u8, shell, "zsh"));
+    if (!shell_ok) return error.UnsupportedShell;
     const cwd = strArg(args, "cwd") orelse "";
     const timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
     var new_args: std.ArrayList(u8) = .empty;
     try new_args.appendSlice(arena, "{\"argv\":[");
     try appendJsonString(&new_args, arena, shell);
-    try new_args.appendSlice(arena, ",\"-c\",");
+    // cmd takes /c; every other supported shell (incl. powershell) takes -c.
+    const script_flag: []const u8 = if (std.mem.eql(u8, shell, "cmd")) "/c" else "-c";
+    try new_args.appendSlice(arena, ",");
+    try appendJsonString(&new_args, arena, script_flag);
+    try new_args.appendSlice(arena, ",");
     try appendJsonString(&new_args, arena, script);
     try new_args.appendSlice(arena, "]");
     if (cwd.len != 0) {
@@ -922,30 +947,61 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    while (true) {
-        // Poll instead of blind blocking read: exec_close must be able to reap
-        // the session even if a grandchild escaped the process group and holds
-        // the pipe write-end open forever.
-        if (session.closing.load(.acquire)) break;
-        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
-        if (ready == 0) continue;
-        if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
-        const n = std.posix.read(fd, &buf) catch break;
-        if (n == 0) break;
-        session.mutex.lockUncancelable(io);
-        if (is_stdout) {
-            appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
-        } else {
-            appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+    if (comptime builtin.os.tag == .windows) {
+        // Blocking NtReadFile loop (no poll tick on this OS). Termination is
+        // guaranteed by the Job Object: exec_kill/exec_close run
+        // TerminateJobObject, the waiter terminates the job when the child
+        // exits, and grandchildren auto-join the job (Win8+) — so every write
+        // end of the pipe eventually closes and the pending read completes
+        // with PIPE_BROKEN (EOF). session.closing is still honored between
+        // reads for the already-EOF fast path.
+        var wbuf: [IO_BUF_SIZE]u8 = undefined;
+        while (true) {
+            if (session.closing.load(.acquire)) break;
+            const n = proc.readPipeBlocking(fd, &wbuf) orelse break;
+            if (n == 0) break;
+            session.mutex.lockUncancelable(io);
+            if (is_stdout) {
+                appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout);
+            } else {
+                appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr);
+            }
+            session.mutex.unlock(io);
         }
-        session.mutex.unlock(io);
+        return;
+    }
+    // POSIX path: poll-tick loop (unchanged).
+    {
+        var buf: [IO_BUF_SIZE]u8 = undefined;
+        while (true) {
+            // Poll instead of blind blocking read: exec_close must be able to reap
+            // the session even if a grandchild escaped the process group and holds
+            // the pipe write-end open forever.
+            if (session.closing.load(.acquire)) break;
+            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
+            if (ready == 0) continue;
+            if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
+            const n = std.posix.read(fd, &buf) catch break;
+            if (n == 0) break;
+            session.mutex.lockUncancelable(io);
+            if (is_stdout) {
+                appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
+            } else {
+                appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+            }
+            session.mutex.unlock(io);
+        }
     }
 }
 
 fn sessionWaiterMain(session: *Session, io: Io) void {
     const term = session.child.wait(io) catch {
+        // Windows: same invariant as below — done=true must imply the job is
+        // dead, so close/reap joins of the blocking readers can never hang.
+        if (comptime builtin.os.tag == .windows) {
+            if (session.job) |j| proc.terminateJob(j);
+        }
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = null;
@@ -954,6 +1010,13 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
         return;
     };
     const code = termExitCode(term);
+    // Windows: the child is gone; terminate the Job Object so grandchildren
+    // cannot outlive the session pinning the pipe write ends open (the
+    // blocking readers have no poll tick — EOF is their only exit). done=true
+    // published after this point therefore implies the whole tree is dead.
+    if (comptime builtin.os.tag == .windows) {
+        if (session.job) |j| proc.terminateJob(j);
+    }
     session.mutex.lockUncancelable(io);
     session.done = true;
     session.exit_code = code;
@@ -963,10 +1026,16 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
 
 fn freeSession(session: *Session) void {
     // Called only after all session threads were joined (close/evict/error
-    // paths), i.e. always after child.wait() already closed child.stdin/
-    // stdout/stderr via std cleanup. The only fd we own is the dup'd stdin
-    // write-end taken over at exec_start.
-    if (session.stdin_fd) |fd| _ = std.os.linux.close(fd);
+    // paths), i.e. always after child.wait() already closed child.stdout/
+    // stderr via std cleanup (child.stdin is null by construction: sessions
+    // spawn with .file stdio). The stdin write end is session-owned from the
+    // start, so closing it here can never double-close a std cleanup copy.
+    if (session.stdin_fd) |fd| os.closeFd(fd);
+    // Windows: release the Job Object. The tree is already dead (waiter ran
+    // TerminateJobObject), so KILL_ON_JOB_CLOSE is a no-op here.
+    if (comptime builtin.os.tag == .windows) {
+        if (session.job) |j| os.closeFd(j);
+    }
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
     std.heap.page_allocator.free(session.cwd);
@@ -1022,57 +1091,83 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         if (!cwd_owned) std.heap.page_allocator.free(cwd);
     }
 
+    // Parent-owned stdin pipe: the read end goes to the child as .file
+    // stdio, the write end becomes Session.stdin_fd. std.process.Child.stdin
+    // stays null, so child.wait() cleanup can never close the write end from
+    // under exec_write — this replaces the pre-port F_DUPFD_CLOEXEC takeover
+    // hack on every OS.
+    const stdin_pipe = try proc.createStdinPipe(io);
+    var stdin_read_open = true;
+    errdefer if (stdin_read_open) os.closeFd(stdin_pipe.read);
+    const stdin_fd: std.posix.fd_t = stdin_pipe.write;
+    var stdin_owned = false;
+    errdefer if (!stdin_owned) os.closeFd(stdin_fd);
+
+    // Windows: the Job Object exists before the process so the
+    // assign-before-resume sequence can never leak an untracked tree.
+    const job: proc.JobField = if (comptime builtin.os.tag == .windows) try proc.createKillOnCloseJob() else proc.no_job;
+    var job_owned = false;
+    errdefer {
+        if (comptime builtin.os.tag == .windows) {
+            if (!job_owned) {
+                if (job) |j| os.closeFd(j);
+            }
+        }
+    }
+
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
-        .stdin = .pipe,
+        .stdin = .{ .file = proc.stdinFile(&stdin_pipe) },
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = 0,
+        // POSIX: child becomes process-group leader (kill(-pgid) reaches the
+        // tree). Windows: null (pid_t is a HANDLE there) — the Job Object
+        // takes over the tree role.
+        .pgid = proc.child_pgid,
+        // Windows only: CREATE_SUSPENDED so the child lands in the job before
+        // it can spawn anything. POSIX keeps running-start semantics.
+        .start_suspended = proc.spawn_suspended,
     });
+    // The child owns its stdin read end from here on; drop the parent's copy.
+    os.closeFd(stdin_pipe.read);
+    stdin_read_open = false;
 
     // Never leak a running child if session allocation fails after spawn.
     var child_owned = false;
     errdefer {
         if (!child_owned) {
-            if (child.id) |pid| killSessionTree(pid);
+            killSessionTree(childPidOrZero(child.id), job);
             _ = child.wait(io) catch null;
         }
     }
 
-    // Take over stdin: child.wait() unconditionally closes child.stdin/stdout/
-    // stderr via std's cleanup. Dup the write end (CLOEXEC) and null the
-    // Child's copy, so our session.stdin_fd is the sole owner: exec_write can
-    // never race a std-cleanup close, and freeSession never double-closes.
-    var stdin_fd: ?std.posix.fd_t = null;
-    if (child.stdin) |f| {
-        const dup_rc = std.os.linux.fcntl(f.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
-        if (std.os.linux.errno(dup_rc) != .SUCCESS) return error.DupFailed;
-        stdin_fd = @intCast(dup_rc);
-        _ = std.os.linux.close(f.handle);
-        child.stdin = null;
-    }
-    var stdin_owned = false;
-    errdefer {
-        if (!stdin_owned) {
-            if (stdin_fd) |fd| _ = std.os.linux.close(fd);
-        }
+    if (comptime builtin.os.tag == .windows) {
+        proc.assignToJob(job.?, child.id.?) catch |err| {
+            // Not in the job yet: a job kill would miss the suspended child
+            // and the errdefer's child.wait() would hang. Kill by handle.
+            proc.terminateHandle(child.id.?);
+            return err;
+        };
+        try proc.resumeProcess(child.id.?);
     }
 
     const session = try std.heap.page_allocator.create(Session);
     session.* = .{
         .id = store.allocId(),
-        .pid = child.id orelse 0,
+        .pid = childPidOrZero(child.id),
         .argv = argv,
         .cwd = cwd,
         .child = child,
         .stdin_fd = stdin_fd,
+        .job = job,
         .started_ms = nowMs(io),
     };
     argv_owned = true;
     cwd_owned = true;
     child_owned = true;
     stdin_owned = true;
+    job_owned = true;
 
     // Spawn threads before publishing: a session visible in the store always
     // has its threads running, so concurrent exec_close can never see null
@@ -1082,7 +1177,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
     if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
         session.closing.store(true, .release);
-        killSessionTree(session.pid);
+        killSessionTree(session.pid, session.job);
         if (session.waiter_thread) |t| {
             t.join();
         } else {
@@ -1096,7 +1191,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
     store.put(session) catch |err| {
         session.closing.store(true, .release);
-        killSessionTree(session.pid);
+        killSessionTree(session.pid, session.job);
         if (session.waiter_thread) |t| t.join();
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
@@ -1107,7 +1202,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "{\"ok\":true,\"session_id\":");
     try out.print(arena, "{d}", .{session.id});
     try out.appendSlice(arena, ",\"pid\":");
-    try out.print(arena, "{d}", .{session.pid});
+    try out.print(arena, "{d}", .{pidJsonValue(session.pid)});
     try out.appendSlice(arena, "}");
 }
 
@@ -1201,8 +1296,7 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
         session.mutex.unlock(store.io);
         if (done) break;
         if (nowMs(store.io) >= deadline) break;
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = WAIT_POLL_NS };
-        _ = std.os.linux.nanosleep(&ts, null);
+        os.sleepMs(WAIT_POLL_MS);
     }
     try renderSessionState(arena, store, session, stdout_offset, stderr_offset, out);
 }
@@ -1230,7 +1324,7 @@ fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayLis
         try out.appendSlice(arena, "{\"session_id\":");
         try out.print(arena, "{d}", .{s.id});
         try out.appendSlice(arena, ",\"pid\":");
-        try out.print(arena, "{d}", .{pid});
+        try out.print(arena, "{d}", .{pidJsonValue(pid)});
         try out.appendSlice(arena, ",\"argv\":[");
         for (s.argv, 0..) |arg, i| {
             if (i != 0) try out.appendSlice(arena, ",");
@@ -1268,9 +1362,9 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     const exited = session.done;
     session.mutex.unlock(sio);
     if (exited) return error.ProcessExited;
-    if (data.len != 0) try writeAllFd(fd, data);
+    if (data.len != 0) try proc.writeAllFd(fd, data);
     if (eof) {
-        _ = std.os.linux.close(fd);
+        os.closeFd(fd);
         session.stdin_fd = null;
     }
     try out.appendSlice(arena, "{\"ok\":true,\"bytes\":");
@@ -1288,7 +1382,7 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     session.mutex.lockUncancelable(sio);
     const done = session.done;
     session.mutex.unlock(sio);
-    if (!done) killSessionTree(session.pid);
+    if (!done) killSessionTree(session.pid, session.job);
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
@@ -1316,7 +1410,7 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.mutex.lockUncancelable(store.io);
     const done = session.done;
     session.mutex.unlock(store.io);
-    if (!done) killSessionTree(session.pid);
+    if (!done) killSessionTree(session.pid, session.job);
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();
@@ -1326,37 +1420,22 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
 fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const hostname = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/sys/kernel/hostname", 256) catch "", "\r\n ");
-    const loadavg = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/loadavg", 256) catch "", "\r\n ");
-    const uptime_s = std.mem.trim(u8, readFileAllocMaybe(arena, io, "/proc/uptime", 256) catch "", "\r\n ");
-    const meminfo = readFileAllocMaybe(arena, io, "/proc/meminfo", 16384) catch "";
-    var mem_total: u64 = 0;
-    var mem_avail: u64 = 0;
-    var it = std.mem.splitScalar(u8, meminfo, '\n');
-    while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "MemTotal:")) mem_total = parseKbLine(line);
-        if (std.mem.startsWith(u8, line, "MemAvailable:")) mem_avail = parseKbLine(line);
-    }
+    // Per-OS fetchers live in os.sysinfo; every field
+    // degrades independently to ""/0, exactly like the old `catch ""` sites.
+    const info = os.sysinfo.fetch(arena, io);
     try out.appendSlice(arena, "{\"node\":");
-    try appendJsonString(out, arena, hostname);
+    try appendJsonString(out, arena, info.hostname);
     try out.appendSlice(arena, ",\"hostname\":");
-    try appendJsonString(out, arena, hostname);
-    try out.appendSlice(arena, ",\"os\":\"Linux\",\"machine\":\"x86_64\",\"loadavg_raw\":");
-    try appendJsonString(out, arena, loadavg);
+    try appendJsonString(out, arena, info.hostname);
+    try out.appendSlice(arena, ",\"os\":\"" ++ os.sysinfo.os_name ++ "\",\"machine\":\"" ++ os.sysinfo.machine ++ "\",\"loadavg_raw\":");
+    try appendJsonString(out, arena, info.loadavg_raw);
     try out.appendSlice(arena, ",\"uptime_raw\":");
-    try appendJsonString(out, arena, uptime_s);
+    try appendJsonString(out, arena, info.uptime_raw);
     try out.appendSlice(arena, ",\"mem\":{\"MemTotal\":");
-    try out.print(arena, "{d}", .{mem_total * 1024});
+    try out.print(arena, "{d}", .{info.mem_total});
     try out.appendSlice(arena, ",\"MemAvailable\":");
-    try out.print(arena, "{d}", .{mem_avail * 1024});
+    try out.print(arena, "{d}", .{info.mem_available});
     try out.appendSlice(arena, "}}");
-}
-
-fn parseKbLine(line: []const u8) u64 {
-    var it = std.mem.tokenizeScalar(u8, line, ' ');
-    _ = it.next();
-    const num = it.next() orelse return 0;
-    return std.fmt.parseInt(u64, num, 10) catch 0;
 }
 
 fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
@@ -1365,11 +1444,16 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     const offset = intArg(args, "offset") orelse 0;
     const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
-    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        error.IsDir => return error.IsDirectory,
-        error.StreamTooLong => return error.FileTooLarge,
-        else => return err,
+    const data = readFileAllocMaybe(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
+        // The read path is cross-platform, so the mapping holds
+        // on every target. error.IsDir surfaces at read time (opening a
+        // directory read-only succeeds, the first read fails).
+        switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            error.IsDir => return error.IsDirectory,
+            error.StreamTooLong => return error.FileTooLarge,
+            else => return err,
+        }
     };
     const text = try utf8LossyAlloc(arena, data);
     const slice = try utf8CharSlice(text, @intCast(offset), @intCast(limit));
@@ -1406,9 +1490,10 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
     }
     const mode: std.posix.mode_t = @intCast(mode_i);
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, mode);
-    defer _ = std.os.linux.close(fd);
-    try writeAllFd(fd, data);
+    // POSIX applies `mode` exactly via openat(2); on Windows the
+    // mode is ignored (NTFS ACLs, not POSIX permission bits) — both paths and
+    // the rationale live in os.fd.writeFile.
+    try os.fd.writeFile(io, path, data, mode);
 
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(data);
@@ -1657,63 +1742,35 @@ fn appendHexLower(out: *std.ArrayList(u8), arena: Allocator, bytes: []const u8) 
 }
 
 fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
-    // Expand "~" and "~/x" to $HOME; leave "~user" and everything else untouched.
+    _ = io;
+    // Expand "~" and "~/x" to the user's home directory; leave "~user" and
+    // everything else untouched. Home resolution is cross-platform
+    // via the OS layer ($HOME on POSIX; %USERPROFILE% with a
+    // %HOMEDRIVE%%HOMEPATH% fallback on Windows).
     if (path.len == 0 or path[0] != '~') return path;
     if (path.len > 1 and path[1] != '/') return path; // "~user" unsupported
-    const home = getEnv(arena, io, "HOME") orelse return path;
+    const home = os.homeDir(arena, process_environ) orelse return path;
     if (home.len == 0) return path;
     return std.mem.concat(arena, u8, &.{ home, path[1..] });
 }
 
 fn readFileAllocMaybe(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    _ = io;
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .CLOEXEC = true }, 0);
-    defer _ = std.os.linux.close(fd);
-    var out: std.ArrayList(u8) = .empty;
-    var buf: [IO_BUF_SIZE]u8 = undefined;
-    while (true) {
-        const n = try std.posix.read(fd, &buf);
-        if (n == 0) break;
-        if (out.items.len + n > limit) return error.StreamTooLong;
-        try out.appendSlice(arena, buf[0..n]);
-    }
-    return out.items;
-}
-
-fn setSocketTimeouts(fd: std.posix.fd_t, seconds: u16) !void {
-    const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
-    // Raw syscalls only: std.posix.setsockopt panics via `unreachable` on
-    // EBADF/ENOTSOCK, and under accept churn that must never kill the daemon.
-    const opt = std.mem.asBytes(&tv);
-    const rcv = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
-    if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
-    const snd = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
-    if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
-    // Disable Nagle: the 100-continue path writes two segments per request;
-    // without TCP_NODELAY the second stalls until the first is ACKed (~1 RTT).
-    const one = std.mem.asBytes(&@as(c_int, 1));
-    const nodelay = std.os.linux.setsockopt(fd, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, one.ptr, @intCast(one.len));
-    if (std.os.linux.errno(nodelay) != .SUCCESS) return error.SocketOptionFailed;
+    // Cross-platform implementation lives in os.fd — open via
+    // Io.Dir, file.readStreaming to EOF, file.close(io). Reading to EOF (not
+    // to stat size) is load-bearing: Linux /proc files report a zero size
+    // yet yield content.
+    return os.fd.readFileAlloc(arena, io, path, limit);
 }
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const rc = std.os.linux.write(fd, bytes.ptr + off, bytes.len - off);
-        const errno = std.os.linux.errno(rc);
-        switch (errno) {
-            .SUCCESS => off += rc,
-            .INTR => continue,
-            else => return error.WriteFailed,
-        }
-    }
+    return os.writeAllFd(fd, bytes);
 }
 
-fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8) !void {
-    try sendHttpRawMode(arena, fd, status, content_type, body, false);
+fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, timeout_ms: u64) !void {
+    try sendHttpRawMode(arena, fd, status, content_type, body, false, timeout_ms);
 }
 
-fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool) !void {
+fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool, timeout_ms: u64) !void {
     var out: std.ArrayList(u8) = .empty;
     const reason = switch (status) {
         200 => "OK",
@@ -1733,17 +1790,17 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
     const connection = if (keep_alive) "keep-alive" else "close";
     try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ status, reason, content_type, body.len, connection });
     try out.appendSlice(arena, body);
-    try writeAllFd(fd, out.items);
+    try os.net.socketWriteAll(fd, out.items, timeout_ms);
 }
 
-fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8) !void {
+fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8, timeout_ms: u64) !void {
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(arena, "{\"error\":");
     try appendJsonString(&body, arena, code);
     try body.appendSlice(arena, ",\"message\":");
     try appendJsonString(&body, arena, message);
     try body.appendSlice(arena, "}");
-    try sendHttpRaw(arena, fd, status, "application/json", body.items);
+    try sendHttpRaw(arena, fd, status, "application/json", body.items, timeout_ms);
 }
 
 const TOOLS_JSON =
@@ -1757,7 +1814,7 @@ const TOOLS_JSON =
     \\{"name":"exec_close","description":"Kill if needed, join session threads, and free session state. Idempotent.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"}},"required":["session_id"]}},
     \\{"name":"exec_wait","description":"Long-poll a session until it finishes or timeout (default 30s, max 300s); returns the same payload as exec_poll.","inputSchema":{"type":"object","properties":{"session_id":{"type":"integer"},"timeout":{"type":"integer"},"stdout_offset":{"type":"integer"},"stderr_offset":{"type":"integer"}},"required":["session_id"]}},
     \\{"name":"exec_list","description":"List live sessions with id, pid, argv, done, exit_code, timestamps.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"exec_shell","description":"Run one shell script layer via bash/sh/fish/zsh -c.","inputSchema":{"type":"object","properties":{"script":{"type":"string"},"shell":{"type":"string"},"timeout":{"type":"integer"},"cwd":{"type":"string"}},"required":["script"]}},
+    \\{"name":"exec_shell","description":"Run one shell script layer via bash/sh/fish/zsh -c (cmd /c, powershell -c on Windows).","inputSchema":{"type":"object","properties":{"script":{"type":"string"},"shell":{"type":"string"},"timeout":{"type":"integer"},"cwd":{"type":"string"}},"required":["script"]}},
     \\{"name":"read_file","description":"Read a text file as UTF-8 with replacement. offset/limit are in characters.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}},
     \\{"name":"write_file","description":"Write base64 content to a file; returns sha256.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content_b64":{"type":"string"},"mode":{"type":"integer"},"mkdirs":{"type":"boolean"}},"required":["path","content_b64"]}},
     \\{"name":"list_dir","description":"List a directory with name/type/size/mtime.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}
