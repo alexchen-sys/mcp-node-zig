@@ -14,17 +14,34 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_tarball_key: x86_64-linux
+            binary: mcp-node
+            smoke_script: ci/smoke.sh
+          - os: macos-latest
+            zig_tarball_key: aarch64-macos
+            binary: mcp-node
+            smoke_script: ci/smoke.sh
+          - os: windows-latest
+            zig_tarball_key: x86_64-windows
+            binary: mcp-node.exe
+            smoke_script: ci/smoke.ps1
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Zig 0.16.0
+        shell: bash
         run: |
           set -euo pipefail
           ZIG_VERSION=0.16.0
           INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
-          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".tarball')
-          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".shasum')
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].shasum')
           mkdir -p "$RUNNER_TEMP/zig"
           curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
           echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
@@ -32,39 +49,24 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Check formatting
+        shell: bash
         run: zig fmt --check .
 
       - name: Unit tests
+        shell: bash
         run: zig build test
 
       - name: Release build
+        shell: bash
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Smoke test (auth gate + initialize)
-        run: |
-          set -euo pipefail
-          TOKEN_FILE=$RUNNER_TEMP/mcp-node-ci-token
-          printf 'ci-test-token' > "$TOKEN_FILE"
-          MCP_NODE_TOKEN_FILE=$TOKEN_FILE ./zig-out/bin/mcp-node &
-          PID=$!
-          trap 'kill $PID 2>/dev/null || true' EXIT
-          for i in $(seq 1 50); do
-            curl -s -o /dev/null http://127.0.0.1:8341/mcp && break || sleep 0.1
-          done
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8341/mcp \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}')
-          test "$code" = "401"
-          body=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
-            -H 'Content-Type: application/json' \
-            -H 'x-node-token: ci-test-token' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}')
-          echo "$body" | grep -q '"protocolVersion":"2025-11-25"'
-          echo "$body" | grep -q '"name":"mcp-node"'
+        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
+        run: ${{ matrix.smoke_script }}
 
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v4
         with:
-          name: mcp-node-linux-x86_64
-          path: zig-out/bin/mcp-node
+          name: mcp-node-${{ matrix.os }}
+          path: zig-out/bin/${{ matrix.binary }}
           retention-days: 7
