@@ -82,20 +82,28 @@ jobs:
         shell: pwsh
         run: ci/smoke.ps1
 
-      - name: Package
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar'
         shell: bash
         run: |
           set -euo pipefail
           pkg="mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$pkg"
           cp "zig-out/bin/${{ matrix.binary }}" LICENSE README.md "dist/$pkg/"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && zip -qr "$pkg.zip" "$pkg")
-            sha256sum "dist/$pkg.zip" > "dist/$pkg.zip.sha256"
-          else
-            tar -C dist -czf "$pkg.tar.gz" "$pkg"
-            sha256sum "$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
-          fi
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          sha256sum "$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
+
+      - name: Package (zip, Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pkg = "mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$pkg" | Out-Null
+          Copy-Item "zig-out/bin/${{ matrix.binary }}", "LICENSE", "README.md" "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
+          $h = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $pkg.zip" | Out-File -FilePath "dist/$pkg.zip.sha256" -Encoding ascii -NoNewline
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
