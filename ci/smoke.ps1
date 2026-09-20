@@ -12,11 +12,10 @@ foreach ($i in 1..50) {
         $null = Invoke-WebRequest -Uri "http://127.0.0.1:8341/mcp" -UseBasicParsing -TimeoutSec 1
         $ready = $true
         break
-    } catch [System.Net.WebException] {
-        # Any HTTP response (including 401) means the server is up.
-        if ($_.Exception.Response) { $ready = $true; break }
-        Start-Sleep -Milliseconds 200
     } catch {
+        # Any HTTP response (including 401) means the server is up.
+        # pwsh 7 throws HttpResponseException for 4xx, not WebException.
+        if ($_.Exception.Response) { $ready = $true; break }
         Start-Sleep -Milliseconds 200
     }
 }
