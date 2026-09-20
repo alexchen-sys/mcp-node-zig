@@ -61,8 +61,14 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Smoke test (auth gate + initialize)
-        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
-        run: ${{ matrix.smoke_script }}
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ci/smoke.sh
+
+      - name: Smoke test (auth gate + initialize, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ci/smoke.ps1
 
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v4
