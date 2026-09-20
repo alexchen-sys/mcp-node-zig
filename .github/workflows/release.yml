@@ -90,8 +90,8 @@ jobs:
           pkg="mcp-node-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "dist/$pkg"
           cp "zig-out/bin/${{ matrix.binary }}" LICENSE README.md "dist/$pkg/"
-          tar -C dist -czf "$pkg.tar.gz" "$pkg"
-          sha256sum "$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
+          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+          sha256sum "dist/$pkg.tar.gz" > "dist/$pkg.tar.gz.sha256"
 
       - name: Package (zip, Windows)
         if: matrix.archive == 'zip'
