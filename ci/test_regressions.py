@@ -49,14 +49,22 @@ def free_port():
         return probe.getsockname()[1]
 
 
+# Bytes read past one response that belong to the next response on the same
+# connection (coalesced pipelined delivery), keyed by the socket object.
+# socket.socket forbids attribute assignment (no __dict__), so a side table
+# with pop-on-read semantics holds them; entries only persist while bytes
+# are actually pending.
+_response_overread = {}
+
+
 def read_http_response(sock, deadline_s=8.0):
     """Read one HTTP/1.1 response; returns (status, reason, headers, body).
 
     Bytes over-read past this response (a pipelined next response delivered
-    in the same recv) are kept on the socket object and seed the next call,
-    so coalesced delivery never loses a response."""
+    in the same recv) are kept for the next call on the same socket, so
+    coalesced delivery never loses a response."""
     sock.settimeout(deadline_s)
-    data = getattr(sock, '_response_overread', b'')
+    data = _response_overread.pop(id(sock), b'')
     while b'\r\n\r\n' not in data:
         chunk = sock.recv(65536)
         if not chunk:
@@ -80,7 +88,9 @@ def read_http_response(sock, deadline_s=8.0):
         if not chunk:
             raise AssertionError('connection closed mid-body: %d/%d bytes' % (len(body), length))
         body += chunk
-    sock._response_overread = body[length:]
+    leftover = body[length:]
+    if leftover:
+        _response_overread[id(sock)] = leftover
     return status, reason, headers, body[:length]
 
 
