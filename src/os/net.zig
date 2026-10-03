@@ -94,6 +94,35 @@ pub fn setSocketTimeouts(handle: Handle, seconds: u16) SetTimeoutError!void {
     }
 }
 
+/// Re-arm only the read-side deadline with millisecond precision.
+///
+/// The request pipeline enforces one absolute deadline per request and
+/// re-arms the remaining budget before every read; whole-second
+/// `setSocketTimeouts` would either round small remainders down to "no
+/// timeout" (an unbounded read) or up past the deadline. Platform semantics:
+///   * linux   — raw `std.os.linux.setsockopt` (same rationale as
+///               `setSocketTimeouts`).
+///   * darwin  — same setsockopt via libc (`std.c`).
+///   * windows — no-op: the software deadline inside `socketReadSome` is
+///               driven by its `timeout_ms` argument instead.
+pub fn setSocketReadTimeoutMs(handle: Handle, milliseconds: u64) SetTimeoutError!void {
+    const clamped: u64 = @min(milliseconds, @as(u64, std.math.maxInt(u32)));
+    if (comptime builtin.os.tag == .linux) {
+        const tv = std.posix.timeval{ .sec = @intCast(clamped / 1000), .usec = @intCast((clamped % 1000) * 1000) };
+        const opt = std.mem.asBytes(&tv);
+        const rcv = std.os.linux.setsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, opt.ptr, @intCast(opt.len));
+        if (std.os.linux.errno(rcv) != .SUCCESS) return error.SocketOptionFailed;
+    } else if (comptime builtin.os.tag == .windows) {
+        // No-op: the software deadline in socketReadSome carries the bound
+        // (its timeout_ms argument). Nothing to arm at the socket level.
+    } else {
+        const tv = std.c.timeval{ .sec = @intCast(clamped / 1000), .usec = @intCast((clamped % 1000) * 1000) };
+        const opt = std.mem.asBytes(&tv);
+        if (std.c.setsockopt(handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, opt.ptr, @intCast(opt.len)) != 0)
+            return error.SocketOptionFailed;
+    }
+}
+
 /// Read up to `buf.len` bytes from a connected socket. Returns 0 on clean
 /// EOF (peer closed a keep-alive connection), exactly like read(2).
 ///
@@ -120,6 +149,16 @@ pub fn socketReadSome(handle: Handle, buf: []u8, timeout_ms: u64) !usize {
         // Per-operation bound is carried by SO_RCVTIMEO on the socket.
         return std.posix.read(handle, buf);
     }
+}
+
+/// True when a socketReadSome error is the read deadline expiring:
+/// SO_RCVTIMEO expiry surfaces as WouldBlock on POSIX, the Windows
+/// software deadline as Timeout. Compared by value on anyerror because each
+/// name exists in only one target's concrete error set — typed switch
+/// prongs cannot compile cross-target.
+pub fn isReadTimeout(err: anyerror) bool {
+    if (comptime builtin.os.tag == .windows) return err == error.Timeout;
+    return err == error.WouldBlock;
 }
 
 /// Write the whole buffer to a connected socket, looping over short writes.

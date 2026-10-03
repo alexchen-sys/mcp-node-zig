@@ -30,7 +30,8 @@ const TOKEN_FILE_MAX_BYTES: usize = 4096;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
 const DEFAULT_SESSION_TTL_MS: i64 = 600_000;
-const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
+const MIN_INFLIGHT_BYTES: u64 = 1024 * 1024; // config floor: below this the in-flight budget is unusable
 
 const Config = struct {
     name: []const u8,
@@ -44,19 +45,24 @@ const Config = struct {
     max_conn: u16,
     max_sessions: u16,
     session_ttl_s: u32,
+    max_inflight_bytes: u64,
     sessions: ?*SessionStore = null,
+    inflight: ?*InflightGate = null,
 };
 
-const Request = struct {
+/// Parsed request head: request line plus the security-relevant headers.
+/// Duplicates of these are rejected at parse time (ambiguous duplicates are
+/// a classic desync primitive), so every field here is single-valued.
+const HeadInfo = struct {
     method: []const u8,
     path: []const u8,
-    host: ?[]const u8,
-    origin: ?[]const u8,
-    content_type: ?[]const u8,
-    content_length: usize,
-    token: ?[]const u8,
-    connection: ?[]const u8,
-    body: []const u8,
+    host: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    content_length: usize = 0,
+    token: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
+    expect_continue: bool = false,
 };
 
 const RpcResponse = struct {
@@ -82,6 +88,35 @@ const ConnGate = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.active -= 1;
+    }
+};
+
+/// Global budget of in-flight request-body bytes (default 64 MiB via
+/// MCP_NODE_MAX_INFLIGHT_BYTES). Bytes are reserved after the gates pass but
+/// BEFORE the body allocation/read, and released on every exit path —
+/// success, error, or disconnect. Only declared body bytes count (arena
+/// growth and response buffers are not budgeted; the contract is in-flight
+/// request bodies).
+const InflightGate = struct {
+    mutex: std.Io.Mutex = .init,
+    io: Io,
+    in_use: u64 = 0,
+    max: u64,
+
+    fn tryReserve(self: *InflightGate, bytes: usize) bool {
+        if (bytes == 0) return true;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (bytes > self.max - self.in_use) return false;
+        self.in_use += bytes;
+        return true;
+    }
+
+    fn release(self: *InflightGate, bytes: usize) void {
+        if (bytes == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.in_use -= bytes;
     }
 };
 
@@ -292,6 +327,8 @@ pub fn main() !void {
     sessions.ttl_ms = @as(i64, cfg.session_ttl_s) * 1000;
     cfg.sessions = &sessions;
     var gate = ConnGate{ .io = io, .max = cfg.max_conn };
+    var inflight = InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &inflight;
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -329,8 +366,13 @@ fn connectionThread(conn: *Connection) void {
     defer conn.gate.release();
     defer conn.stream.close(conn.io);
 
+    // Bytes a header-phase read over-fetched past the current request (the
+    // coalesced head of a pipelined next request) seed the next iteration.
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(std.heap.page_allocator);
+
     while (true) {
-        const keep = serveOneRequest(conn.io, conn.cfg, &conn.stream) catch |err| {
+        const keep = serveOneRequest(conn.io, conn.cfg, &conn.stream, &carry) catch |err| {
             std.debug.print("connection failed: {s}\n", .{@errorName(err)});
             break;
         };
@@ -371,6 +413,17 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
     const session_ttl_s = getEnv(arena, "MCP_NODE_SESSION_TTL_S") orelse "600";
     var session_ttl = try std.fmt.parseInt(u32, session_ttl_s, 10);
     if (session_ttl == 0) session_ttl = 600;
+    // Global in-flight request-body budget. An invalid or unusably small
+    // value is a config error (fail fast at startup), not a silent fallback.
+    const inflight_s = getEnv(arena, "MCP_NODE_MAX_INFLIGHT_BYTES") orelse "67108864";
+    const max_inflight_bytes = std.fmt.parseInt(u64, inflight_s, 10) catch {
+        std.debug.print("MCP_NODE_MAX_INFLIGHT_BYTES must be an unsigned integer, got '{s}'\n", .{inflight_s});
+        return error.InvalidConfig;
+    };
+    if (max_inflight_bytes < MIN_INFLIGHT_BYTES) {
+        std.debug.print("MCP_NODE_MAX_INFLIGHT_BYTES must be at least {d}\n", .{MIN_INFLIGHT_BYTES});
+        return error.InvalidConfig;
+    }
 
     const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
     const token_raw = os.fd.readFileAlloc(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
@@ -410,6 +463,7 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .max_conn = max_conn,
         .max_sessions = max_sessions,
         .session_ttl_s = session_ttl,
+        .max_inflight_bytes = max_inflight_bytes,
     };
 }
 
@@ -438,9 +492,18 @@ fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
 
 /// Serve one HTTP request on an accepted stream. Returns true while the
 /// connection stays usable (keep-alive), false when the caller must close.
-/// Never fails silently on security gates: host/origin/token rejections are
-/// answered with 421/403/401 before any RPC dispatch happens.
-fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
+///
+/// Pipeline: parse the head with strict HTTP/1.1 grammar -> answer every
+/// security gate (host/origin/token/method/path/content-type) from the head
+/// alone, before a single body byte is read or 100 Continue is sent -> check
+/// the Content-Length cap and the global in-flight body budget -> read
+/// exactly content_length body bytes -> dispatch. A rejected or
+/// unauthenticated client can therefore never force a 32 MiB body read.
+/// `carry` holds bytes that a header-phase read over-fetched past the
+/// current request (the coalesced head of a pipelined next request); they
+/// seed the next request on this connection instead of being dropped, which
+/// is what keeps pipelined peers from desyncing.
+fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *std.ArrayList(u8)) !bool {
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
@@ -452,28 +515,76 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
         // forever; refuse the connection instead of serving unprotected.
         return error.SocketOptionFailed;
     };
-    const req = readHttpRequest(ra, io, fd, cfg.socket_timeout_s) catch |err| {
-        switch (err) {
-            error.CleanEof => return false,
-            error.RequestTooLarge => try sendHttpError(ra, fd, 413, "payload_too_large", "request too large", timeout_ms),
-            error.HeadersTooLarge => try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large", timeout_ms),
-            else => try sendHttpError(ra, fd, 400, "bad_request", @errorName(err), timeout_ms),
+    // One absolute deadline covers the whole request (head + body); every
+    // read below is armed with the remaining budget, never a fresh timeout.
+    const started = std.Io.Clock.awake.now(io);
+
+    // ---- phase 1: request head (request line + headers), 64 KiB cap ----
+    var data: std.ArrayList(u8) = .empty;
+    if (carry.items.len > 0) {
+        try data.appendSlice(ra, carry.items);
+        carry.clearRetainingCapacity();
+    }
+    var buf: [IO_BUF_SIZE]u8 = undefined;
+    var header_end: ?usize = null;
+    while (header_end == null) {
+        if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+            break;
         }
+        if (data.items.len >= MAX_HEADER_BYTES) {
+            try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large", timeout_ms);
+            return false;
+        }
+        const remaining = remainingMs(started, io, timeout_ms) orelse {
+            try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
+            return false;
+        };
+        const n = readWithDeadline(fd, &buf, remaining) catch |err| switch (err) {
+            error.RequestTimeout => {
+                try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
+                return false;
+            },
+            else => return err,
+        };
+        if (n == 0) {
+            // Clean EOF before any bytes: the peer just closed a keep-alive
+            // connection. Not an error — answering here would write a zombie
+            // 400 into a dying socket. A partial head followed by EOF falls
+            // through to the BadHeaders answer below.
+            if (data.items.len == 0) return false;
+            break;
+        }
+        try data.appendSlice(ra, buf[0..n]);
+    }
+    const he = header_end orelse {
+        try sendHttpError(ra, fd, 400, "bad_request", "BadHeaders", timeout_ms);
+        return false;
+    };
+    const info = parseHead(data.items[0 .. he - 4]) catch |err| {
+        const status: u16 = switch (err) {
+            error.RequestTooLarge => 413,
+            error.BadExpectation => 417,
+            else => 400,
+        };
+        try sendHttpError(ra, fd, status, "bad_request", @errorName(err), timeout_ms);
         return false;
     };
 
-    if (!hostAllowed(req.host, cfg.allowed_hosts)) {
+    // ---- phase 2: gates, all answered from the head alone (before any body
+    // byte is read, before 100 Continue) ----
+    if (!hostAllowed(info.host, cfg.allowed_hosts)) {
         try sendHttpError(ra, fd, 421, "invalid_host", "Invalid Host header", timeout_ms);
         return false;
     }
-    if (req.origin) |origin| {
+    if (info.origin) |origin| {
         if (!originAllowed(origin, cfg.allowed_origins)) {
             try sendHttpError(ra, fd, 403, "forbidden_origin", "Forbidden Origin header", timeout_ms);
             return false;
         }
     }
     if (cfg.token.len != 0) {
-        const got = req.token orelse "";
+        const got = info.token orelse "";
         var got_hash: [32]u8 = undefined;
         var cfg_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
@@ -483,142 +594,244 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream) !bool {
             return false;
         }
     }
-    if (!std.mem.eql(u8, req.path, "/mcp")) {
+    if (!std.mem.eql(u8, info.path, "/mcp")) {
         try sendHttpError(ra, fd, 404, "not_found", "not found", timeout_ms);
         return false;
     }
-    if (!std.mem.eql(u8, req.method, "POST")) {
+    if (!std.mem.eql(u8, info.method, "POST")) {
         try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed", timeout_ms);
         return false;
     }
-    if (req.content_type) |ct| {
-        if (!std.mem.startsWith(u8, ct, "application/json")) {
-            try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
-            return false;
-        }
-    } else {
+    const ct = info.content_type orelse {
+        try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
+        return false;
+    };
+    if (!contentTypeJson(ct)) {
         try sendHttpError(ra, fd, 415, "unsupported_media_type", "Invalid Content-Type header", timeout_ms);
         return false;
     }
 
-    const keep_alive = !connectionCloseRequested(req.connection);
-    const rpc = try handleRpc(ra, io, cfg, req.body);
+    // ---- phase 3: global in-flight body budget. The per-request 32 MiB
+    // Content-Length cap was already enforced in parseHead (-> 413). ----
+    var reserved: usize = 0;
+    if (cfg.inflight) |gate| {
+        if (!gate.tryReserve(info.content_length)) {
+            // Answered without reading the body: the budget counts in-flight
+            // body bytes, and this request never becomes one.
+            try sendHttpError(ra, fd, 503, "busy", "in-flight body budget exhausted", timeout_ms);
+            return false;
+        }
+        reserved = info.content_length;
+    }
+    defer if (cfg.inflight) |gate| gate.release(reserved);
+
+    // ---- phase 4: 100 Continue, only after every gate passed ----
+    if (info.expect_continue and info.content_length > 0) {
+        try os.net.socketWriteAll(fd, "HTTP/1.1 100 Continue\r\n\r\n", timeout_ms);
+    }
+
+    // ---- phase 5: body, exactly content_length bytes. Reads are capped at
+    // the remaining body length, so pipelined bytes are never over-fetched
+    // here; only the header-phase read can over-fetch. ----
+    const body = try ra.alloc(u8, info.content_length);
+    const after_head = data.items[he..];
+    const prefix_len = @min(after_head.len, info.content_length);
+    @memcpy(body[0..prefix_len], after_head[0..prefix_len]);
+    var filled = prefix_len;
+    while (filled < body.len) {
+        const remaining = remainingMs(started, io, timeout_ms) orelse {
+            try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
+            return false;
+        };
+        const want = @min(buf.len, body.len - filled);
+        const n = readWithDeadline(fd, buf[0..want], remaining) catch |err| switch (err) {
+            error.RequestTimeout => {
+                try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
+                return false;
+            },
+            else => return err,
+        };
+        if (n == 0) {
+            // Clean EOF mid-body: the declared body never fully arrived.
+            try sendHttpError(ra, fd, 400, "bad_request", "ShortBody", timeout_ms);
+            return false;
+        }
+        @memcpy(body[filled .. filled + n], buf[0..n]);
+        filled += n;
+    }
+
+    // ---- phase 6: keep-alive bookkeeping. Bytes past the body are the
+    // coalesced head of the next pipelined request: carry them over. When
+    // they cannot be carried safely (peer asked for close, or the carry
+    // budget would blow up), answer and close — never desync. ----
+    const leftover = after_head[prefix_len..];
+    var keep_alive = !connectionCloseRequested(info.connection);
+    if (leftover.len > 0) {
+        if (keep_alive and leftover.len <= MAX_HEADER_BYTES) {
+            try carry.appendSlice(std.heap.page_allocator, leftover);
+        } else {
+            keep_alive = false;
+        }
+    }
+
+    const rpc = try handleRpc(ra, io, cfg, body);
     try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive, timeout_ms);
     return keep_alive;
 }
 
-fn readHttpRequest(arena: Allocator, io: Io, fd: std.posix.fd_t, timeout_s: u16) !Request {
-    // Socket I/O goes through os.net (POSIX keeps raw syscalls,
-    // Windows runs overlapped AFD ioctls with a software deadline; see
-    // os/net.zig for why the Io vtable is unsafe under SO_RCVTIMEO).
-    {
-        var data: std.ArrayList(u8) = .empty;
-        var header_end: ?usize = null;
-        var content_length: usize = 0;
-        var continue_sent = false;
-        var buf: [IO_BUF_SIZE]u8 = undefined;
-        const started = std.Io.Clock.awake.now(io);
-        const deadline_ms = @as(u64, timeout_s) * 1000;
-
-        while (true) {
-            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-            if (data.items.len >= MAX_REQUEST_BYTES) return error.RequestTooLarge;
-            const n = try os.net.socketReadSome(fd, &buf, deadline_ms);
-            if (n == 0) {
-                // Clean EOF before any bytes: the peer just closed a keep-alive
-                // connection. Not an error — answering here would write a zombie
-                // 400 into a dying socket.
-                if (data.items.len == 0) return error.CleanEof;
-                break;
-            }
-            try data.appendSlice(arena, buf[0..n]);
-            if (started.untilNow(io, .awake).toMilliseconds() >= deadline_ms) return error.RequestTimeout;
-            if (data.items.len > MAX_REQUEST_BYTES) return error.RequestTooLarge;
-            if (header_end == null and data.items.len > MAX_HEADER_BYTES) return error.HeadersTooLarge;
-            if (header_end == null) {
-                if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
-                    header_end = idx + 4;
-                    content_length = try parseContentLength(data.items[0..idx]);
-                    if (!continue_sent and hasExpectContinue(data.items[0..idx]) and content_length > 0) {
-                        try os.net.socketWriteAll(fd, "HTTP/1.1 100 Continue\r\n\r\n", deadline_ms);
-                        continue_sent = true;
-                    }
-                }
-            }
-            if (header_end) |he| {
-                const total = he + content_length;
-                if (data.items.len >= total) break;
-            }
-        }
-        const he = header_end orelse return error.BadHeaders;
-        const total = he + content_length;
-        if (data.items.len < total) return error.ShortBody;
-        const head = data.items[0 .. he - 4];
-        const body = data.items[he..total];
-
-        var lines = std.mem.splitSequence(u8, head, "\r\n");
-        const request_line = lines.next() orelse return error.BadRequestLine;
-        var parts = std.mem.splitScalar(u8, request_line, ' ');
-        const method = parts.next() orelse return error.BadRequestLine;
-        const path = parts.next() orelse return error.BadRequestLine;
-
-        var req = Request{
-            .method = method,
-            .path = path,
-            .host = null,
-            .origin = null,
-            .content_type = null,
-            .content_length = content_length,
-            .token = null,
-            .connection = null,
-            .body = body,
-        };
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const name = std.mem.trim(u8, line[0..colon], " \t");
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            if (asciiEqlIgnoreCase(name, "host")) req.host = value;
-            if (asciiEqlIgnoreCase(name, "origin")) req.origin = value;
-            if (asciiEqlIgnoreCase(name, "content-type")) req.content_type = value;
-            if (asciiEqlIgnoreCase(name, "x-node-token")) req.token = value;
-            if (asciiEqlIgnoreCase(name, "connection")) req.connection = value;
-        }
-        return req;
-    }
+/// Milliseconds left on the absolute request deadline; null when expired.
+fn remainingMs(started: std.Io.Timestamp, io: Io, deadline_ms: u64) ?u64 {
+    const elapsed_i = started.untilNow(io, .awake).toMilliseconds();
+    if (elapsed_i < 0) return deadline_ms; // clock moved backwards: keep the full budget
+    const elapsed: u64 = @intCast(elapsed_i);
+    if (elapsed >= deadline_ms) return null;
+    return deadline_ms - elapsed;
 }
 
-fn hasExpectContinue(head: []const u8) bool {
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (asciiEqlIgnoreCase(name, "expect") and asciiEqlIgnoreCase(value, "100-continue")) return true;
-    }
-    return false;
+/// One socket read bounded by `remaining_ms` — the leftover of the absolute
+/// request deadline, not a fresh per-read timeout. POSIX re-arms SO_RCVTIMEO
+/// per call; Windows enforces the software deadline inside socketReadSome.
+/// Returns 0 on clean EOF; an expired deadline is error.RequestTimeout.
+fn readWithDeadline(fd: std.posix.fd_t, buf: []u8, remaining_ms: u64) !usize {
+    os.net.setSocketReadTimeoutMs(fd, remaining_ms) catch return error.SocketOptionFailed;
+    const n = os.net.socketReadSome(fd, buf, remaining_ms) catch |err| {
+        // SO_RCVTIMEO expiry on POSIX, software-deadline expiry on Windows.
+        if (os.net.isReadTimeout(err)) return error.RequestTimeout;
+        return err;
+    };
+    return n;
 }
 
-fn parseContentLength(head: []const u8) !usize {
+fn isTokenChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn validToken(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!isTokenChar(c)) return false;
+    }
+    return true;
+}
+
+/// RFC 9110 field-content: HTAB / SP / VCHAR / obs-text only; no other
+/// controls and no DEL.
+fn validHeaderValue(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '\t' or c == ' ') continue;
+        if (c >= 0x21 and c != 0x7f) continue;
+        return false;
+    }
+    return true;
+}
+
+const RequestLine = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+/// Strict HTTP/1.1 request line: exactly `METHOD SP path SP HTTP/1.1`. This
+/// daemon speaks 1.1 semantics (keep-alive by default, 100-continue), so
+/// other versions are refused rather than guessed.
+fn parseRequestLine(line: []const u8) !RequestLine {
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const method = parts.next() orelse return error.BadRequestLine;
+    const path = parts.next() orelse return error.BadRequestLine;
+    const version = parts.next() orelse return error.BadRequestLine;
+    if (parts.next() != null) return error.BadRequestLine;
+    if (!validToken(method)) return error.BadRequestLine;
+    if (path.len == 0 or path[0] != '/') return error.BadRequestLine;
+    for (path) |c| {
+        if (c <= 0x20 or c == 0x7f) return error.BadRequestLine;
+    }
+    if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.BadRequestLine;
+    return .{ .method = method, .path = path };
+}
+
+/// Strict media-type check: exactly `application/json` (case-insensitive),
+/// optionally followed by well-formed `; token=value` parameters such as
+/// charset=utf-8. `application/json-not-real` must not pass a startsWith
+/// shortcut ever again.
+fn contentTypeJson(ct: []const u8) bool {
+    var it = std.mem.splitScalar(u8, ct, ';');
+    const media = std.mem.trim(u8, it.first(), " \t");
+    if (!asciiEqlIgnoreCase(media, "application/json")) return false;
+    while (it.next()) |param_raw| {
+        const param = std.mem.trim(u8, param_raw, " \t");
+        if (param.len == 0) return false; // "application/json;" is malformed
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse return false;
+        const name = std.mem.trim(u8, param[0..eq], " \t");
+        const value = std.mem.trim(u8, param[eq + 1 ..], " \t");
+        if (!validToken(name)) return false;
+        if (value.len == 0) return false;
+        if (value[0] == '"') {
+            // quoted-string: must close; no raw CR/LF/DEL inside.
+            if (value.len < 2 or value[value.len - 1] != '"') return false;
+            for (value[1 .. value.len - 1]) |c| {
+                if (c == '\r' or c == '\n' or c == 0x7f) return false;
+            }
+        } else if (!validToken(value)) return false;
+    }
+    return true;
+}
+
+/// Parse and validate the request head (request line + headers, without the
+/// trailing CRLFCRLF). Strict HTTP/1.1 grammar. Security-relevant headers
+/// reject duplicates instead of last-wins. `Transfer-Encoding` is refused
+/// outright: this server speaks Content-Length only, and accepting TE (let
+/// alone TE+CL) would invite request smuggling.
+fn parseHead(head: []const u8) !HeadInfo {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
-    _ = lines.next();
-    var seen: ?usize = null;
+    const request_line = lines.next() orelse return error.BadRequestLine;
+    const rl = try parseRequestLine(request_line);
+    var info = HeadInfo{ .method = rl.method, .path = rl.path };
+    var seen_cl: ?usize = null;
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (line.len == 0) continue;
+        // obs-fold (a line starting with SP/HTAB) died with RFC 7230: reject.
+        if (line[0] == ' ' or line[0] == '\t') return error.BadHeader;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
+        const name = line[0..colon];
+        // No whitespace between field name and colon (RFC 9112 §5.1).
+        if (!validToken(name)) return error.BadHeader;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (asciiEqlIgnoreCase(name, "content-length")) {
+        if (!validHeaderValue(value)) return error.BadHeader;
+        if (asciiEqlIgnoreCase(name, "host")) {
+            if (info.host != null) return error.DuplicateHeader;
+            info.host = value;
+        } else if (asciiEqlIgnoreCase(name, "origin")) {
+            if (info.origin != null) return error.DuplicateHeader;
+            info.origin = value;
+        } else if (asciiEqlIgnoreCase(name, "content-type")) {
+            if (info.content_type != null) return error.DuplicateHeader;
+            info.content_type = value;
+        } else if (asciiEqlIgnoreCase(name, "x-node-token")) {
+            if (info.token != null) return error.DuplicateHeader;
+            info.token = value;
+        } else if (asciiEqlIgnoreCase(name, "connection")) {
+            if (info.connection != null) return error.DuplicateHeader;
+            info.connection = value;
+        } else if (asciiEqlIgnoreCase(name, "expect")) {
+            if (!asciiEqlIgnoreCase(value, "100-continue")) return error.BadExpectation;
+            if (info.expect_continue) return error.DuplicateHeader;
+            info.expect_continue = true;
+        } else if (asciiEqlIgnoreCase(name, "transfer-encoding")) {
+            return error.TransferEncodingUnsupported;
+        } else if (asciiEqlIgnoreCase(name, "content-length")) {
             const parsed = std.fmt.parseInt(usize, value, 10) catch return error.BadContentLength;
-            if (parsed > MAX_REQUEST_BYTES) return error.RequestTooLarge;
-            if (seen) |prev| {
+            if (parsed > MAX_BODY_BYTES) return error.RequestTooLarge;
+            if (seen_cl) |prev| {
                 if (prev != parsed) return error.BadContentLength;
             } else {
-                seen = parsed;
+                seen_cl = parsed;
             }
         }
     }
-    return seen orelse 0;
+    info.content_length = seen_cl orelse 0;
+    return info;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -1833,6 +2046,8 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        408 => "Request Timeout",
+        417 => "Expectation Failed",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -1907,9 +2122,54 @@ test "utf8 lossy replaces invalid bytes with U+FFFD" {
 }
 
 test "content length rejects overflow and conflicting duplicates" {
-    try std.testing.expectError(error.RequestTooLarge, parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 18446744073709551615"));
-    try std.testing.expectError(error.BadContentLength, parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2"));
-    try std.testing.expectEqual(@as(usize, 2), try parseContentLength("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2"));
+    try std.testing.expectError(error.RequestTooLarge, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 18446744073709551615"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2"));
+    const info = try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2");
+    try std.testing.expectEqual(@as(usize, 2), info.content_length);
+}
+
+test "request line enforces HTTP/1.1 and exact three-token shape" {
+    const ok = try parseRequestLine("POST /mcp HTTP/1.1");
+    try std.testing.expectEqualStrings("POST", ok.method);
+    try std.testing.expectEqualStrings("/mcp", ok.path);
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /mcp HTTP/1.0"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /mcp HTTP/1.1 extra"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST  /mcp HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("PO ST /mcp HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /m cp HTTP/1.1"));
+}
+
+test "head parser rejects ambiguous and legacy framing" {
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\nHost: a\r\nHost: a"));
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: a\r\nx-node-token: b"));
+    try std.testing.expectError(error.TransferEncodingUnsupported, parseHead("POST /mcp HTTP/1.1\r\nTransfer-Encoding: chunked"));
+    try std.testing.expectError(error.TransferEncodingUnsupported, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked"));
+    // obs-fold died with RFC 7230
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nX-A: 1\r\n folded"));
+    // whitespace before the colon is a smuggling primitive
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nHost : a"));
+    // control bytes in a value
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nX-A: a\x07b"));
+    // header line without a colon
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\njusttext"));
+    // Expect: only 100-continue is legal
+    const info = try parseHead("POST /mcp HTTP/1.1\r\nExpect: 100-continue");
+    try std.testing.expect(info.expect_continue);
+    try std.testing.expectError(error.BadExpectation, parseHead("POST /mcp HTTP/1.1\r\nExpect: magic"));
+}
+
+test "content type accepts only strict application/json media type" {
+    try std.testing.expect(contentTypeJson("application/json"));
+    try std.testing.expect(contentTypeJson("application/json; charset=utf-8"));
+    try std.testing.expect(contentTypeJson("Application/JSON;charset=UTF-8"));
+    try std.testing.expect(contentTypeJson("application/json; charset=\"utf-8\""));
+    try std.testing.expect(!contentTypeJson("application/json-not-real"));
+    try std.testing.expect(!contentTypeJson("application/jsonx"));
+    try std.testing.expect(!contentTypeJson("text/json"));
+    try std.testing.expect(!contentTypeJson("application/json;"));
+    try std.testing.expect(!contentTypeJson("application/json; charset"));
+    try std.testing.expect(!contentTypeJson("application/json; =utf-8"));
 }
 
 test "float to int rejects non finite and out of range values" {
@@ -1954,6 +2214,7 @@ test "rpc parse error and notification semantics" {
         .max_conn = 4,
         .max_sessions = 4,
         .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
     };
 
     const bad = try handleRpc(arena, io, &cfg, "{");
