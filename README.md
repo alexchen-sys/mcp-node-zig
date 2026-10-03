@@ -70,15 +70,15 @@ Configuration is environment-only:
 - `MCP_NODE_SESSION_TTL_S` — finished-session reap delay, default `600` (`0` -> `600`)
 - `MCP_NODE_INSECURE=1` — allow startup without a token (not recommended); on Windows a missing token file always fails startup, so create an empty one instead
 
-Auth header: `X-Node-Token: <token>`.
+Auth header: `Authorization: Bearer <token>` (the standard scheme most MCP clients send). `X-Node-Token: <token>` is accepted as an alternative. If a request carries both, they must match; otherwise it gets 401.
 
 ## MCP client setup
 
-The server speaks streamable HTTP with a token header, so any MCP client with HTTP transport support can attach:
+The server speaks streamable HTTP with a bearer token, so any MCP client with HTTP transport support can attach:
 
 ```sh
 claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
-  --header "X-Node-Token: $(cat token)"
+  --header "Authorization: Bearer $(cat token)"
 ```
 
 Equivalent JSON (Claude Code, or any client that supports HTTP servers with headers):
@@ -90,12 +90,14 @@ Equivalent JSON (Claude Code, or any client that supports HTTP servers with head
       "type": "http",
       "url": "http://127.0.0.1:8341/mcp",
       "headers": {
-        "X-Node-Token": "<token>"
+        "Authorization": "Bearer <token>"
       }
     }
   }
 }
 ```
+
+Clients that cannot set `Authorization` can send `X-Node-Token: <token>` instead (`--header "X-Node-Token: $(cat token)"`).
 
 Clients that only speak stdio need a bridge (e.g. `mcp-remote`) in front of this endpoint.
 
@@ -160,7 +162,7 @@ mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_close"
 
 ## Security notes
 
-- Auth is a constant-time SHA-256 comparison of the `X-Node-Token` header; a missing token or a wrong one gets HTTP 401, and a missing/empty token file fails closed unless `MCP_NODE_INSECURE=1`.
+- Auth is a constant-time SHA-256 comparison of the token from `Authorization: Bearer` or `X-Node-Token`; a missing token, a wrong one, a non-Bearer scheme, or two headers that disagree gets HTTP 401 with `WWW-Authenticate: Bearer`. A repeated `Authorization` header is rejected with 400, and a missing/empty token file fails closed unless `MCP_NODE_INSECURE=1`.
 - `Host` is validated before JSON parsing; unknown hosts get HTTP 421. A present `Origin` header is validated against `MCP_NODE_ALLOWED_ORIGINS`; unknown origins get HTTP 403.
 - Requests over 32 MiB get HTTP 413; conflicting duplicate `Content-Length` headers are rejected. `Expect: 100-continue` is answered before the body is read. Only `POST /mcp` with `Content-Type: application/json` is served (404/405/415 otherwise; headers over 64 KiB get 431).
 - `exec`/`exec_shell` timeouts are clamped to `[1, 1800]` seconds (default 120s).
@@ -170,7 +172,7 @@ mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_close"
 
 ## Troubleshooting
 
-- **HTTP 401** — missing or wrong `X-Node-Token`; the server also refuses to start with a missing/empty token file unless `MCP_NODE_INSECURE=1`.
+- **HTTP 401** — missing or wrong token. Check that the header is `Authorization: Bearer <token>` (other schemes such as `Basic` are ignored) or `X-Node-Token: <token>`, and that a client sending both sends the same value; the server also refuses to start with a missing/empty token file unless `MCP_NODE_INSECURE=1`.
 - **HTTP 421** — the request's `Host` header is not in `MCP_NODE_ALLOWED_HOSTS`; add the `host:port` you actually connect through (anything but loopback needs an explicit entry).
 - **HTTP 403** — an `Origin` header was present (browser-originated call) and is not in `MCP_NODE_ALLOWED_ORIGINS`.
 
