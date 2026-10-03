@@ -20,6 +20,8 @@ const IO_BUF_SIZE: usize = 16 * 1024; // shared read scratch: HTTP, session pipe
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
 const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
+const DRAIN_GRACE_MS: i64 = 1000; // bounded post-kill window for readers to collect available output when an escaped grandchild holds the pipes
+const READER_EXIT_MS: i64 = 10 * READER_POLL_MS; // hard cap waiting for readers to observe closing before reap closes their fds
 const ACCEPT_BACKOFF_MS: u64 = 50; // pause after accept failure
 const WAIT_POLL_MS: u64 = 50; // exec_wait sleep tick
 const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
@@ -163,6 +165,13 @@ const Session = struct {
     /// exec_close test-and-skip on this so a late SIGKILL can never land on
     /// a recycled process group.
     tree_killed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Serializes the kill decision against the waiter's reap: killers hold
+    /// this across {tree_killed check, killTree, tree_killed store} (see
+    /// killTreeGuarded); the waiter holds it across child.wait() once the
+    /// leader is known dead. A bare tree_killed bool leaves a check/kill/reap
+    /// race: load(false) → context switch → waiter kill+reap → late kill at
+    /// a recycled pgid.
+    kill_mutex: std.Io.Mutex = .init,
     /// Number of pipe-reader threads that finished draining (stdout/stderr).
     /// The waiter gates done=true on this so `done` implies final output is
     /// fully drained.
@@ -1300,29 +1309,72 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
         // reaches every in-group descendant; the leader zombie ignores it.
         proc.killTree(session.pid, session.job);
         session.tree_killed.store(true, .release);
-        // Step 3: done must mean the output is fully drained. After the
+        // Step 3: done must mean the available output is drained. After the
         // group kill every in-group pipe writer is dead, so EOF lets both
-        // readers finish; an escaped grandchild holding the pipe open is
-        // covered by the closing flag (exec_close/reap paths).
+        // readers finish quickly. An escaped (setsid) grandchild holding a
+        // pipe write end open makes EOF impossible: give the readers a
+        // bounded grace to collect everything already written, then force
+        // finalization — done=true is guaranteed within DRAIN_GRACE_MS plus
+        // one reader tick even for pipe-holding escapees, instead of the
+        // session never finalizing.
         var expected_readers: u32 = 0;
         if (session.stdout_thread != null) expected_readers += 1;
         if (session.stderr_thread != null) expected_readers += 1;
+        const drain_deadline = nowMs(io) + DRAIN_GRACE_MS;
         while (session.readers_done.load(.acquire) < expected_readers) {
             if (session.closing.load(.acquire)) break;
+            if (nowMs(io) >= drain_deadline) break;
             os.sleepMs(1);
         }
-    }
-    // Step 4: only now reap. child.wait() cleanup closes the parent pipe
-    // ends, which the reader threads were still using until step 3 — reaping
-    // earlier was a use-after-close / lost-tail window.
-    const term = session.child.wait(io) catch {
-        if (!no_reap_ok) {
-            // Fallback after a waitid failure: kill post-reap. The reuse
-            // window is exactly the gap the WNOWAIT path exists to close,
-            // but a late kill is still strictly better than a leaked tree.
-            proc.killTree(session.pid, session.job);
-            session.tree_killed.store(true, .release);
+        // Step 4: child.wait() cleanup closes the parent pipe ends, so the
+        // readers must be fully out of their poll/read loop BEFORE the reap
+        // (a reader's defer bumps readers_done only after its last fd
+        // touch). If the drain ended on the deadline or an external closing,
+        // the readers are still inside a poll tick: tell them to stop and
+        // wait them out. Bounded by construction — readers observe closing
+        // within one READER_POLL_MS tick; the hard cap only backstops a
+        // wedged kernel and is never reached in practice.
+        if (session.readers_done.load(.acquire) < expected_readers) {
+            session.closing.store(true, .release);
+            const exit_deadline = nowMs(io) + READER_EXIT_MS;
+            while (session.readers_done.load(.acquire) < expected_readers) {
+                if (nowMs(io) >= exit_deadline) break;
+                os.sleepMs(1);
+            }
         }
+        // Step 5: reap with the child already dead, so child.wait() returns
+        // immediately. The kill_mutex critical section serializes the reap
+        // against killTreeGuarded callers: their tree_killed check + kill
+        // complete either strictly before this reap (leader zombie still
+        // pins the pgid — safe) or strictly after it (they observe
+        // tree_killed == true and skip). A bare bool left a load(false) →
+        // waiter kill+reap → late kill at a recycled pgid race.
+        session.kill_mutex.lockUncancelable(io);
+        const term = session.child.wait(io) catch {
+            session.kill_mutex.unlock(io);
+            session.mutex.lockUncancelable(io);
+            session.done = true;
+            session.exit_code = null;
+            session.ended_ms = nowMs(io);
+            session.mutex.unlock(io);
+            return;
+        };
+        session.kill_mutex.unlock(io);
+        const code = termExitCode(term);
+        session.mutex.lockUncancelable(io);
+        session.done = true;
+        session.exit_code = code;
+        session.ended_ms = nowMs(io);
+        session.mutex.unlock(io);
+        return;
+    }
+    // Fallback after a waitid failure: block on the child WITHOUT holding
+    // kill_mutex — exec_kill must be able to unblock this wait. The
+    // post-reap kill keeps its documented pid-reuse window (the gap the
+    // WNOWAIT path exists to close), but a late kill is still strictly
+    // better than a leaked tree.
+    const term = session.child.wait(io) catch {
+        killTreeGuarded(session, io);
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = null;
@@ -1331,10 +1383,7 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
         return;
     };
     const code = termExitCode(term);
-    if (!no_reap_ok) {
-        proc.killTree(session.pid, session.job);
-        session.tree_killed.store(true, .release);
-    }
+    killTreeGuarded(session, io);
     session.mutex.lockUncancelable(io);
     session.done = true;
     session.exit_code = code;
@@ -1502,7 +1551,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     session.waiter_thread = std.Thread.spawn(.{}, sessionWaiterMain, .{ session, io }) catch null;
     if (session.stdout_thread == null or session.stderr_thread == null or session.waiter_thread == null) {
         session.closing.store(true, .release);
-        proc.killTree(session.pid, session.job);
+        killTreeGuarded(session, io);
         if (session.waiter_thread) |t| {
             t.join();
         } else {
@@ -1516,7 +1565,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
     store.put(session) catch |err| {
         session.closing.store(true, .release);
-        proc.killTree(session.pid, session.job);
+        killTreeGuarded(session, io);
         if (session.waiter_thread) |t| t.join();
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
@@ -1670,10 +1719,13 @@ fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayLis
 
 fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
-    const session = try sessionFromArgs(cfg, args);
-    defer sessionRelease(session);
+    // Validate protocol-level argument types before resolving the session:
+    // a wrong-typed argument is -32602 regardless of whether the session id
+    // happens to exist.
     const data_b64 = (try optStrArg(args, "data_b64")) orelse return error.MissingData;
     const eof = (try optBoolArg(args, "eof")) orelse false;
+    const session = try sessionFromArgs(cfg, args);
+    defer sessionRelease(session);
     const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
     const data = try std.heap.page_allocator.alloc(u8, size);
     defer std.heap.page_allocator.free(data);
@@ -1699,17 +1751,29 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "}");
 }
 
-fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
-    _ = io;
-    const session = try sessionFromArgs(cfg, args);
-    defer sessionRelease(session);
-    // tree_killed is set by the waiter once the tree is dead (POSIX: after
-    // the group kill while the leader zombie still pins the pgid). Skipping
-    // on it means a late SIGKILL can never land on a recycled process group.
+/// Serialized check-and-kill. The tree_killed check, the kill and the store
+/// are atomic with respect to the waiter's reap (sessionWaiterMain holds
+/// kill_mutex across child.wait() once the leader is known dead): a guarded
+/// kill either lands while the leader zombie still pins the process group —
+/// safe — or observes tree_killed == true after the reap and skips. A bare
+/// bool could not give that: load(false) → context switch → waiter kill+reap
+/// → late kill would fire into a possibly recycled process group.
+fn killTreeGuarded(session: *Session, io: Io) void {
+    session.kill_mutex.lockUncancelable(io);
+    defer session.kill_mutex.unlock(io);
     if (!session.tree_killed.load(.acquire)) {
         proc.killTree(session.pid, session.job);
         session.tree_killed.store(true, .release);
     }
+}
+
+fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+    const session = try sessionFromArgs(cfg, args);
+    defer sessionRelease(session);
+    // killTreeGuarded serializes check+kill against the waiter's reap: the
+    // kill either lands while the leader zombie still pins the process group
+    // or is skipped because the tree is already known dead.
+    killTreeGuarded(session, io);
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
@@ -1717,7 +1781,6 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
 /// drop the store's ref. Safe against concurrent exec_close — the loser of
 /// the removal race reports already_closed and frees nothing.
 fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
-    _ = io;
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const session = sessionFromArgs(cfg, args) catch |err| switch (err) {
         error.UnknownSession => {
@@ -1734,12 +1797,9 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         return;
     };
     session.closing.store(true, .release);
-    // Same recycled-pgid guard as exec_kill: once the waiter (or a previous
+    // Same serialized guard as exec_kill: once the waiter (or a previous
     // kill/close) killed the tree, never signal the group again.
-    if (!session.tree_killed.load(.acquire)) {
-        proc.killTree(session.pid, session.job);
-        session.tree_killed.store(true, .release);
-    }
+    killTreeGuarded(session, io);
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();

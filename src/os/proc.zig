@@ -235,6 +235,21 @@ pub fn killTree(pid: ProcessId, job: JobField) void {
     }
 }
 
+/// XNU idtype_t (bsd/sys/wait.h): typedef enum idtype { P_ALL, P_PID,
+/// P_PGID } — declaration order makes P_ALL=0, P_PID=1, P_PGID=2. Linux call
+/// sites use the typed std.os.linux.P instead; this enum exists so the
+/// Darwin call site can never pass a bare integer again (0 was P_ALL:
+/// waitid matched ANY exited child of the daemon, so one finishing session
+/// killed every parallel session's tree).
+const DarwinIdType = enum(c_uint) {
+    all = 0,
+    pid = 1,
+    pgid = 2,
+};
+
+/// XNU waitid options used below: WEXITED (0x4) | WNOWAIT (0x20).
+const darwin_wexited_nowait: c_int = 0x4 | 0x20;
+
 /// Block until the direct child `pid` exits WITHOUT reaping it
 /// (waitid(WNOWAIT)). The unreaped zombie keeps its pid — and therefore the
 /// process-group id it led — allocated, so a kill(-pgid) issued after this
@@ -256,12 +271,21 @@ pub fn waitChildExitNoReap(pid: ProcessId) error{WaitFailed}!void {
         }
     } else {
         // Darwin: libSystem waitid (POSIX.1-2008); std.c ships no binding.
-        // P_PID = 0, WEXITED = 0x4, WNOWAIT = 0x20 on XNU.
+        // XNU: P_ALL=0, P_PID=1, P_PGID=2 (see DarwinIdType); WEXITED=0x4,
+        // WNOWAIT=0x20.
         var retries: u32 = 0;
         while (true) {
             var info: std.c.siginfo_t = undefined;
-            const rc = waitid(0, pid, &info, 0x4 | 0x20);
-            if (rc == 0) return;
+            const rc = waitid(@intFromEnum(DarwinIdType.pid), pid, &info, darwin_wexited_nowait);
+            if (rc == 0) {
+                // Identity check: the reported child must be the one we were
+                // asked about. A regression to P_ALL semantics (or a kernel
+                // surprise) must fail into the caller's fallback — which
+                // blocks on OUR child — never kill our own live tree on
+                // someone else's exit.
+                if (info.pid != pid) return error.WaitFailed;
+                return;
+            }
             if (comptime @hasDecl(std.c, "_errno")) {
                 if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
                 return error.WaitFailed;
