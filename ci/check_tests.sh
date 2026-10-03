@@ -18,7 +18,7 @@ ZIG_BIN="${ZIG:-zig}"
 "$ZIG_BIN" build test
 
 # --- test count floor ------------------------------------------------------
-MIN_TESTS=23
+MIN_TESTS=27
 TEST_COUNT=$(grep -rh 'test "' src/ --include='*.zig' | wc -l | tr -d ' ')
 if [ "$TEST_COUNT" -lt "$MIN_TESTS" ]; then
     echo "check_tests: test block count $TEST_COUNT is below floor $MIN_TESTS" >&2
@@ -28,18 +28,22 @@ echo "check_tests: $TEST_COUNT test blocks (floor $MIN_TESTS)"
 
 # --- required test names ---------------------------------------------------
 REQUIRED_TESTS='read http request extracts full post request
+read http request extracts lowercase header names
 read http request body containing crlfcrlf sequence
 read http request sends 100 continue for expect header
 read http request ignores non continue expect value
+read http request skips 100 continue without body
 read http request rejects malformed content length
 read http request rejects conflicting duplicate content length
 read http request rejects oversized content length
 read http request short body after eof errors
 read http request unterminated headers error on eof
+read http request clean eof on empty socket
 read http request oversized headers rejected
 read http request rejects malformed request line
 read http request keeps pipelined bytes as carry for the next request
 read http request rejects chunked transfer encoding
+read http request without content length has empty body
 content length rejects malformed values and documents plus prefix
 expect continue matching is case insensitive and whitespace trimmed'
 
