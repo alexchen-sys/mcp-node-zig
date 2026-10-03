@@ -3,7 +3,9 @@
 //! Best-effort contract: every field degrades independently to "" / 0 on
 //! failure and `fetch` itself never fails. All OSes emit the same JSON
 //! fields, filled from their native sources (loadavg_raw/uptime_raw stay
-//! empty where the OS has no analog).
+//! empty where the OS has no analog). disk_root mirrors the python
+//! lapnode field of the same name (total/used/free bytes of the root
+//! filesystem).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +23,17 @@ pub const os_name: []const u8 = switch (builtin.os.tag) {
 };
 pub const machine: []const u8 = @tagName(builtin.cpu.arch);
 
+/// Root-filesystem usage in bytes, field names mirroring the python
+/// lapnode reference (`shutil.disk_usage("/")` semantics): `total`,
+/// `used` (total minus free-to-root; includes root-reserved blocks on
+/// POSIX), `free` (available to unprivileged users). All fields degrade
+/// independently of the rest of SysInfo to 0 when the stat call fails.
+pub const DiskRoot = struct {
+    total: u64 = 0,
+    used: u64 = 0,
+    free: u64 = 0,
+};
+
 pub const SysInfo = struct {
     hostname: []const u8 = "",
     loadavg_raw: []const u8 = "",
@@ -29,6 +42,8 @@ pub const SysInfo = struct {
     mem_total: u64 = 0,
     /// Available physical memory in bytes; 0 when unknown.
     mem_available: u64 = 0,
+    /// Root filesystem usage in bytes; zeros when unknown.
+    disk_root: DiskRoot = .{},
 };
 
 pub fn fetch(arena: Allocator, io: Io) SysInfo {
@@ -57,7 +72,46 @@ fn fetchLinux(arena: Allocator, io: Io) SysInfo {
         if (std.mem.startsWith(u8, line, "MemTotal:")) info.mem_total = parseKbLine(line) * 1024;
         if (std.mem.startsWith(u8, line, "MemAvailable:")) info.mem_available = parseKbLine(line) * 1024;
     }
+    info.disk_root = linuxDiskRoot();
     return info;
+}
+
+/// Linux `struct statfs` as filled by the statfs(2) syscall on 64-bit
+/// targets (std 0.16 does not wrap this syscall; the kernel layout is
+/// stable ABI). Only the prefix consumed here is declared.
+const LinuxStatfs = extern struct {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [4]i64,
+};
+
+/// Root disk usage via the raw statfs(2) syscall (no libc on this target).
+/// `f_frsize` is the statvfs(2)-style fundamental block size python uses;
+/// fall back to f_bsize when a filesystem reports it as 0.
+fn linuxDiskRoot() DiskRoot {
+    // The 32-bit kernel ABI pads differently; degrade rather than read
+    // garbage. All supported builds are 64-bit.
+    if (comptime @sizeOf(usize) != 8) return .{};
+    var st: LinuxStatfs = undefined;
+    const rc = std.os.linux.syscall2(.statfs, @intFromPtr("/"), @intFromPtr(&st));
+    if (std.os.linux.errno(rc) != .SUCCESS) return .{};
+    const frsize: u64 = if (st.f_frsize > 0)
+        @intCast(st.f_frsize)
+    else if (st.f_bsize > 0) @intCast(st.f_bsize) else return .{};
+    return .{
+        .total = st.f_blocks *| frsize,
+        .used = (st.f_blocks -| st.f_bfree) *| frsize,
+        .free = st.f_bavail *| frsize,
+    };
 }
 
 /// Parse a "/proc/meminfo"-style line ("MemTotal:       16384 kB") into the
@@ -127,7 +181,50 @@ fn fetchDarwin(arena: Allocator, io: Io) SysInfo {
     info.loadavg_raw = darwinLoadavg(arena);
     info.uptime_raw = darwinUptime(arena, io);
     darwinMeminfo(&info);
+    info.disk_root = darwinDiskRoot();
     return info;
+}
+
+/// Darwin `struct statfs` (userland, 64-bit-inode layout of
+/// bsd/sys/mount.h: __DARWIN_STRUCT_STATFS64) as statfs(2) fills it.
+/// std 0.16 does not wrap this libc call, so the ABI layout is declared
+/// here; every member past f_ffree is present only to make the struct
+/// size correct for the libc write.
+const DarwinStatfs = extern struct {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_owner: u32,
+    f_type: u32,
+    f_fssubtype: u32,
+    f_fstypename: [16]u8,
+    f_mntonname: [1024]u8,
+    f_mntfromname: [1024]u8,
+    f_flags: u32,
+    f_flags_ext: u32,
+    f_reserved: [7]u32,
+};
+
+extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
+
+/// Root disk usage via libSystem statfs(2). CPython's os.statvfs maps the
+/// BSD statfs onto statvfs semantics with f_frsize == f_bsize on Darwin,
+/// and shutil.disk_usage is defined on top of that; mirror it here.
+fn darwinDiskRoot() DiskRoot {
+    var st: DarwinStatfs = undefined;
+    if (statfs("/", &st) != 0) return .{};
+    const bsize: u64 = st.f_bsize;
+    if (bsize == 0) return .{};
+    return .{
+        .total = st.f_blocks *| bsize,
+        .used = (st.f_blocks -| st.f_bfree) *| bsize,
+        .free = st.f_bavail *| bsize,
+    };
 }
 
 fn darwinHostname(arena: Allocator) []const u8 {
@@ -185,12 +282,24 @@ fn darwinMeminfo(info: *SysInfo) void {
 }
 
 // ---------------------------------------------------------------------------
-// Windows: kernel32 externs (std 0.16 does not wrap these three).
+// Windows: kernel32 externs (std 0.16 does not wrap these).
 // ---------------------------------------------------------------------------
 
 extern "kernel32" fn GetTickCount64() u64;
 extern "kernel32" fn GetComputerNameW(buffer: [*]u16, size: *u32) i32;
 extern "kernel32" fn GlobalMemoryStatusEx(status: *MemoryStatusEx) i32;
+extern "kernel32" fn GetWindowsDirectoryW(buffer: [*]u16, size: u32) u32;
+extern "kernel32" fn GetDiskFreeSpaceExW(
+    root: [*:0]const u16,
+    available_to_caller: *LargeInteger,
+    total: *LargeInteger,
+    free: *LargeInteger,
+) i32;
+
+/// Win32 ULARGE_INTEGER (QuadPart view; the union split is irrelevant here).
+const LargeInteger = extern struct {
+    quad: u64 = 0,
+};
 
 /// Win32 MEMORYSTATUSEX.
 const MemoryStatusEx = extern struct {
@@ -225,7 +334,29 @@ fn fetchWindows(arena: Allocator) SysInfo {
         info.mem_total = status.total_phys;
         info.mem_available = status.avail_phys;
     }
+    info.disk_root = windowsDiskRoot();
     return info;
+}
+
+/// Root disk usage on the system drive (the one hosting the Windows
+/// directory) via GetDiskFreeSpaceExW. `used = total - free` matches
+/// CPython's shutil.disk_usage on this platform; `free` is the total
+/// number of free bytes, not the caller-quota variant.
+fn windowsDiskRoot() DiskRoot {
+    var win_dir: [260]u16 = undefined; // MAX_PATH is ample for the system dir
+    const len = GetWindowsDirectoryW(&win_dir, win_dir.len);
+    if (len == 0 or len > win_dir.len) return .{};
+    // "C:\Windows" -> "C:\": drive letter, ':', '\', NUL sentinel.
+    const root: [3:0]u16 = .{ win_dir[0], ':', '\\' };
+    var avail: LargeInteger = .{};
+    var total: LargeInteger = .{};
+    var free: LargeInteger = .{};
+    if (GetDiskFreeSpaceExW(&root, &avail, &total, &free) == 0) return .{};
+    return .{
+        .total = total.quad,
+        .used = total.quad -| free.quad,
+        .free = free.quad,
+    };
 }
 
 fn windowsHostname(arena: Allocator) []const u8 {
@@ -239,4 +370,19 @@ fn windowsHostname(arena: Allocator) []const u8 {
 fn windowsUptime(arena: Allocator) []const u8 {
     const ms = GetTickCount64();
     return std.fmt.allocPrint(arena, "{d}.{d:0>2}", .{ ms / std.time.ms_per_s, (ms % std.time.ms_per_s) / 10 }) catch "";
+}
+
+test "disk_root reports a populated root filesystem" {
+    // Live stat of "/" (or the system drive): on every supported OS a
+    // real machine answers with a nonzero total. The per-OS fetchers
+    // degrade to zeros only on call failure, which is not the case here.
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const io = Io.Threaded.global_single_threaded.io();
+    const info = fetch(arena_state.allocator(), io);
+    try std.testing.expect(info.disk_root.total > 0);
+    try std.testing.expect(info.disk_root.free > 0);
+    try std.testing.expect(info.disk_root.used <= info.disk_root.total);
+    try std.testing.expect(info.disk_root.free <= info.disk_root.total);
 }

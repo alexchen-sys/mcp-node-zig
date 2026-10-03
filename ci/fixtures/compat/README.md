@@ -74,9 +74,10 @@ The matcher is a structural deep-match, deliberately minimal:
   - `{"*int": null}` — any integer (booleans do not match).
   - `{"*str": null}` — any string.
   - `{"*any": null}` — anything, including null.
-  The value in the wildcard object is ignored. Wildcards exist for volatile
-  fields only: `session_id`, `pid`, `duration_ms`, `started_ms`,
-  `ended_ms`, `mtime`, `MemTotal`/`MemAvailable`, `hostname`, `node`,
+  - The value in the wildcard object is ignored. Wildcards exist for volatile
+  fields only: `session_id`, `pid`, `duration_ms`, `duration_us`, `started_ms`,
+  `ended_ms`, `mtime`, `MemTotal`/`MemAvailable`, `disk_root`
+  (`total`/`used`/`free`), `hostname`, `node`,
   `loadavg_raw`, `uptime_raw`, directory sizes, `auth-fixture`/`daemon.log`
   sizes. Deterministic values (`exit_code`, `stdout`, `sha256`, file sizes,
   offsets) are pinned exactly so accidental contract drift cannot hide
@@ -120,8 +121,8 @@ The matcher is a structural deep-match, deliberately minimal:
   `/bin/sleep` and `bash` (the default `exec_shell` shell). SIGKILL is
   signal 9, so a killed session reports `exit_code` 137 (128+9).
 - `sys_info` pins `os: "Linux"` and `machine: "x86_64"` (compile-time
-  constants of the build platform); the hostname and memory numbers are
-  wildcards.
+  constants of the build platform); the hostname, memory numbers and
+  `disk_root` (root filesystem total/used/free in bytes) are wildcards.
 - File tools run inside the daemon's temp cwd. The default-path `list_dir`
   case expects exactly `auth-fixture`, `compat-dir`, `daemon.log` — the
   harness creates the first and last, the fixture file itself creates

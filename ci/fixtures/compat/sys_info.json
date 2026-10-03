@@ -1,5 +1,5 @@
 {
-  "description": "sys_info host summary. Note: the payload has no ok field; every volatile field (hostname, load averages, uptime, memory) is a typed wildcard. os and machine are compile-time constants of the build platform and are pinned. sys_info takes no arguments, so there is no missing-required-arg case; unknown arguments are ignored.",
+  "description": "sys_info host summary. Note: the payload has no ok field; every volatile field (hostname, load averages, uptime, memory, root disk) is a typed wildcard. os and machine are compile-time constants of the build platform and are pinned. disk_root is the root filesystem usage in bytes (total/used/free, python lapnode semantics; zeros only when the stat call fails). sys_info takes no arguments, so there is no missing-required-arg case; unknown arguments are ignored.",
   "platforms": ["linux"],
   "platforms_reason": "pins the compile-time os/machine constants of the Linux x86_64 reference build; per-platform goldens are future work",
   "cases": [
@@ -13,7 +13,7 @@
           "id": 43,
           "result": {
             "content": [{"type": "text", "text": {"*str": null}}],
-            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}},
+            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}, "disk_root": {"total": {"*int": null}, "used": {"*int": null}, "free": {"*int": null}}},
             "isError": false
           }
         }
@@ -29,7 +29,7 @@
           "id": 44,
           "result": {
             "content": [{"type": "text", "text": {"*str": null}}],
-            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}},
+            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}, "disk_root": {"total": {"*int": null}, "used": {"*int": null}, "free": {"*int": null}}},
             "isError": false
           }
         }

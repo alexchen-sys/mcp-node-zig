@@ -480,6 +480,12 @@ pub fn toolSysInfo(arena: Allocator, io: Io, cfg: *const config.Config, out: *st
     try out.print(arena, "{d}", .{info.mem_total});
     try out.appendSlice(arena, ",\"MemAvailable\":");
     try out.print(arena, "{d}", .{info.mem_available});
+    try out.appendSlice(arena, "},\"disk_root\":{\"total\":");
+    try out.print(arena, "{d}", .{info.disk_root.total});
+    try out.appendSlice(arena, ",\"used\":");
+    try out.print(arena, "{d}", .{info.disk_root.used});
+    try out.appendSlice(arena, ",\"free\":");
+    try out.print(arena, "{d}", .{info.disk_root.free});
     try out.appendSlice(arena, "}}");
 }
 
