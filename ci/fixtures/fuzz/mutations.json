@@ -1,0 +1,828 @@
+{
+  "seed": 20261002,
+  "base_case": "canon-000",
+  "head_len": 136,
+  "body_len": 40,
+  "ops": [
+    {
+      "id": "mut-flip-001",
+      "op": "flip",
+      "pos": 25,
+      "mask": 83,
+      "expected": {
+        "responses": [
+          421
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-002",
+      "op": "flip",
+      "pos": 83,
+      "mask": 194,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-003",
+      "op": "flip",
+      "pos": 72,
+      "mask": 85,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-004",
+      "op": "flip",
+      "pos": 119,
+      "mask": 155,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-005",
+      "op": "flip",
+      "pos": 0,
+      "mask": 105,
+      "expected": {
+        "responses": [
+          405
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-006",
+      "op": "flip",
+      "pos": 133,
+      "mask": 14,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-007",
+      "op": "flip",
+      "pos": 70,
+      "mask": 164,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-008",
+      "op": "flip",
+      "pos": 47,
+      "mask": 114,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-009",
+      "op": "flip",
+      "pos": 90,
+      "mask": 210,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-010",
+      "op": "flip",
+      "pos": 63,
+      "mask": 163,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-011",
+      "op": "flip",
+      "pos": 133,
+      "mask": 239,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-012",
+      "op": "flip",
+      "pos": 46,
+      "mask": 225,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-013",
+      "op": "flip",
+      "pos": 125,
+      "mask": 78,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-014",
+      "op": "flip",
+      "pos": 47,
+      "mask": 246,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-015",
+      "op": "flip",
+      "pos": 109,
+      "mask": 222,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-016",
+      "op": "flip",
+      "pos": 79,
+      "mask": 68,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-017",
+      "op": "flip",
+      "pos": 116,
+      "mask": 191,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-018",
+      "op": "flip",
+      "pos": 59,
+      "mask": 124,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-019",
+      "op": "flip",
+      "pos": 116,
+      "mask": 229,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-020",
+      "op": "flip",
+      "pos": 134,
+      "mask": 196,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-021",
+      "op": "flip",
+      "pos": 39,
+      "mask": 118,
+      "expected": {
+        "responses": [
+          200
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-022",
+      "op": "flip",
+      "pos": 18,
+      "mask": 231,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-023",
+      "op": "flip",
+      "pos": 117,
+      "mask": 20,
+      "expected": {
+        "responses": [
+          400,
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-024",
+      "op": "flip",
+      "pos": 134,
+      "mask": 36,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-025",
+      "op": "flip",
+      "pos": 88,
+      "mask": 148,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-026",
+      "op": "flip",
+      "pos": 69,
+      "mask": 102,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-027",
+      "op": "flip",
+      "pos": 128,
+      "mask": 247,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-028",
+      "op": "flip",
+      "pos": 110,
+      "mask": 199,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-029",
+      "op": "flip",
+      "pos": 103,
+      "mask": 220,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-030",
+      "op": "flip",
+      "pos": 48,
+      "mask": 213,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-031",
+      "op": "flip",
+      "pos": 60,
+      "mask": 19,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-032",
+      "op": "flip",
+      "pos": 72,
+      "mask": 235,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-033",
+      "op": "flip",
+      "pos": 124,
+      "mask": 15,
+      "expected": {
+        "responses": [
+          400,
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-034",
+      "op": "flip",
+      "pos": 129,
+      "mask": 140,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-035",
+      "op": "flip",
+      "pos": 120,
+      "mask": 8,
+      "expected": {
+        "responses": [
+          400,
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-036",
+      "op": "flip",
+      "pos": 95,
+      "mask": 97,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-037",
+      "op": "flip",
+      "pos": 83,
+      "mask": 25,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-038",
+      "op": "flip",
+      "pos": 71,
+      "mask": 155,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-039",
+      "op": "flip",
+      "pos": 125,
+      "mask": 243,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-040",
+      "op": "flip",
+      "pos": 61,
+      "mask": 44,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-041",
+      "op": "flip",
+      "pos": 10,
+      "mask": 152,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-042",
+      "op": "flip",
+      "pos": 124,
+      "mask": 197,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-043",
+      "op": "flip",
+      "pos": 23,
+      "mask": 161,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-044",
+      "op": "flip",
+      "pos": 14,
+      "mask": 59,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-045",
+      "op": "flip",
+      "pos": 109,
+      "mask": 111,
+      "expected": {
+        "responses": [
+          401
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-046",
+      "op": "flip",
+      "pos": 57,
+      "mask": 214,
+      "expected": {
+        "responses": [
+          415
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-047",
+      "op": "flip",
+      "pos": 77,
+      "mask": 223,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-flip-048",
+      "op": "flip",
+      "pos": 24,
+      "mask": 215,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-001",
+      "op": "truncate",
+      "pos": 86,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-002",
+      "op": "truncate",
+      "pos": 116,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-003",
+      "op": "truncate",
+      "pos": 32,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-004",
+      "op": "truncate",
+      "pos": 22,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-005",
+      "op": "truncate",
+      "pos": 51,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-006",
+      "op": "truncate",
+      "pos": 40,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-007",
+      "op": "truncate",
+      "pos": 30,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-008",
+      "op": "truncate",
+      "pos": 87,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-009",
+      "op": "truncate",
+      "pos": 111,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-010",
+      "op": "truncate",
+      "pos": 54,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-011",
+      "op": "truncate",
+      "pos": 27,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-012",
+      "op": "truncate",
+      "pos": 91,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-013",
+      "op": "truncate",
+      "pos": 90,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-014",
+      "op": "truncate",
+      "pos": 127,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-015",
+      "op": "truncate",
+      "pos": 10,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    },
+    {
+      "id": "mut-trunc-016",
+      "op": "truncate",
+      "pos": 27,
+      "expected": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+    }
+  ],
+  "note": "Frozen LCG stream for the default seed; expected outcomes are filled from the observed behavior of the binary at c70c323 (probe run). The runner verifies this file matches the LCG byte-for-byte before trusting it."
+}

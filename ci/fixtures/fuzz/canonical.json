@@ -1,0 +1,302 @@
+{
+  "token": "fuzzcafe20261002c70c323",
+  "host_line": "127.0.0.1:65535",
+  "note": "Literal bytes; nothing here depends on the daemon's real port. Host port 65535 is fake and matches the default allowed-hosts wildcard 127.0.0.1:*. The token is a corpus fixture (fixed) so the case stream is byte-reproducible; it is delivered via MCP_NODE_TOKEN_FILE like ci/test_regressions.py does.",
+  "cases": [
+    {
+      "id": "canon-000",
+      "class": "baseline",
+      "description": "Canonical valid ping: strict grammar, every gate passes. Baseline for mutations (base_case) and proof the harness talks to a healthy daemon.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1"
+        ]
+      },
+      "known_bug": false,
+      "notes": "RFC 9112-clean request; connection stays keep-alive. Probe: with a half-closed client the server answers, then sees clean EOF in its keep-alive loop and closes; the answer itself still proves the connection stayed usable for that request."
+    },
+    {
+      "id": "canon-001",
+      "class": "cl-duplicate-identical",
+      "description": "Duplicate Content-Length with identical values (class a). Accepted: RFC 9112 6.3 permits collapsing identical duplicates.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1"
+        ]
+      },
+      "known_bug": false,
+      "notes": "parseHead compares duplicates: equal values are collapsed, unequal are rejected. Probe: with a half-closed client the server answers, then sees clean EOF in its keep-alive loop and closes; the answer itself still proves the connection stayed usable for that request."
+    },
+    {
+      "id": "canon-002",
+      "class": "cl-duplicate-conflict",
+      "description": "Duplicate Content-Length with conflicting values (class b): classic request-smuggling split. Must be 400, never a guess or last-wins.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\nContent-Length: 39\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "RFC 9112 6.3: conflicting duplicates ought to be treated as an error; smuggling-resistant answer is 400 + close."
+    },
+    {
+      "id": "canon-003",
+      "class": "cl-plus-te-chunked",
+      "description": "Content-Length + Transfer-Encoding: chunked (class c): the canonical CL.TE smuggling vector.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\nTransfer-Encoding: chunked\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "RFC 9112 6.1: both present ought to be an error; the server refuses Transfer-Encoding outright (400)."
+    },
+    {
+      "id": "canon-004",
+      "class": "cl-plus-te-identity",
+      "description": "Content-Length + Transfer-Encoding: identity (class d): legacy-coding variant of the CL.TE desync.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\nTransfer-Encoding: identity\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "RFC 9112 6.1: chunked is not the final encoding -> server MUST answer 400. Blanket TE refusal also matches."
+    },
+    {
+      "id": "canon-005",
+      "class": "te-alone",
+      "description": "Transfer-Encoding: chunked without Content-Length. Framing would fall to chunked parsing; the server refuses any TE.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nTransfer-Encoding: chunked\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "Stricter than RFC needs (a non-chunked-speaker MAY 501); refusing TE outright is the documented hardening stance."
+    },
+    {
+      "id": "canon-006",
+      "class": "bare-lf-terminator-close",
+      "description": "Bare LF as line terminator (class e), client half-closes after send: no CRLFCRLF ever appears, so the head never terminates; EOF mid-head must answer 400, not a hang.",
+      "send": "POST /mcp HTTP/1.1\nHost: 127.0.0.1:65535\nContent-Type: application/json\nX-Node-Token: fuzzcafe20261002c70c323\nContent-Length: 40\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "RFC 9112 2.2: a recipient MAY accept bare LF; strict CRLF-only is the safe desync-resistant posture."
+    },
+    {
+      "id": "canon-007",
+      "class": "bare-lf-terminator-hold",
+      "description": "Bare LF head, client keeps the connection open: the head never completes, so the absolute request deadline (MCP_NODE_SOCKET_TIMEOUT_S=3) must fire a 408 in bounded time, never an open-ended hang.",
+      "send": "POST /mcp HTTP/1.1\nHost: 127.0.0.1:65535\nContent-Type: application/json\nX-Node-Token: fuzzcafe20261002c70c323\nContent-Length: 40\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "hold",
+      "deadline_s": 8,
+      "expect": {
+        "responses": [
+          408
+        ],
+        "close_after": "yes",
+        "max_elapsed_s": 5.5
+      },
+      "known_bug": false,
+      "notes": "408 must arrive near the 3s budget, not a fresh per-read timeout stacked on it."
+    },
+    {
+      "id": "canon-008",
+      "class": "bare-cr-terminator-close",
+      "description": "Bare CR as line terminator (class f), client half-closes: no LF at all, head never terminates, EOF mid-head -> 400.",
+      "send": "POST /mcp HTTP/1.1\rHost: 127.0.0.1:65535\rContent-Type: application/json\rX-Node-Token: fuzzcafe20261002c70c323\rContent-Length: 40\r\r{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "CR-only framing is invalid; the head scan only terminates on CRLFCRLF."
+    },
+    {
+      "id": "canon-009",
+      "class": "bare-cr-in-value",
+      "description": "Valid CRLF head, but a bare CR smuggled inside a header value (X-Junk: a<CR>b): field-content forbids CR, so header grammar must reject.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nX-Junk: a\rb\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "RFC 9110 field-content: SP/HTAB/VCHAR/obs-text only; 0x0d is a grammar violation."
+    },
+    {
+      "id": "canon-010",
+      "class": "body-truncated-close",
+      "description": "Head complete, body truncated to 30 of the declared 40 bytes, then client half-closes (class g): short body must be 400 ShortBody, not a silent drop.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"metho",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "EOF mid-body: the declared body never fully arrived -> 400 ShortBody + close."
+    },
+    {
+      "id": "canon-011",
+      "class": "cl-oversize-close",
+      "description": "Content-Length 1024 but only 10 body bytes, then client half-closes (class h): immediate EOF mid-body -> 400 ShortBody, never a hang.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 1024\r\n\r\n{\"jsonrpc",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          400
+        ],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "104,182 bytes of the declared body never arrive; EOF shortens the wait to zero."
+    },
+    {
+      "id": "canon-012",
+      "class": "cl-oversize-hold",
+      "description": "Content-Length 1024, 10 bytes sent, client holds the connection open (class h): the server must give up at its absolute deadline (~3s) with 408, not hang.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 1024\r\n\r\n{\"jsonrpc",
+      "after_send": "hold",
+      "deadline_s": 8,
+      "expect": {
+        "responses": [
+          408
+        ],
+        "close_after": "yes",
+        "max_elapsed_s": 5.5
+      },
+      "known_bug": false,
+      "notes": "Absolute request deadline covers head+body; a dribbling client cannot pin a slot forever."
+    },
+    {
+      "id": "canon-013",
+      "class": "pipelining-two-valid",
+      "description": "Pipelining: two full valid requests written in one shot (class i): both answered in order, ids 1 then 2, no desync.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200,
+          200
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1",
+          "\"id\":2"
+        ]
+      },
+      "known_bug": false,
+      "notes": "Over-fetched bytes past request 1 seed the next iteration (carry); answers stay in order. Probe: with a half-closed client the server answers, then sees clean EOF in its keep-alive loop and closes; the answer itself still proves the connection stayed usable for that request."
+    },
+    {
+      "id": "canon-014",
+      "class": "pipelining-valid-plus-malformed",
+      "description": "Pipelining: valid request + second request with conflicting duplicate Content-Length (class j): first answered 200, the smuggled second must be 400 and the connection closed.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\nContent-Length: 1\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200,
+          400
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1"
+        ]
+      },
+      "known_bug": false,
+      "notes": "The pipelined malformed head arrives via carry; parseHead rejects, connection closes: no desync window."
+    },
+    {
+      "id": "canon-015",
+      "class": "pipelining-valid-plus-short-body",
+      "description": "Pipelining: valid request + second request whose declared Content-Length (10) exceeds the 3 bytes actually sent (class j variant): first 200, second 400 ShortBody.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 10\r\n\r\nabc",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200,
+          400
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1"
+        ]
+      },
+      "known_bug": false,
+      "notes": "Truncation arriving as a pipelined second request: EOF mid-body -> 400 + close."
+    },
+    {
+      "id": "canon-016",
+      "class": "silent-close",
+      "description": "Connect and half-close with zero bytes: clean EOF before any byte is the keep-alive shutdown path; the server must close silently, never emit a zombie 400.",
+      "send": "",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [],
+        "close_after": "yes"
+      },
+      "known_bug": false,
+      "notes": "Closed-without-response class: writing an error into a dying socket would be noise, not safety."
+    },
+    {
+      "id": "canon-017",
+      "class": "pipelining-valid-plus-bare-lf",
+      "description": "Pipelining: valid request + second request with bare-LF framing: the carry path must treat the unterminated second head as BadHeaders on EOF, answering 200 then 400.",
+      "send": "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:65535\r\nContent-Type: application/json\r\nX-Node-Token: fuzzcafe20261002c70c323\r\nContent-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}POST /mcp HTTP/1.1\nHost: 127.0.0.1:65535\nContent-Type: application/json\nX-Node-Token: fuzzcafe20261002c70c323\nContent-Length: 40\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
+      "after_send": "shutdown",
+      "expect": {
+        "responses": [
+          200,
+          400
+        ],
+        "close_after": "yes",
+        "body_contains": [
+          "\"id\":1"
+        ]
+      },
+      "known_bug": false,
+      "notes": "Over-fetched bare-LF bytes seed the next request via carry; no CRLFCRLF + EOF -> 400 BadHeaders."
+    }
+  ]
+}
