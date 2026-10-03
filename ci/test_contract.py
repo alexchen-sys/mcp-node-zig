@@ -87,7 +87,12 @@ class Node:
 
     def tool(self, name, **arguments):
         result = self.rpc('tools/call', {'name': name, 'arguments': arguments})
-        return result.get('structuredContent', json.loads(result['content'][0]['text']))
+        # structuredContent first: it is present in both text-mirror modes
+        # (MCP_NODE_TEXT_MIRROR=0 drops the content mirror); the text
+        # fallback covers isError envelopes, which never carry it.
+        if 'structuredContent' in result:
+            return result['structuredContent']
+        return json.loads(result['content'][0]['text'])
 
     def close(self):
         if self.process is not None and self.process.poll() is None:
@@ -246,6 +251,38 @@ class Contracts(unittest.TestCase):
         self.assertEqual(len(state['stderr']), 1024)
         self.assertTrue(state['truncated_stdout'])
         self.assertTrue(state['truncated_stderr'])
+
+    def test_text_mirror_flag_structured_only_mode(self):
+        # MCP_NODE_TEXT_MIRROR=0: successful tool results drop the redundant
+        # content[0].text mirror and ship structuredContent only; isError
+        # results keep the text channel for every client.
+        node = Node(MCP_NODE_TEXT_MIRROR='0')
+        self.addCleanup(node.close)
+        result = node.rpc('tools/call', {'name': 'exec',
+            'arguments': {'argv': [sys.executable, '-c', 'print("mirror-off")']}})
+        self.assertNotIn('content', result)
+        self.assertIn('structuredContent', result)
+        self.assertIs(result['isError'], False)
+        self.assertEqual(result['structuredContent']['stdout'], 'mirror-off\n')
+        # Domain error (isError stays false in the v0 quirk): structured-only.
+        result = node.rpc('tools/call', {'name': 'read_file',
+            'arguments': {'path': '/nonexistent-mcpnz-contract'}})
+        self.assertNotIn('content', result)
+        self.assertEqual(result['structuredContent']['error'], 'FileNotFound')
+        # isError result: text mirror survives the flag.
+        result = node.rpc('tools/call', {'name': 'no_such_tool', 'arguments': {}})
+        self.assertIn('content', result)
+        self.assertTrue(result['content'][0]['text'])
+        self.assertIs(result['isError'], True)
+        self.assertNotIn('structuredContent', result)
+        # Default (mirror on): both channels, as before.
+        default = Node()
+        self.addCleanup(default.close)
+        result = default.rpc('tools/call', {'name': 'exec',
+            'arguments': {'argv': [sys.executable, '-c', 'print("mirror-on")']}})
+        self.assertIn('content', result)
+        self.assertIn('structuredContent', result)
+        self.assertEqual(json.loads(result['content'][0]['text'])['stdout'], 'mirror-on\n')
 
 
 if __name__ == '__main__':

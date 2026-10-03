@@ -27,6 +27,12 @@ pub const Config = struct {
     max_sessions: u16,
     session_ttl_s: u32,
     max_inflight_bytes: u64,
+    /// Emit the JSON payload as `content[0].text` (text mirror) in addition
+    /// to `structuredContent`. Default true = the MCP 2025-06-18
+    /// backward-compat recommendation. `MCP_NODE_TEXT_MIRROR=0` opts
+    /// structured-capable clients into a single-copy result.
+    /// Errors (`isError: true`) always carry text regardless of this flag.
+    text_mirror: bool = true,
     sessions: ?*session_mod.SessionStore = null,
     inflight: ?*InflightGate = null,
 };
@@ -115,6 +121,13 @@ pub fn loadConfig(arena: Allocator, io: Io) !Config {
         if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
     }
 
+    // Text-mirror gate for tool results. Only the exact value "0" turns
+    // the mirror off; anything else (including unset) keeps the default
+    // spec-recommended behavior, so a typo cannot silently strip the
+    // text channel for legacy clients.
+    const mirror_s = getEnv(arena, "MCP_NODE_TEXT_MIRROR") orelse "1";
+    const text_mirror = !std.mem.eql(u8, mirror_s, "0");
+
     const hosts_s = getEnv(arena, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
     const origins_s = getEnv(arena, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
     return .{
@@ -130,6 +143,7 @@ pub fn loadConfig(arena: Allocator, io: Io) !Config {
         .max_sessions = max_sessions,
         .session_ttl_s = session_ttl,
         .max_inflight_bytes = max_inflight_bytes,
+        .text_mirror = text_mirror,
     };
 }
 

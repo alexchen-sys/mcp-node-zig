@@ -168,9 +168,9 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value
             error.InvalidParams => return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") },
             else => try buildErrorPayload(&payload, arena, @errorName(err)),
         }
-        return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
+        return .{ .status = 200, .body = try toolEnvelope(arena, cfg, id, payload.items, false) };
     };
-    return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
+    return .{ .status = 200, .body = try toolEnvelope(arena, cfg, id, payload.items, false) };
 }
 
 fn dispatchTool(arena: Allocator, io: Io, cfg: *const config.Config, name: []const u8, args: Value, out: *std.ArrayList(u8)) !void {
@@ -190,17 +190,24 @@ fn dispatchTool(arena: Allocator, io: Io, cfg: *const config.Config, name: []con
     return error.UnknownTool;
 }
 
-fn toolEnvelope(arena: Allocator, id: Value, payload: []const u8, is_error: bool, structured: bool) ![]const u8 {
+/// MCP tool-result envelope. The payload is emitted as `structuredContent`
+/// (the primary channel for clients) and, unless the text mirror was
+/// switched off via `MCP_NODE_TEXT_MIRROR=0`, again as the JSON-escaped
+/// `content[0].text` text mirror that pre-structured clients read.
+/// `isError` results always carry the text mirror: errors are read by
+/// every client, old and new alike.
+fn toolEnvelope(arena: Allocator, cfg: *const config.Config, id: Value, payload: []const u8, is_error: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
     try util.appendJsonValue(&out, arena, id);
-    try out.appendSlice(arena, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
-    try util.appendJsonString(&out, arena, payload);
-    try out.appendSlice(arena, "}]");
-    if (structured) {
-        try out.appendSlice(arena, ",\"structuredContent\":");
-        try out.appendSlice(arena, payload);
+    try out.appendSlice(arena, ",\"result\":{");
+    if (cfg.text_mirror or is_error) {
+        try out.appendSlice(arena, "\"content\":[{\"type\":\"text\",\"text\":");
+        try util.appendJsonString(&out, arena, payload);
+        try out.appendSlice(arena, "}],");
     }
+    try out.appendSlice(arena, "\"structuredContent\":");
+    try out.appendSlice(arena, payload);
     try out.appendSlice(arena, ",\"isError\":");
     try out.appendSlice(arena, if (is_error) "true" else "false");
     try out.appendSlice(arena, "}}");
@@ -309,4 +316,48 @@ test "rpc parse error and notification semantics" {
     try std.testing.expectEqual(@as(u16, 200), ping.status);
     const ping_parsed = try std.json.parseFromSliceLeaky(Value, arena, ping.body, .{});
     try std.testing.expect(ping_parsed.object.get("result").? == .object);
+}
+
+test "tool result text mirror flag" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    var cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+    // read_file on a missing path walks the full toolEnvelope path with a
+    // non-throwing payload ({"ok":false,"error":"FileNotFound"}).
+    const req = "{\"jsonrpc\":\"2.0\",\"id\":\"m\",\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"/nonexistent-mcpnz-mirror\"}}}";
+
+    // Default: spec-recommended mirror — text and structured both present.
+    const on = try handleRpc(arena, io, &cfg, req);
+    try std.testing.expect(std.mem.indexOf(u8, on.body, "\"content\":[{\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, on.body, "\"structuredContent\":") != null);
+
+    // Mirror off: structured-only for regular results...
+    cfg.text_mirror = false;
+    const off = try handleRpc(arena, io, &cfg, req);
+    try std.testing.expect(std.mem.indexOf(u8, off.body, "\"content\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, off.body, "\"structuredContent\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off.body, "\"isError\":false") != null);
+
+    // ...but isError results keep the text channel open for every client.
+    const unknown_req = "{\"jsonrpc\":\"2.0\",\"id\":\"u\",\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}";
+    const unknown = try handleRpc(arena, io, &cfg, unknown_req);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.body, "\"content\":[{\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.body, "\"isError\":true") != null);
 }
