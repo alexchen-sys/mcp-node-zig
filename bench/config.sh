@@ -47,3 +47,7 @@ G0T4_TOOL_KEY="argv"
 cleanup_workdir() {
     rm -rf "$WORKDIR"
 }
+# every script that sources this file (run_all.sh AND each bNN metric script)
+# gets its own mktemp workdir; register the cleanup here so no scratch dirs
+# survive any exit path, error or success.
+trap cleanup_workdir EXIT
