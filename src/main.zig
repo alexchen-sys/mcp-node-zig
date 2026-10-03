@@ -6,6 +6,7 @@ const Io = std.Io;
 const Value = std.json.Value;
 const os = @import("os.zig");
 const proc = @import("os/proc.zig");
+const util = @import("util.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -16,7 +17,6 @@ pub const keep_sigpipe = false;
 const VERSION: []const u8 = @import("build_options").version;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
-const IO_BUF_SIZE: usize = 16 * 1024; // shared read scratch: HTTP, session pipes, files
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
 const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
@@ -415,7 +415,7 @@ const LINGER_DRAIN_BYTES: usize = 256 * 1024;
 fn lingerBeforeClose(io: Io, fd: std.posix.fd_t) void {
     os.net.shutdownSend(fd);
     const started = std.Io.Clock.awake.now(io);
-    var sink: [IO_BUF_SIZE]u8 = undefined;
+    var sink: [util.IO_BUF_SIZE]u8 = undefined;
     var drained: usize = 0;
     while (drained < LINGER_DRAIN_BYTES) {
         const remaining = remainingMs(started, io, LINGER_DRAIN_MS) orelse return;
@@ -502,8 +502,8 @@ fn loadConfig(arena: Allocator, io: Io) !Config {
         .host = try arena.dupe(u8, host),
         .port = port,
         .token = try arena.dupe(u8, token),
-        .allowed_hosts = try splitCsv(arena, hosts_s),
-        .allowed_origins = try splitCsv(arena, origins_s),
+        .allowed_hosts = try util.splitCsv(arena, hosts_s),
+        .allowed_origins = try util.splitCsv(arena, origins_s),
         .max_out = max_out,
         .socket_timeout_s = socket_timeout,
         .max_conn = max_conn,
@@ -523,17 +523,6 @@ var process_environ: std.process.Environ = .empty;
 /// source, same parse, same degrade-to-null-on-missing semantics.
 fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
     return os.environGet(arena, process_environ, key);
-}
-
-fn splitCsv(arena: Allocator, s: []const u8) ![][]const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, s, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        try list.append(arena, trimmed);
-    }
-    return list.toOwnedSlice(arena);
 }
 
 /// Serve one HTTP request on an accepted stream. Returns true while the
@@ -571,7 +560,7 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *s
         try data.appendSlice(ra, carry.items);
         carry.clearRetainingCapacity();
     }
-    var buf: [IO_BUF_SIZE]u8 = undefined;
+    var buf: [util.IO_BUF_SIZE]u8 = undefined;
     var header_end: ?usize = null;
     while (header_end == null) {
         if (std.mem.indexOf(u8, data.items, "\r\n\r\n")) |idx| {
@@ -1033,27 +1022,27 @@ fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !Rp
         }
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try appendJsonValue(&out, arena, id);
+        try util.appendJsonValue(&out, arena, id);
         try out.appendSlice(arena, ",\"result\":{\"protocolVersion\":");
-        try appendJsonString(&out, arena, protocol_version);
+        try util.appendJsonString(&out, arena, protocol_version);
         try out.appendSlice(arena, ",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":");
-        try appendJsonString(&out, arena, cfg.name);
+        try util.appendJsonString(&out, arena, cfg.name);
         try out.appendSlice(arena, ",\"version\":");
-        try appendJsonString(&out, arena, VERSION);
+        try util.appendJsonString(&out, arena, VERSION);
         try out.appendSlice(arena, "}}}");
         return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "ping")) {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try appendJsonValue(&out, arena, id);
+        try util.appendJsonValue(&out, arena, id);
         try out.appendSlice(arena, ",\"result\":{}}");
         return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "tools/list")) {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try appendJsonValue(&out, arena, id);
+        try util.appendJsonValue(&out, arena, id);
         try out.appendSlice(arena, ",\"result\":");
         try out.appendSlice(arena, TOOLS_JSON);
         try out.appendSlice(arena, "}");
@@ -1062,14 +1051,14 @@ fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !Rp
     if (std.mem.eql(u8, method, "resources/list")) {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try appendJsonValue(&out, arena, id);
+        try util.appendJsonValue(&out, arena, id);
         try out.appendSlice(arena, ",\"result\":{\"resources\":[]}}");
         return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "prompts/list")) {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try appendJsonValue(&out, arena, id);
+        try util.appendJsonValue(&out, arena, id);
         try out.appendSlice(arena, ",\"result\":{\"prompts\":[]}}");
         return .{ .status = 200, .body = out.items };
     }
@@ -1133,9 +1122,9 @@ fn dispatchTool(arena: Allocator, io: Io, cfg: *const Config, name: []const u8, 
 fn toolEnvelope(arena: Allocator, id: Value, payload: []const u8, is_error: bool, structured: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-    try appendJsonValue(&out, arena, id);
+    try util.appendJsonValue(&out, arena, id);
     try out.appendSlice(arena, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
-    try appendJsonString(&out, arena, payload);
+    try util.appendJsonString(&out, arena, payload);
     try out.appendSlice(arena, "}]");
     if (structured) {
         try out.appendSlice(arena, ",\"structuredContent\":");
@@ -1153,9 +1142,9 @@ fn unknownToolResult(arena: Allocator, id: Value, name: []const u8) !RpcResponse
     try msg.appendSlice(arena, name);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-    try appendJsonValue(&out, arena, id);
+    try util.appendJsonValue(&out, arena, id);
     try out.appendSlice(arena, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
-    try appendJsonString(&out, arena, msg.items);
+    try util.appendJsonString(&out, arena, msg.items);
     try out.appendSlice(arena, "}],\"isError\":true}}");
     return .{ .status = 200, .body = out.items };
 }
@@ -1171,11 +1160,11 @@ fn validIdOrNull(id_opt: ?Value) Value {
 fn rpcError(arena: Allocator, id: Value, code: i32, message: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
-    try appendJsonValue(&out, arena, id);
+    try util.appendJsonValue(&out, arena, id);
     try out.appendSlice(arena, ",\"error\":{\"code\":");
     try out.print(arena, "{d}", .{code});
     try out.appendSlice(arena, ",\"message\":");
-    try appendJsonString(&out, arena, message);
+    try util.appendJsonString(&out, arena, message);
     try out.appendSlice(arena, "}}");
     return out.items;
 }
@@ -1183,12 +1172,12 @@ fn rpcError(arena: Allocator, id: Value, code: i32, message: []const u8) ![]cons
 fn buildErrorPayload(out: *std.ArrayList(u8), arena: Allocator, msg: []const u8) !void {
     out.clearRetainingCapacity();
     try out.appendSlice(arena, "{\"ok\":false,\"error\":");
-    try appendJsonString(out, arena, msg);
+    try util.appendJsonString(out, arena, msg);
     try out.appendSlice(arena, "}");
 }
 
 fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
-    const argv_v = objGet(args, "argv") orelse return error.MissingArgv;
+    const argv_v = util.objGet(args, "argv") orelse return error.MissingArgv;
     if (argv_v != .array) return error.BadArgv;
     if (argv_v.array.items.len == 0) return error.BadArgv;
     var argv = try arena.alloc([]const u8, argv_v.array.items.len);
@@ -1196,8 +1185,8 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
         if (item != .string) return error.BadArgv;
         argv[i] = item.string;
     }
-    const cwd = (try optStrArg(args, "cwd")) orelse "";
-    var timeout_s = (try optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
+    const cwd = (try util.optStrArg(args, "cwd")) orelse "";
+    var timeout_s = (try util.optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > EXEC_MAX_TIMEOUT_S) timeout_s = EXEC_MAX_TIMEOUT_S;
     const started = std.Io.Clock.awake.now(io);
@@ -1230,18 +1219,18 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
     try out.appendSlice(arena, ",\"exit_code\":");
     try out.print(arena, "{d}", .{exit_code});
     try out.appendSlice(arena, ",\"stdout\":");
-    try appendJsonString(out, arena, result.stdout);
+    try util.appendJsonString(out, arena, result.stdout);
     try out.appendSlice(arena, ",\"stderr\":");
-    try appendJsonString(out, arena, result.stderr);
+    try util.appendJsonString(out, arena, result.stderr);
     try out.appendSlice(arena, ",\"truncated\":false,\"duration_ms\":");
     try out.print(arena, "{d}", .{elapsed_ms});
     try out.appendSlice(arena, "}");
 }
 
 fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
-    const script = (try optStrArg(args, "script")) orelse return error.MissingScript;
+    const script = (try util.optStrArg(args, "script")) orelse return error.MissingScript;
     const default_shell: []const u8 = if (comptime builtin.os.tag == .windows) "cmd" else "bash";
-    const shell = (try optStrArg(args, "shell")) orelse default_shell;
+    const shell = (try util.optStrArg(args, "shell")) orelse default_shell;
     // Comptime platform allowlist: POSIX shells on POSIX, cmd/powershell on
     // Windows (mirrored in TOOLS_JSON prose).
     const shell_ok = if (comptime builtin.os.tag == .windows)
@@ -1249,21 +1238,21 @@ fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     else
         (std.mem.eql(u8, shell, "bash") or std.mem.eql(u8, shell, "sh") or std.mem.eql(u8, shell, "fish") or std.mem.eql(u8, shell, "zsh"));
     if (!shell_ok) return error.UnsupportedShell;
-    const cwd = (try optStrArg(args, "cwd")) orelse "";
-    const timeout_s = (try optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
+    const cwd = (try util.optStrArg(args, "cwd")) orelse "";
+    const timeout_s = (try util.optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
     var new_args: std.ArrayList(u8) = .empty;
     try new_args.appendSlice(arena, "{\"argv\":[");
-    try appendJsonString(&new_args, arena, shell);
+    try util.appendJsonString(&new_args, arena, shell);
     // cmd takes /c; every other supported shell (incl. powershell) takes -c.
     const script_flag: []const u8 = if (std.mem.eql(u8, shell, "cmd")) "/c" else "-c";
     try new_args.appendSlice(arena, ",");
-    try appendJsonString(&new_args, arena, script_flag);
+    try util.appendJsonString(&new_args, arena, script_flag);
     try new_args.appendSlice(arena, ",");
-    try appendJsonString(&new_args, arena, script);
+    try util.appendJsonString(&new_args, arena, script);
     try new_args.appendSlice(arena, "]");
     if (cwd.len != 0) {
         try new_args.appendSlice(arena, ",\"cwd\":");
-        try appendJsonString(&new_args, arena, cwd);
+        try util.appendJsonString(&new_args, arena, cwd);
     }
     try new_args.appendSlice(arena, ",\"timeout\":");
     try new_args.print(arena, "{d}", .{timeout_s});
@@ -1298,7 +1287,7 @@ fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max
         // end of the pipe eventually closes and the pending read completes
         // with PIPE_BROKEN (EOF). session.closing is still honored between
         // reads for the already-EOF fast path.
-        var wbuf: [IO_BUF_SIZE]u8 = undefined;
+        var wbuf: [util.IO_BUF_SIZE]u8 = undefined;
         while (true) {
             if (session.closing.load(.acquire)) break;
             const n = proc.readPipeBlocking(fd, &wbuf) orelse break;
@@ -1315,7 +1304,7 @@ fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max
     }
     // POSIX path: poll-tick loop.
     {
-        var buf: [IO_BUF_SIZE]u8 = undefined;
+        var buf: [util.IO_BUF_SIZE]u8 = undefined;
         while (true) {
             // Poll instead of blind blocking read: exec_close must be able to reap
             // the session even if a grandchild escaped the process group and holds
@@ -1492,7 +1481,7 @@ fn sessionRelease(session: *Session) void {
 /// protect against concurrent exec_close freeing the session.
 fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
     const store = cfg.sessions orelse return error.SessionsDisabled;
-    const id_i = (try optIntArg(args, "session_id")) orelse return error.MissingSession;
+    const id_i = (try util.optIntArg(args, "session_id")) orelse return error.MissingSession;
     if (id_i <= 0) return error.BadSession;
     return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
 }
@@ -1503,7 +1492,7 @@ fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
 /// reaped — either by the session waiter thread or by the error path.
 fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     const store = cfg.sessions orelse return error.SessionsDisabled;
-    const argv_v = objGet(args, "argv") orelse return error.MissingArgv;
+    const argv_v = util.objGet(args, "argv") orelse return error.MissingArgv;
     if (argv_v != .array) return error.BadArgv;
     if (argv_v.array.items.len == 0) return error.BadArgv;
 
@@ -1523,7 +1512,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         argv[i] = try std.heap.page_allocator.dupe(u8, item.string);
         argv_filled += 1;
     }
-    const cwd_s = (try optStrArg(args, "cwd")) orelse "";
+    const cwd_s = (try util.optStrArg(args, "cwd")) orelse "";
     const cwd = try std.heap.page_allocator.dupe(u8, cwd_s);
     var cwd_owned = false;
     errdefer {
@@ -1730,17 +1719,17 @@ fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Session,
     // client re-fetch it once completed.
     const stdout_delta = if (session.done) stdout_raw else utf8CompletePrefix(stdout_raw);
     const stderr_delta = if (session.done) stderr_raw else utf8CompletePrefix(stderr_raw);
-    const stdout_text = try utf8LossyAlloc(arena, stdout_delta);
-    const stderr_text = try utf8LossyAlloc(arena, stderr_delta);
+    const stdout_text = try util.utf8LossyAlloc(arena, stdout_delta);
+    const stderr_text = try util.utf8LossyAlloc(arena, stderr_delta);
     const ended = session.ended_ms orelse nowMs(store.io);
     try out.appendSlice(arena, "{\"ok\":true,\"done\":");
     try out.appendSlice(arena, if (session.done) "true" else "false");
     try out.appendSlice(arena, ",\"exit_code\":");
     if (session.exit_code) |code| try out.print(arena, "{d}", .{code}) else try out.appendSlice(arena, "null");
     try out.appendSlice(arena, ",\"stdout\":");
-    try appendJsonString(out, arena, stdout_text);
+    try util.appendJsonString(out, arena, stdout_text);
     try out.appendSlice(arena, ",\"stderr\":");
-    try appendJsonString(out, arena, stderr_text);
+    try util.appendJsonString(out, arena, stderr_text);
     try out.appendSlice(arena, ",\"stdout_offset\":");
     try out.print(arena, "{d}", .{stdout_offset + @as(i64, @intCast(stdout_delta.len))});
     try out.appendSlice(arena, ",\"stderr_offset\":");
@@ -1758,8 +1747,8 @@ fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const stdout_offset = (try optIntArg(args, "stdout_offset")) orelse 0;
-    const stderr_offset = (try optIntArg(args, "stderr_offset")) orelse 0;
+    const stdout_offset = (try util.optIntArg(args, "stdout_offset")) orelse 0;
+    const stderr_offset = (try util.optIntArg(args, "stderr_offset")) orelse 0;
     try renderSessionState(arena, cfg.sessions.?, session, stdout_offset, stderr_offset, out);
 }
 
@@ -1767,9 +1756,9 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const stdout_offset = (try optIntArg(args, "stdout_offset")) orelse 0;
-    const stderr_offset = (try optIntArg(args, "stderr_offset")) orelse 0;
-    var timeout_s = (try optIntArg(args, "timeout")) orelse WAIT_DEFAULT_TIMEOUT_S;
+    const stdout_offset = (try util.optIntArg(args, "stdout_offset")) orelse 0;
+    const stderr_offset = (try util.optIntArg(args, "stderr_offset")) orelse 0;
+    var timeout_s = (try util.optIntArg(args, "timeout")) orelse WAIT_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > WAIT_MAX_TIMEOUT_S) timeout_s = WAIT_MAX_TIMEOUT_S;
     const store = cfg.sessions.?;
@@ -1812,7 +1801,7 @@ fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayLis
         try out.appendSlice(arena, ",\"argv\":[");
         for (s.argv, 0..) |arg, i| {
             if (i != 0) try out.appendSlice(arena, ",");
-            try appendJsonString(out, arena, arg);
+            try util.appendJsonString(out, arena, arg);
         }
         try out.appendSlice(arena, "],\"done\":");
         try out.appendSlice(arena, if (done) "true" else "false");
@@ -1832,8 +1821,8 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     // Validate protocol-level argument types before resolving the session:
     // a wrong-typed argument is -32602 regardless of whether the session id
     // happens to exist.
-    const data_b64 = (try optStrArg(args, "data_b64")) orelse return error.MissingData;
-    const eof = (try optBoolArg(args, "eof")) orelse false;
+    const data_b64 = (try util.optStrArg(args, "data_b64")) orelse return error.MissingData;
+    const eof = (try util.optBoolArg(args, "eof")) orelse false;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
     const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
@@ -1923,13 +1912,13 @@ fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList
     // degrades independently to ""/0.
     const info = os.sysinfo.fetch(arena, io);
     try out.appendSlice(arena, "{\"node\":");
-    try appendJsonString(out, arena, info.hostname);
+    try util.appendJsonString(out, arena, info.hostname);
     try out.appendSlice(arena, ",\"hostname\":");
-    try appendJsonString(out, arena, info.hostname);
+    try util.appendJsonString(out, arena, info.hostname);
     try out.appendSlice(arena, ",\"os\":\"" ++ os.sysinfo.os_name ++ "\",\"machine\":\"" ++ os.sysinfo.machine ++ "\",\"loadavg_raw\":");
-    try appendJsonString(out, arena, info.loadavg_raw);
+    try util.appendJsonString(out, arena, info.loadavg_raw);
     try out.appendSlice(arena, ",\"uptime_raw\":");
-    try appendJsonString(out, arena, info.uptime_raw);
+    try util.appendJsonString(out, arena, info.uptime_raw);
     try out.appendSlice(arena, ",\"mem\":{\"MemTotal\":");
     try out.print(arena, "{d}", .{info.mem_total});
     try out.appendSlice(arena, ",\"MemAvailable\":");
@@ -1939,9 +1928,9 @@ fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList
 
 fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse return error.MissingPath);
-    const offset = (try optIntArg(args, "offset")) orelse 0;
-    const limit = (try optIntArg(args, "limit")) orelse READ_FILE_DEFAULT_LIMIT_CHARS;
+    const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse return error.MissingPath);
+    const offset = (try util.optIntArg(args, "offset")) orelse 0;
+    const limit = (try util.optIntArg(args, "limit")) orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
     const data = os.fd.readFileAlloc(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
         // The read path is cross-platform, so the mapping holds
@@ -1954,16 +1943,16 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
             else => return err,
         }
     };
-    const text = try utf8LossyAlloc(arena, data);
-    const slice = try utf8CharSlice(text, @intCast(offset), @intCast(limit));
+    const text = try util.utf8LossyAlloc(arena, data);
+    const slice = try util.utf8CharSlice(text, @intCast(offset), @intCast(limit));
     try out.appendSlice(arena, "{\"ok\":true,\"path\":");
-    try appendJsonString(out, arena, path);
+    try util.appendJsonString(out, arena, path);
     try out.appendSlice(arena, ",\"size\":");
     try out.print(arena, "{d}", .{data.len});
     try out.appendSlice(arena, ",\"offset\":");
     try out.print(arena, "{d}", .{offset});
     try out.appendSlice(arena, ",\"content\":");
-    try appendJsonString(out, arena, slice.text);
+    try util.appendJsonString(out, arena, slice.text);
     try out.appendSlice(arena, ",\"has_more\":");
     try out.appendSlice(arena, if (slice.has_more) "true" else "false");
     try out.appendSlice(arena, "}");
@@ -1971,10 +1960,10 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
 
 fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse return error.MissingPath);
-    const content_b64 = (try optStrArg(args, "content_b64")) orelse return error.MissingContent;
-    const mode_i = (try optIntArg(args, "mode")) orelse 0o644;
-    const mkdirs = (try optBoolArg(args, "mkdirs")) orelse true;
+    const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse return error.MissingPath);
+    const content_b64 = (try util.optStrArg(args, "content_b64")) orelse return error.MissingContent;
+    const mode_i = (try util.optIntArg(args, "mode")) orelse 0o644;
+    const mkdirs = (try util.optBoolArg(args, "mkdirs")) orelse true;
     if (mode_i < 0 or mode_i > 0o7777) return error.BadMode;
 
     const size = try std.base64.standard.Decoder.calcSizeForSlice(content_b64);
@@ -1999,17 +1988,17 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     var digest: [32]u8 = undefined;
     h.final(&digest);
     try out.appendSlice(arena, "{\"ok\":true,\"path\":");
-    try appendJsonString(out, arena, path);
+    try util.appendJsonString(out, arena, path);
     try out.appendSlice(arena, ",\"size\":");
     try out.print(arena, "{d}", .{data.len});
     try out.appendSlice(arena, ",\"sha256\":");
-    try appendHexLower(out, arena, &digest);
+    try util.appendHexLower(out, arena, &digest);
     try out.appendSlice(arena, "}");
 }
 
 fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse ".");
+    const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse ".");
     var dir = std.Io.Dir.openDir(.cwd(), io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.NotDir => return error.NotDirectory,
@@ -2047,14 +2036,14 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
         }
     }.lt);
     try out.appendSlice(arena, "{\"ok\":true,\"path\":");
-    try appendJsonString(out, arena, path);
+    try util.appendJsonString(out, arena, path);
     try out.appendSlice(arena, ",\"items\":[");
     for (items.items, 0..) |item, i| {
         if (i != 0) try out.appendSlice(arena, ",");
         try out.appendSlice(arena, "{\"name\":");
-        try appendJsonString(out, arena, item.name);
+        try util.appendJsonString(out, arena, item.name);
         try out.appendSlice(arena, ",\"type\":");
-        try appendJsonString(out, arena, item.kind);
+        try util.appendJsonString(out, arena, item.kind);
         try out.appendSlice(arena, ",\"size\":");
         try out.print(arena, "{d}", .{item.size});
         try out.appendSlice(arena, ",\"mtime\":");
@@ -2073,199 +2062,6 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
     try out.appendSlice(arena, ",\"has_more\":");
     try out.appendSlice(arena, if (truncated) "true" else "false");
     try out.appendSlice(arena, "}");
-}
-
-fn objGet(v: Value, key: []const u8) ?Value {
-    if (v != .object) return null;
-    return v.object.get(key);
-}
-
-/// Optional string argument: absent/null -> null; a present value of the
-/// wrong JSON type is a strict error (error.InvalidParams -> -32602), never
-/// a silent default.
-fn optStrArg(args: Value, key: []const u8) !?[]const u8 {
-    const v = objGet(args, key) orelse return null;
-    if (v == .null) return null;
-    if (v != .string) return error.InvalidParams;
-    return v.string;
-}
-
-/// Optional integer argument: absent/null -> null; wrong type, non-integral
-/// float, or unrepresentable number -> strict error.
-fn optIntArg(args: Value, key: []const u8) !?i64 {
-    const v = objGet(args, key) orelse return null;
-    if (v == .null) return null;
-    return switch (v) {
-        .integer => |i| i,
-        .float => |f| blk: {
-            const i = floatToI64(f) orelse return error.InvalidParams;
-            // Reject fractional floats that a bare cast would truncate.
-            if (@as(f64, @floatFromInt(i)) != f) return error.InvalidParams;
-            break :blk i;
-        },
-        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch return error.InvalidParams,
-        else => return error.InvalidParams,
-    };
-}
-
-/// Optional boolean argument: absent/null -> null; wrong type -> strict error.
-fn optBoolArg(args: Value, key: []const u8) !?bool {
-    const v = objGet(args, key) orelse return null;
-    if (v == .null) return null;
-    return switch (v) {
-        .bool => |b| b,
-        else => return error.InvalidParams,
-    };
-}
-
-fn floatToI64(f: f64) ?i64 {
-    if (!std.math.isFinite(f)) return null;
-    if (f >= 9223372036854775808.0 or f < -9223372036854775808.0) return null;
-    return @as(i64, @intFromFloat(f));
-}
-
-fn appendJsonValue(out: *std.ArrayList(u8), arena: Allocator, v: Value) !void {
-    switch (v) {
-        .null => try out.appendSlice(arena, "null"),
-        .bool => |b| try out.appendSlice(arena, if (b) "true" else "false"),
-        .integer => |i| try out.print(arena, "{d}", .{i}),
-        .float => |f| try out.print(arena, "{d}", .{f}),
-        .number_string => |s| try out.appendSlice(arena, s),
-        .string => |s| try appendJsonString(out, arena, s),
-        else => try out.appendSlice(arena, "null"),
-    }
-}
-
-fn appendJsonString(out: *std.ArrayList(u8), arena: Allocator, s: []const u8) !void {
-    try out.append(arena, '"');
-    var i: usize = 0;
-    while (i < s.len) {
-        const c = s[i];
-        switch (c) {
-            '"' => try out.appendSlice(arena, "\\\""),
-            '\\' => try out.appendSlice(arena, "\\\\"),
-            '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
-            '\t' => try out.appendSlice(arena, "\\t"),
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => try out.print(arena, "\\u{x:0>4}", .{c}),
-            else => {
-                if (c < 0x80) {
-                    try out.append(arena, c);
-                    i += 1;
-                    continue;
-                }
-                const seq_len = utf8SeqLen(s[i..]) orelse {
-                    try out.appendSlice(arena, "");
-                    i += 1;
-                    continue;
-                };
-                if (i + seq_len > s.len or !validUtf8Seq(s[i .. i + seq_len])) {
-                    try out.appendSlice(arena, "");
-                    i += 1;
-                    continue;
-                }
-                try out.appendSlice(arena, s[i .. i + seq_len]);
-                i += seq_len;
-                continue;
-            },
-        }
-        i += 1;
-    }
-    try out.append(arena, '"');
-}
-
-fn utf8SeqLen(s: []const u8) ?usize {
-    if (s.len == 0) return null;
-    const b0 = s[0];
-    if (b0 < 0x80) return 1;
-    if (b0 >= 0xc2 and b0 <= 0xdf) return 2;
-    if (b0 >= 0xe0 and b0 <= 0xef) return 3;
-    if (b0 >= 0xf0 and b0 <= 0xf4) return 4;
-    return null;
-}
-
-fn validUtf8Seq(s: []const u8) bool {
-    if (s.len == 0) return false;
-    const b0 = s[0];
-    if (b0 < 0x80) return true;
-    for (s[1..]) |b| {
-        if ((b & 0xc0) != 0x80) return false;
-    }
-    switch (s.len) {
-        2 => return true,
-        3 => {
-            if (b0 == 0xe0 and s[1] < 0xa0) return false;
-            if (b0 == 0xed and s[1] > 0x9f) return false;
-            return true;
-        },
-        4 => {
-            if (b0 == 0xf0 and s[1] < 0x90) return false;
-            if (b0 == 0xf4 and s[1] > 0x8f) return false;
-            return true;
-        },
-        else => return false,
-    }
-}
-
-fn utf8LossyAlloc(arena: Allocator, data: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < data.len) {
-        const c = data[i];
-        if (c < 0x80) {
-            try out.append(arena, c);
-            i += 1;
-            continue;
-        }
-        const seq_len = utf8SeqLen(data[i..]) orelse {
-            try out.appendSlice(arena, "\xef\xbf\xbd"); // U+FFFD
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > data.len or !validUtf8Seq(data[i .. i + seq_len])) {
-            try out.appendSlice(arena, "\xef\xbf\xbd"); // U+FFFD
-            i += 1;
-            continue;
-        }
-        try out.appendSlice(arena, data[i .. i + seq_len]);
-        i += seq_len;
-    }
-    return out.items;
-}
-
-const CharSlice = struct { text: []const u8, has_more: bool };
-
-fn utf8CharSlice(s: []const u8, offset_chars: usize, limit_chars: usize) !CharSlice {
-    var char_idx: usize = 0;
-    var byte_idx: usize = 0;
-    var start_byte: usize = 0;
-    var end_byte: usize = s.len;
-    var have_start = false;
-    while (byte_idx < s.len) {
-        if (char_idx == offset_chars and !have_start) {
-            start_byte = byte_idx;
-            have_start = true;
-        }
-        if (have_start and char_idx == offset_chars + limit_chars) {
-            end_byte = byte_idx;
-            return .{ .text = s[start_byte..end_byte], .has_more = true };
-        }
-        const len = utf8SeqLen(s[byte_idx..]) orelse 1;
-        byte_idx += len;
-        char_idx += 1;
-    }
-    if (!have_start) return .{ .text = "", .has_more = false };
-    return .{ .text = s[start_byte..], .has_more = false };
-}
-
-fn appendHexLower(out: *std.ArrayList(u8), arena: Allocator, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
-    try out.append(arena, '"');
-    for (bytes) |b| {
-        try out.append(arena, alphabet[b >> 4]);
-        try out.append(arena, alphabet[b & 0x0f]);
-    }
-    try out.append(arena, '"');
 }
 
 fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
@@ -2315,9 +2111,9 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
 fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8, timeout_ms: u64) !void {
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(arena, "{\"error\":");
-    try appendJsonString(&body, arena, code);
+    try util.appendJsonString(&body, arena, code);
     try body.appendSlice(arena, ",\"message\":");
-    try appendJsonString(&body, arena, message);
+    try util.appendJsonString(&body, arena, message);
     try body.appendSlice(arena, "}");
     try sendHttpRaw(arena, fd, status, "application/json", body.items, timeout_ms);
 }
@@ -2340,33 +2136,14 @@ const TOOLS_JSON =
     \\]}
 ;
 
-test "json string escaping keeps poison literal" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    try appendJsonString(&out, arena, "single ' double \" dollar $HOME backtick `tick` newline\n");
-    const parsed = try std.json.parseFromSliceLeaky(Value, arena, out.items, .{});
-    try std.testing.expect(parsed == .string);
-    try std.testing.expectEqualStrings("single ' double \" dollar $HOME backtick `tick` newline\n", parsed.string);
-}
-
 test "host allowlist supports exact and wildcard-port patterns" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const allowed = try splitCsv(arena, "127.0.0.1:*,localhost:*,192.0.2.1:*");
+    const allowed = try util.splitCsv(arena, "127.0.0.1:*,localhost:*,192.0.2.1:*");
     try std.testing.expect(hostAllowed("127.0.0.1:8341", allowed));
     try std.testing.expect(hostAllowed("192.0.2.1:8341", allowed));
     try std.testing.expect(!hostAllowed("evil.example:8341", allowed));
-}
-
-test "utf8 lossy replaces invalid bytes with U+FFFD" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const s = try utf8LossyAlloc(arena, "a\xffb");
-    try std.testing.expectEqualStrings("a\xef\xbf\xbdb", s);
 }
 
 test "content length rejects overflow and conflicting duplicates" {
@@ -2472,18 +2249,11 @@ test "content type accepts only strict application/json media type" {
     try std.testing.expect(!contentTypeJson("application/json; =utf-8"));
 }
 
-test "float to int rejects non finite and out of range values" {
-    try std.testing.expect(floatToI64(std.math.inf(f64)) == null);
-    try std.testing.expect(floatToI64(std.math.nan(f64)) == null);
-    try std.testing.expect(floatToI64(1e300) == null);
-    try std.testing.expectEqual(@as(i64, 42), floatToI64(42.0).?);
-}
-
 test "origin allowlist supports exact and wildcard-port patterns" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const allowed = try splitCsv(arena, "http://127.0.0.1:*,https://node.example");
+    const allowed = try util.splitCsv(arena, "http://127.0.0.1:*,https://node.example");
     try std.testing.expect(originAllowed("http://127.0.0.1:8341", allowed));
     try std.testing.expect(originAllowed("https://node.example", allowed));
     try std.testing.expect(!originAllowed("https://evil.example", allowed));
@@ -2507,8 +2277,8 @@ test "rpc parse error and notification semantics" {
         .host = "127.0.0.1",
         .port = 1,
         .token = "",
-        .allowed_hosts = try splitCsv(arena, "127.0.0.1:*"),
-        .allowed_origins = try splitCsv(arena, "http://127.0.0.1:*"),
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
         .max_out = 1024,
         .socket_timeout_s = 1,
         .max_conn = 4,
