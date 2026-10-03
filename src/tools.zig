@@ -20,9 +20,9 @@ const env_state = @import("env_state.zig");
 
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const WAIT_POLL_MS: u64 = 50; // exec_wait sleep tick
-const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
+const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose (rpc.zig)
 const EXEC_MAX_TIMEOUT_S: i64 = 1800;
-const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
+const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose (rpc.zig)
 const WAIT_MAX_TIMEOUT_S: i64 = 300;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
