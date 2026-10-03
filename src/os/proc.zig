@@ -235,6 +235,52 @@ pub fn killTree(pid: ProcessId, job: JobField) void {
     }
 }
 
+/// Block until the direct child `pid` exits WITHOUT reaping it
+/// (waitid(WNOWAIT)). The unreaped zombie keeps its pid — and therefore the
+/// process-group id it led — allocated, so a kill(-pgid) issued after this
+/// returns can never hit a recycled process group. The caller must reap the
+/// child afterwards (std.process.Child.wait).
+///
+/// POSIX only; Windows sessions are supervised by the Job Object instead
+/// (this function is referenced from comptime-gated POSIX paths only).
+pub fn waitChildExitNoReap(pid: ProcessId) error{WaitFailed}!void {
+    if (comptime native_os == .linux) {
+        while (true) {
+            var info: std.os.linux.siginfo_t = undefined;
+            const rc = std.os.linux.waitid(.PID, pid, &info, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return error.WaitFailed,
+            }
+        }
+    } else {
+        // Darwin: libSystem waitid (POSIX.1-2008); std.c ships no binding.
+        // P_PID = 0, WEXITED = 0x4, WNOWAIT = 0x20 on XNU.
+        var retries: u32 = 0;
+        while (true) {
+            var info: std.c.siginfo_t = undefined;
+            const rc = waitid(0, pid, &info, 0x4 | 0x20);
+            if (rc == 0) return;
+            if (comptime @hasDecl(std.c, "_errno")) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return error.WaitFailed;
+            } else {
+                // No errno accessor: EINTR is the only transient failure;
+                // permanent errors burn a bounded retry budget, then the
+                // caller falls back to the post-reap kill path.
+                retries += 1;
+                if (retries > 1024) return error.WaitFailed;
+            }
+        }
+    }
+}
+
+// Darwin's libSystem waitid (POSIX.1-2008): no std.c binding in 0.16.
+// Referenced only from the macOS branch of waitChildExitNoReap, so on other
+// targets it is never codegen'd or linked.
+extern "c" fn waitid(idtype: c_uint, id: c_int, infop: *std.c.siginfo_t, options: c_int) c_int;
+
 /// Blocking read from an asynchronous pipe handle (the std-created child
 /// stdout/stderr ends are opened with MODE.IO.ASYNCHRONOUS). Issues
 /// NtReadFile; on STATUS_PENDING waits on the file handle itself, which the

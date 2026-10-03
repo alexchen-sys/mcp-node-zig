@@ -157,6 +157,16 @@ const Session = struct {
     // freeSession runs only when refs hit 0 (always after thread joins).
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set once the whole process tree is known dead (POSIX: the waiter
+    /// killed the process group while the leader zombie still pinned the
+    /// pgid, so the kill could never hit a recycled group). exec_kill /
+    /// exec_close test-and-skip on this so a late SIGKILL can never land on
+    /// a recycled process group.
+    tree_killed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Number of pipe-reader threads that finished draining (stdout/stderr).
+    /// The waiter gates done=true on this so `done` implies final output is
+    /// fully drained.
+    readers_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 const SessionStore = struct {
@@ -1200,6 +1210,7 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
+    defer _ = session.readers_done.fetchAdd(1, .acq_rel);
     if (comptime builtin.os.tag == .windows) {
         // Blocking NtReadFile loop (no poll tick on this OS). Termination is
         // guaranteed by the Job Object: exec_kill/exec_close run
@@ -1249,11 +1260,68 @@ fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max
 }
 
 fn sessionWaiterMain(session: *Session, io: Io) void {
-    const term = session.child.wait(io) catch {
-        // Windows: same invariant as below — done=true must imply the job is
-        // dead, so close/reap joins of the blocking readers can never hang.
-        if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.os.tag == .windows) {
+        const term = session.child.wait(io) catch {
+            // done=true must imply the job is dead, so close/reap joins of
+            // the blocking readers can never hang.
             if (session.job) |j| proc.terminateJob(j);
+            session.tree_killed.store(true, .release);
+            session.mutex.lockUncancelable(io);
+            session.done = true;
+            session.exit_code = null;
+            session.ended_ms = nowMs(io);
+            session.mutex.unlock(io);
+            return;
+        };
+        const code = termExitCode(term);
+        // The child is gone; terminate the Job Object so grandchildren cannot
+        // outlive the session pinning the pipe write ends open (the blocking
+        // readers have no poll tick — EOF is their only exit). done=true
+        // published after this point implies the whole tree is dead.
+        if (session.job) |j| proc.terminateJob(j);
+        session.tree_killed.store(true, .release);
+        session.mutex.lockUncancelable(io);
+        session.done = true;
+        session.exit_code = code;
+        session.ended_ms = nowMs(io);
+        session.mutex.unlock(io);
+        return;
+    }
+    // POSIX: done=true must imply (a) the whole process tree is dead and
+    // (b) every buffered byte has been drained from the pipes.
+    //
+    // Step 1: detect the leader's exit WITHOUT reaping it. The unreaped
+    // zombie keeps its pid — and therefore the process-group id it led —
+    // allocated, so the group kill below can never hit a recycled pgid
+    // (the classic PID/PGID reuse race).
+    const no_reap_ok = if (proc.waitChildExitNoReap(session.pid)) |_| true else |_| false;
+    if (no_reap_ok) {
+        // Step 2: kill the tree while the zombie pins the group. SIGKILL
+        // reaches every in-group descendant; the leader zombie ignores it.
+        proc.killTree(session.pid, session.job);
+        session.tree_killed.store(true, .release);
+        // Step 3: done must mean the output is fully drained. After the
+        // group kill every in-group pipe writer is dead, so EOF lets both
+        // readers finish; an escaped grandchild holding the pipe open is
+        // covered by the closing flag (exec_close/reap paths).
+        var expected_readers: u32 = 0;
+        if (session.stdout_thread != null) expected_readers += 1;
+        if (session.stderr_thread != null) expected_readers += 1;
+        while (session.readers_done.load(.acquire) < expected_readers) {
+            if (session.closing.load(.acquire)) break;
+            os.sleepMs(1);
+        }
+    }
+    // Step 4: only now reap. child.wait() cleanup closes the parent pipe
+    // ends, which the reader threads were still using until step 3 — reaping
+    // earlier was a use-after-close / lost-tail window.
+    const term = session.child.wait(io) catch {
+        if (!no_reap_ok) {
+            // Fallback after a waitid failure: kill post-reap. The reuse
+            // window is exactly the gap the WNOWAIT path exists to close,
+            // but a late kill is still strictly better than a leaked tree.
+            proc.killTree(session.pid, session.job);
+            session.tree_killed.store(true, .release);
         }
         session.mutex.lockUncancelable(io);
         session.done = true;
@@ -1263,12 +1331,9 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
         return;
     };
     const code = termExitCode(term);
-    // Windows: the child is gone; terminate the Job Object so grandchildren
-    // cannot outlive the session pinning the pipe write ends open (the
-    // blocking readers have no poll tick — EOF is their only exit). done=true
-    // published after this point therefore implies the whole tree is dead.
-    if (comptime builtin.os.tag == .windows) {
-        if (session.job) |j| proc.terminateJob(j);
+    if (!no_reap_ok) {
+        proc.killTree(session.pid, session.job);
+        session.tree_killed.store(true, .release);
     }
     session.mutex.lockUncancelable(io);
     session.done = true;
@@ -1422,6 +1487,13 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     stdin_owned = true;
     job_owned = true;
 
+    // Creator reference: store.put() publishes the session, after which a
+    // concurrent exec_close may drop the store's ref and free the session
+    // while this call is still writing the response. Hold our own ref until
+    // the response is fully formed.
+    _ = session.refs.fetchAdd(1, .acq_rel);
+    defer sessionRelease(session); // creator ref
+
     // Spawn threads before publishing: a session visible in the store always
     // has its threads running, so concurrent exec_close can never see null
     // thread handles and skip the join while exec_start keeps writing.
@@ -1438,7 +1510,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         }
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
-        sessionRelease(session);
+        sessionRelease(session); // store-side ref was never published
         return error.SessionThreadFailed;
     }
 
@@ -1448,7 +1520,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         if (session.waiter_thread) |t| t.join();
         if (session.stdout_thread) |t| t.join();
         if (session.stderr_thread) |t| t.join();
-        sessionRelease(session);
+        sessionRelease(session); // store-side ref was never published
         return err;
     };
 
@@ -1631,11 +1703,13 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const sio = (cfg.sessions.?).io;
-    session.mutex.lockUncancelable(sio);
-    const done = session.done;
-    session.mutex.unlock(sio);
-    if (!done) proc.killTree(session.pid, session.job);
+    // tree_killed is set by the waiter once the tree is dead (POSIX: after
+    // the group kill while the leader zombie still pins the pgid). Skipping
+    // on it means a late SIGKILL can never land on a recycled process group.
+    if (!session.tree_killed.load(.acquire)) {
+        proc.killTree(session.pid, session.job);
+        session.tree_killed.store(true, .release);
+    }
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
@@ -1660,10 +1734,12 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         return;
     };
     session.closing.store(true, .release);
-    session.mutex.lockUncancelable(store.io);
-    const done = session.done;
-    session.mutex.unlock(store.io);
-    if (!done) proc.killTree(session.pid, session.job);
+    // Same recycled-pgid guard as exec_kill: once the waiter (or a previous
+    // kill/close) killed the tree, never signal the group again.
+    if (!session.tree_killed.load(.acquire)) {
+        proc.killTree(session.pid, session.job);
+        session.tree_killed.store(true, .release);
+    }
     if (session.waiter_thread) |t| t.join();
     if (session.stdout_thread) |t| t.join();
     if (session.stderr_thread) |t| t.join();
