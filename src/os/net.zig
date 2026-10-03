@@ -194,6 +194,28 @@ pub fn socketWriteAll(handle: Handle, bytes: []const u8, timeout_ms: u64) posix_
     }
 }
 
+/// Half-close the send side (FIN after any queued response bytes) while the
+/// receive side stays open. Best effort: a peer that already vanished makes
+/// this fail, and the caller closes the socket either way.
+///   * linux   — raw `std.os.linux.shutdown` (std.posix-free for the same
+///               EBADF/ENOTSOCK rationale as `setSocketTimeouts`).
+///   * darwin  — `shutdown(2)` via libc.
+///   * windows — `IOCTL.AFD.PARTIAL_DISCONNECT` with SEND only, the same
+///               ioctl std's Threaded backend issues for `Stream.shutdown`.
+pub fn shutdownSend(handle: Handle) void {
+    if (comptime builtin.os.tag == .linux) {
+        _ = std.os.linux.shutdown(handle, std.os.linux.SHUT.WR);
+    } else if (comptime builtin.os.tag == .windows) {
+        const info = windows.AFD.PARTIAL_DISCONNECT_INFO{
+            .DisconnectMode = .{ .SEND = true },
+            .Timeout = -1,
+        };
+        _ = afdSocketIo(handle, windows.IOCTL.AFD.PARTIAL_DISCONNECT, &info, null) catch {};
+    } else {
+        _ = std.c.shutdown(handle, std.c.SHUT.WR);
+    }
+}
+
 /// Upper bound for one AFD ioctl payload. Responses are bounded by
 /// MCP_NODE_MAX_OUT, so a single chunk almost always suffices; the cap only
 /// keeps the u32 length cast safe for pathological configs.

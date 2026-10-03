@@ -397,6 +397,32 @@ fn connectionThread(conn: *Connection) void {
         };
         if (!keep) break;
     }
+    lingerBeforeClose(conn.io, conn.stream.socket.handle);
+}
+
+/// Upper bounds for the post-response drain in `lingerBeforeClose`.
+const LINGER_DRAIN_MS: u64 = 250;
+const LINGER_DRAIN_BYTES: usize = 256 * 1024;
+
+/// Closing a TCP socket that still has unread input makes the kernel answer
+/// with RST instead of FIN, and an RST can destroy a response the peer has
+/// not read yet. That is exactly the shape of every early rejection (401,
+/// 404, 413, ...): it is answered from the head alone while the client may
+/// still be streaming the body. Send FIN first, then discard whatever the
+/// peer still sends until it closes, within a small byte and time budget,
+/// so the response survives without ever buffering the rejected body.
+fn lingerBeforeClose(io: Io, fd: std.posix.fd_t) void {
+    os.net.shutdownSend(fd);
+    const started = std.Io.Clock.awake.now(io);
+    var sink: [IO_BUF_SIZE]u8 = undefined;
+    var drained: usize = 0;
+    while (drained < LINGER_DRAIN_BYTES) {
+        const remaining = remainingMs(started, io, LINGER_DRAIN_MS) orelse return;
+        const want = @min(sink.len, LINGER_DRAIN_BYTES - drained);
+        const n = readWithDeadline(fd, sink[0..want], remaining) catch return;
+        if (n == 0) return; // peer closed its side: a clean FIN exchange
+        drained += n;
+    }
 }
 
 fn rejectBusy(cfg: *const Config, io: Io, stream: *Io.net.Stream) void {

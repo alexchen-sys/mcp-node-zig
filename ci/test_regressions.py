@@ -491,6 +491,50 @@ class FramingTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(data).get('id'), 9)
 
+    def test_rejection_survives_unread_body(self):
+        """A rejection answered before the body is read must reach a client
+        that already streamed (part of) that body, and the connection must
+        end with FIN, not RST: closing a socket with unread input sends RST,
+        and many TCP stacks (Windows, macOS) drop not-yet-read response bytes
+        when it arrives. Linux keeps them, so the RST itself is what this
+        test observes: after the response, the next read must be a clean
+        EOF. The client deliberately reads late."""
+        payload = b'x' * (128 * 1024)
+        cases = [
+            ('unauthorized', dict(token='wrong-token'), len(payload), 401),
+            ('bad path', dict(path=b'/nope'), len(payload), 404),
+            ('oversize', dict(), BODY_CAP + 1, 413),
+        ]
+        for name, kw, declared, expected in cases:
+            for round_no in range(5):
+                with self.subTest(name=name, round=round_no):
+                    sock = self.node.connect()
+                    head = self.node.head_for(declared, **kw)
+
+                    def stream():
+                        try:
+                            sock.sendall(head + payload)
+                        except OSError:
+                            pass  # the server may legitimately stop reading
+
+                    sender = threading.Thread(target=stream)
+                    try:
+                        sender.start()
+                        sender.join(timeout=5)
+                        time.sleep(0.4)  # let the server answer and close first
+                        try:
+                            status, _, _, _ = read_http_response(sock, deadline_s=8)
+                        except ConnectionResetError as exc:
+                            self.fail('%s: response destroyed by RST: %r' % (name, exc))
+                        try:
+                            tail = sock.recv(1)
+                        except ConnectionResetError as exc:
+                            self.fail('%s: connection reset after response: %r' % (name, exc))
+                        self.assertEqual(tail, b'', '%s: expected clean EOF after response' % name)
+                    finally:
+                        sock.close()
+                    self.assertEqual(status, expected)
+
     def test_oversize_body_413_before_read(self):
         head = self.node.head_for(BODY_CAP + 1)
         sock = self.node.connect()
