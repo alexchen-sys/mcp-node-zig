@@ -29,7 +29,7 @@ The design goal is a small trusted edge agent: static binary, explicit token aut
 
 ## Status
 
-Early `0.1.0`; the contract may evolve.
+Early `0.1.x`; the contract may evolve.
 
 Platform support: **Linux**, **macOS**, and **Windows** — all three are built, unit-tested, and smoke-tested (auth gate, `initialize`, `sys_info`) on every push by the CI matrix. Linux is the primary production target. On Windows, process trees are managed with Job Objects and socket timeouts use overlapped AFD I/O with software deadlines.
 

@@ -127,7 +127,7 @@ The matcher is a structural deep-match, deliberately minimal:
   harness creates the first and last, the fixture file itself creates
   `compat-dir` before that case runs.
 - The daemon name is `compat-node` (set by the harness) and the version
-  `0.1.0` comes from build.zig.zon via build options.
+  pinned in `initialize.json` comes from build.zig.zon via build options.
 
 ## Platform scope
 
