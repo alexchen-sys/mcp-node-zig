@@ -2,7 +2,7 @@
 //! SessionStore map with join-before-free eviction and TTL reaping,
 //! pipe reader and waiter thread bodies, guarded process-tree kills,
 //! and UTF-8-safe session state rendering. Tool-call orchestration
-//! (exec_start and friends) still lives in main.zig.
+//! (exec_start and friends) lives in tools.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");
