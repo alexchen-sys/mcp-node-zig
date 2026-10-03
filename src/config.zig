@@ -133,9 +133,9 @@ pub fn loadConfig(arena: Allocator, io: Io) !Config {
     };
 }
 
-/// All environment reads go through the OS layer's cross-platform
-/// snapshot lookup. Linux reads `/proc/self/environ`
-/// source, same parse, same degrade-to-null-on-missing semantics.
+/// All environment reads go through the OS layer's snapshot lookup
+/// (`/proc/self/environ` on Linux); a missing or unreadable variable
+/// yields null.
 fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
     return os.environGet(arena, env_state.process_environ, key);
 }

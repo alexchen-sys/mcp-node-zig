@@ -162,8 +162,8 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
     // std.process.Child.stdin stays null, so child.wait() cleanup can never
     // close the write end from under exec_write. Windows — `.file` stdio
     // re-opens the pipe read end via NtCreateFile with an empty path, which
-    // a named pipe answers with STATUS_PIPE_NOT_AVAILABLE (error.NoDevice —
-    // every exec_start failed), so spawn with `.pipe` and let std create the
+    // a named pipe answers with STATUS_PIPE_NOT_AVAILABLE (error.NoDevice),
+    // so spawn with `.pipe` and let std create the
     // pipe; the parent write end comes back as child.stdin and is taken
     // over into stdin_fd right after the spawn.
     const is_windows = builtin.os.tag == .windows;

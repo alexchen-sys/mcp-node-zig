@@ -1,9 +1,9 @@
 //! Platform OS layer.
 //!
 //! Dispatcher selected at comptime by `builtin.os.tag`. All platform
-//! knowledge must live behind this module; the platform modules below; `main.zig`
-//! (env, process, fd+sysinfo, net) call only the narrow API re-exported
-//! here.
+//! knowledge must live behind this module and the platform modules below;
+//! `main.zig` and the other modules call only the narrow API re-exported
+//! here (env, process, fd+sysinfo, net).
 //!
 //! Core API surface:
 //!   * `closeFd(fd)`          — close a descriptor/handle, result discarded

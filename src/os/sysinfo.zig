@@ -1,10 +1,9 @@
 //! Per-OS sysinfo fetchers.
 //!
-//! Best-effort contract: missing fields degrade to empty values.
-//! old toolSysInfo: every field degrades independently to "" / 0 on failure
-//! and `fetch` itself never fails. JSON field parity with the Linux daemon
-//! is the contract; other OSes fill the same fields from their native
-//! sources (loadavg_raw/uptime_raw stay empty where the OS has no analog).
+//! Best-effort contract: every field degrades independently to "" / 0 on
+//! failure and `fetch` itself never fails. All OSes emit the same JSON
+//! fields, filled from their native sources (loadavg_raw/uptime_raw stay
+//! empty where the OS has no analog).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -13,8 +12,7 @@ const Io = std.Io;
 
 const fd = @import("fd.zig");
 
-/// Comptime OS identity for the sys_info payload; replaces the hardcoded
-/// comptime per target.
+/// OS name reported in the sys_info payload, fixed at comptime per target.
 pub const os_name: []const u8 = switch (builtin.os.tag) {
     .linux => "Linux",
     .macos => "macOS",

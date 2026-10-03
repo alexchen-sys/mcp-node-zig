@@ -20,21 +20,19 @@ extern "kernel32" fn WriteFile(
 /// Win32 STD_ERROR_HANDLE constant: (DWORD)-12.
 const STD_ERROR_HANDLE: u32 = 0xffff_fff4;
 
-/// Handle of the process standard error stream. Real implementation
-/// (kernel32 GetStdHandle); std 0.16 does not wrap it.
+/// Handle of the process standard error stream via kernel32
+/// GetStdHandle; std 0.16 does not wrap it.
 pub fn stderrFd() fd_t {
     return GetStdHandle(STD_ERROR_HANDLE) orelse std.os.windows.INVALID_HANDLE_VALUE;
 }
 
-/// Close a handle. Real implementation: CloseHandle is the Windows
-/// equivalent of close(2) for both files and pipes.
+/// Close a handle. CloseHandle is the Windows equivalent of close(2) for
+/// both files and pipes.
 pub fn closeFd(fd: fd_t) void {
     std.os.windows.CloseHandle(fd);
 }
 
-/// TODO: works, but should be re-evaluated against
-/// std.Io.sleep or a waitable timer instead of a bare
-/// kernel32 Sleep.
+/// Bare kernel32 Sleep. TODO: consider std.Io.sleep or a waitable timer.
 pub fn sleepMs(ms: u64) void {
     Sleep(@intCast(ms));
 }

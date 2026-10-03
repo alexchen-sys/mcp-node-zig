@@ -13,25 +13,23 @@
 //! is a *normal* runtime condition: every idle keep-alive read timeout would
 //! crash a debug daemon and rename the release error from `WouldBlock` to
 //! `Unexpected`. Until std maps EAGAIN to `error.Timeout` for net I/O, POSIX
-//! keeps the exact raw syscalls the daemon always used — one OS branch here
-//! inside the os layer, zero OS branches in `main.zig`.
+//! uses raw read/write syscalls: one OS branch here inside the os layer,
+//! zero OS branches in `main.zig`.
 //!
-//! # Why Windows does NOT rely on AFD-sockopt RCVTIMEO (task risk #3)
+//! # Why Windows does NOT rely on AFD-sockopt RCVTIMEO
 //!
 //! SO_RCVTIMEO/SO_SNDTIMEO are winsock-level options implemented in user
 //! mode by mswsock/ws2_32, not by the afd.sys transport driver. std 0.16
 //! never routes them through `IOCTL.AFD.SOCKOPT` (its own
 //! `socketOptionAfd`, Threaded.zig, is only used for address- and
 //! protocol-level options), and no std code or bundled doc confirms that
-//! afd.sys honors them, so deadlines are enforced in software below.
-//! The Windows path therefore enforces the deadline in software: every
-//! read/write is an overlapped AFD ioctl waited on with
+//! afd.sys honors them. The Windows path therefore enforces the deadline
+//! in software: every read/write is an overlapped AFD ioctl waited on with
 //! `NtWaitForSingleObject(event, timeout)` and cancelled on expiry via
 //! `NtCancelIoFileEx`. `setSocketTimeouts` on Windows sets only
 //! TCP_NODELAY (a real transport-level option) and documents this.
 //!
-//! Note: AFD handles are not file objects, so `NtReadFile` does not apply; AFD
-//! socket handles are not file objects and reject NtReadFile, so the
+//! AFD socket handles are not file objects and reject `NtReadFile`, so the
 //! equivalent overlapped primitive is `NtDeviceIoControlFile` with
 //! `IOCTL.AFD.RECEIVE`/`IOCTL.AFD.SEND` — the same ioctls std's own
 //! Threaded backend uses (with APC waits where we use event waits).
@@ -59,7 +57,7 @@ pub const SetTimeoutError = error{SocketOptionFailed};
 ///               SNDTIMEO are NOT sent: they are winsock user-mode options
 ///               with no confirmed afd.sys effect. Their defense is carried
 ///               by the software deadline in `socketReadSome`/
-///               `socketWriteAll` (see module doc, task risk #3).
+///               `socketWriteAll` (see the module doc).
 pub fn setSocketTimeouts(handle: Handle, seconds: u16) SetTimeoutError!void {
     if (comptime builtin.os.tag == .linux) {
         const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };

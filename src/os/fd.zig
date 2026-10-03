@@ -49,8 +49,7 @@ pub fn readFileAlloc(arena: Allocator, io: Io, path: []const u8, limit: usize) !
 /// 0..0o7777 (the tool layer rejects wider values with `error.BadMode`).
 ///
 /// * POSIX (Linux, macOS): `mode` is applied exactly as the openat(2)
-///   creation mode, subject to the process umask — identical to the
-///   semantics.
+///   creation mode, subject to the process umask (open(2) semantics).
 /// * Windows: `mode` is IGNORED. NTFS has no POSIX permission bits; the
 ///   file inherits the containing directory's ACLs. Callers must not rely
 ///   on `mode` having any effect on this target.

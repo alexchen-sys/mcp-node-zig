@@ -104,8 +104,8 @@ fn parseRequestLine(line: []const u8) !RequestLine {
 
 /// Strict media-type check: exactly `application/json` (case-insensitive),
 /// optionally followed by well-formed `; token=value` parameters such as
-/// charset=utf-8. `application/json-not-real` must not pass a startsWith
-/// shortcut ever again.
+/// charset=utf-8. A prefix match is not enough: `application/json-not-real`
+/// must be rejected.
 pub fn contentTypeJson(ct: []const u8) bool {
     var it = std.mem.splitScalar(u8, ct, ';');
     const media = std.mem.trim(u8, it.first(), " \t");
