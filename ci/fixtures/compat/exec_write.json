@@ -25,7 +25,7 @@
       "request": {"jsonrpc": "2.0", "id": 72, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid", "timeout": 10}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 72, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "ping\n", "stderr": "", "stdout_offset": 5, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 72, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "ping\n", "stderr": "", "stdout_offset": 5, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {

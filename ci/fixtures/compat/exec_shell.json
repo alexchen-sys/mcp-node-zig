@@ -1,5 +1,5 @@
 {
-  "description": "exec_shell: one shell layer (bash -c by default on POSIX). The payload is the exec payload: ok, exit_code, stdout, stderr, truncated, duration_ms. Shell choice outside the platform allowlist is a tool-domain error.",
+  "description": "exec_shell: one shell layer (bash -c by default on POSIX). The payload is the exec payload: ok, exit_code, stdout, stderr, truncated, duration_ms, duration_us. Shell choice outside the platform allowlist is a tool-domain error.",
   "platforms": ["posix"],
   "platforms_reason": "the default-shell golden is bash -c (POSIX); Windows shell goldens are future work",
   "cases": [
@@ -8,7 +8,7 @@
       "request": {"jsonrpc": "2.0", "id": 53, "method": "tools/call", "params": {"name": "exec_shell", "arguments": {"script": "echo shell-ok"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 53, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "exit_code": 0, "stdout": "shell-ok\n", "stderr": "", "truncated": false, "duration_ms": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 53, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "exit_code": 0, "stdout": "shell-ok\n", "stderr": "", "truncated": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {

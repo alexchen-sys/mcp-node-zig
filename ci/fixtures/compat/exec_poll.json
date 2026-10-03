@@ -1,5 +1,5 @@
 {
-  "description": "exec_poll: byte-offset deltas over a session's captured output. Polled here on a finished session so every field is deterministic: full delta, offset slicing, and offset==len giving an empty delta. exec_poll shares the renderSessionState payload with exec_wait: ok, done, exit_code, stdout, stderr, stdout_offset, stderr_offset, truncated_stdout, truncated_stderr, duration_ms. Like exec_wait, the session is resolved before optional-argument types are validated: an unknown session_id beats a bad stdout_offset type and answers UnknownSession.",
+  "description": "exec_poll: byte-offset deltas over a session's captured output. Polled here on a finished session so every field is deterministic: full delta, offset slicing, and offset==len giving an empty delta. exec_poll shares the renderSessionState payload with exec_wait: ok, done, exit_code, stdout, stderr, stdout_offset, stderr_offset, truncated_stdout, truncated_stderr, duration_ms, duration_us. Like exec_wait, the session is resolved before optional-argument types are validated: an unknown session_id beats a bad stdout_offset type and answers UnknownSession.",
   "platforms": ["posix"],
   "platforms_reason": "golden session argv use POSIX paths; Windows goldens are future work",
   "cases": [
@@ -17,7 +17,7 @@
       "request": {"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid", "timeout": 10}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 91, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 91, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {
@@ -25,7 +25,7 @@
       "request": {"jsonrpc": "2.0", "id": 59, "method": "tools/call", "params": {"name": "exec_poll", "arguments": {"session_id": "$sid"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 59, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 59, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {
@@ -33,7 +33,7 @@
       "request": {"jsonrpc": "2.0", "id": 60, "method": "tools/call", "params": {"name": "exec_poll", "arguments": {"session_id": "$sid", "stdout_offset": 7}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 60, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 60, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "poll\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {

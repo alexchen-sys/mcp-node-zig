@@ -58,7 +58,7 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
         error.StreamTooLong => return error.OutputTooLong,
         else => return err,
     };
-    const elapsed_ms = started.untilNow(io, .awake).toMilliseconds();
+    const elapsed = started.untilNow(io, .awake);
     const exit_code: i32 = switch (result.term) {
         .exited => |code| code,
         .signal => |sig| 128 + @as(i32, @intCast(@intFromEnum(sig))),
@@ -74,7 +74,11 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
     try out.appendSlice(arena, ",\"stderr\":");
     try util.appendJsonString(out, arena, result.stderr);
     try out.appendSlice(arena, ",\"truncated\":false,\"duration_ms\":");
-    try out.print(arena, "{d}", .{elapsed_ms});
+    try out.print(arena, "{d}", .{elapsed.toMilliseconds()});
+    // Same measurement, microsecond resolution: sub-millisecond commands
+    // would render duration_ms: 0 and look like a measurement failure.
+    try out.appendSlice(arena, ",\"duration_us\":");
+    try out.print(arena, "{d}", .{elapsed.toMicroseconds()});
     try out.appendSlice(arena, "}");
 }
 
@@ -264,7 +268,7 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
         .child = child,
         .stdin_fd = stdin_fd,
         .job = job,
-        .started_ms = session_mod.nowMs(io),
+        .started_us = session_mod.nowUs(io),
     };
     argv_owned = true;
     cwd_owned = true;
@@ -335,13 +339,13 @@ pub fn toolExecWait(arena: Allocator, io: Io, cfg: *const config.Config, args: V
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > WAIT_MAX_TIMEOUT_S) timeout_s = WAIT_MAX_TIMEOUT_S;
     const store = cfg.sessions.?;
-    const deadline = session_mod.nowMs(store.io) + @as(i64, timeout_s) * 1000;
+    const deadline = session_mod.nowUs(store.io) + @as(i64, timeout_s) * std.time.us_per_s;
     while (true) {
         session.mutex.lockUncancelable(store.io);
         const done = session.done;
         session.mutex.unlock(store.io);
         if (done) break;
-        if (session_mod.nowMs(store.io) >= deadline) break;
+        if (session_mod.nowUs(store.io) >= deadline) break;
         os.sleepMs(WAIT_POLL_MS);
     }
     try session_mod.renderSessionState(arena, store, session, stdout_offset, stderr_offset, out);
@@ -362,8 +366,8 @@ pub fn toolExecList(arena: Allocator, io: Io, cfg: *const config.Config, out: *s
         const done = s.done;
         const exit_code = s.exit_code;
         const pid = s.pid;
-        const started = s.started_ms;
-        const ended = s.ended_ms;
+        const started = s.started_us;
+        const ended = s.ended_us;
         s.mutex.unlock(store.io);
         if (!first) try out.appendSlice(arena, ",");
         first = false;
@@ -380,10 +384,12 @@ pub fn toolExecList(arena: Allocator, io: Io, cfg: *const config.Config, out: *s
         try out.appendSlice(arena, if (done) "true" else "false");
         try out.appendSlice(arena, ",\"exit_code\":");
         if (exit_code) |code| try out.print(arena, "{d}", .{code}) else try out.appendSlice(arena, "null");
+        // started_ms/ended_ms keep their v0 names and units; the session
+        // internally tracks microseconds since the duration_us work.
         try out.appendSlice(arena, ",\"started_ms\":");
-        try out.print(arena, "{d}", .{started});
+        try out.print(arena, "{d}", .{@divTrunc(started, std.time.us_per_ms)});
         try out.appendSlice(arena, ",\"ended_ms\":");
-        if (ended) |e| try out.print(arena, "{d}", .{e}) else try out.appendSlice(arena, "null");
+        if (ended) |e| try out.print(arena, "{d}", .{@divTrunc(e, std.time.us_per_ms)}) else try out.appendSlice(arena, "null");
         try out.appendSlice(arena, "}");
     }
     try out.appendSlice(arena, "]}");

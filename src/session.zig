@@ -43,8 +43,10 @@ pub const Session = struct {
     exit_code: ?i64 = null,
     truncated_stdout: bool = false,
     truncated_stderr: bool = false,
-    started_ms: i64,
-    ended_ms: ?i64 = null,
+    /// Session start on the real clock, in microseconds (sub-ms sessions
+    /// would render duration_ms: 0; duration_us keeps the precision).
+    started_us: i64,
+    ended_us: ?i64 = null,
     // Lifecycle: store holds 1 ref while the session is in the map; every
     // in-flight tool call holds +1 via sessionFromArgs/defer sessionRelease.
     // freeSession runs only when refs hit 0 (always after thread joins).
@@ -149,7 +151,6 @@ pub const SessionStore = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            const now = nowMs(self.io);
             while (n < victims.len) {
                 var found_key: ?u64 = null;
                 var found_s: ?*Session = null;
@@ -158,11 +159,11 @@ pub const SessionStore = struct {
                     const s = kv.value_ptr.*;
                     s.mutex.lockUncancelable(self.io);
                     const is_done = s.done;
-                    const ended = s.ended_ms;
+                    const ended = s.ended_us;
                     s.mutex.unlock(self.io);
                     if (!is_done) continue;
                     const ended_v = ended orelse continue;
-                    if (now - ended_v < self.ttl_ms) continue;
+                    if (nowUs(self.io) - ended_v < @as(i64, self.ttl_ms) * std.time.us_per_ms) continue;
                     found_key = kv.key_ptr.*;
                     found_s = s;
                     break;
@@ -191,8 +192,8 @@ pub const SessionStore = struct {
     }
 };
 
-pub fn nowMs(io: Io) i64 {
-    return std.Io.Clock.real.now(io).toMilliseconds();
+pub fn nowUs(io: Io) i64 {
+    return std.Io.Clock.real.now(io).toMicroseconds();
 }
 
 /// Child.id is a HANDLE on Windows: resolve the real integer pid through
@@ -297,7 +298,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
             session.mutex.lockUncancelable(io);
             session.done = true;
             session.exit_code = null;
-            session.ended_ms = nowMs(io);
+            session.ended_us = nowUs(io);
             session.mutex.unlock(io);
             return;
         };
@@ -311,7 +312,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = code;
-        session.ended_ms = nowMs(io);
+        session.ended_us = nowUs(io);
         session.mutex.unlock(io);
         return;
     }
@@ -339,10 +340,10 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         var expected_readers: u32 = 0;
         if (session.stdout_thread != null) expected_readers += 1;
         if (session.stderr_thread != null) expected_readers += 1;
-        const drain_deadline = nowMs(io) + DRAIN_GRACE_MS;
+        const drain_deadline = nowUs(io) + DRAIN_GRACE_MS * std.time.us_per_ms;
         while (session.readers_done.load(.acquire) < expected_readers) {
             if (session.closing.load(.acquire)) break;
-            if (nowMs(io) >= drain_deadline) break;
+            if (nowUs(io) >= drain_deadline) break;
             os.sleepMs(1);
         }
         // Step 4: child.wait() cleanup closes the parent pipe ends, so the
@@ -355,9 +356,9 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         // wedged kernel and is never reached in practice.
         if (session.readers_done.load(.acquire) < expected_readers) {
             session.closing.store(true, .release);
-            const exit_deadline = nowMs(io) + READER_EXIT_MS;
+            const exit_deadline = nowUs(io) + READER_EXIT_MS * std.time.us_per_ms;
             while (session.readers_done.load(.acquire) < expected_readers) {
-                if (nowMs(io) >= exit_deadline) break;
+                if (nowUs(io) >= exit_deadline) break;
                 os.sleepMs(1);
             }
         }
@@ -374,7 +375,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
             session.mutex.lockUncancelable(io);
             session.done = true;
             session.exit_code = null;
-            session.ended_ms = nowMs(io);
+            session.ended_us = nowUs(io);
             session.mutex.unlock(io);
             return;
         };
@@ -383,7 +384,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = code;
-        session.ended_ms = nowMs(io);
+        session.ended_us = nowUs(io);
         session.mutex.unlock(io);
         return;
     }
@@ -397,7 +398,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         session.mutex.lockUncancelable(io);
         session.done = true;
         session.exit_code = null;
-        session.ended_ms = nowMs(io);
+        session.ended_us = nowUs(io);
         session.mutex.unlock(io);
         return;
     };
@@ -406,7 +407,7 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
     session.mutex.lockUncancelable(io);
     session.done = true;
     session.exit_code = code;
-    session.ended_ms = nowMs(io);
+    session.ended_us = nowUs(io);
     session.mutex.unlock(io);
 }
 
@@ -478,7 +479,12 @@ pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Sess
     const stderr_delta = if (session.done) stderr_raw else utf8CompletePrefix(stderr_raw);
     const stdout_text = try util.utf8LossyAlloc(arena, stdout_delta);
     const stderr_text = try util.utf8LossyAlloc(arena, stderr_delta);
-    const ended = session.ended_ms orelse nowMs(store.io);
+    // Elapsed kept in microseconds: sub-millisecond sessions would flatten
+    // to duration_ms: 0, while duration_us preserves the resolution.
+    // duration_ms is still emitted (floor of the same value) for the
+    // frozen v0 consumers.
+    const ended_us = session.ended_us orelse nowUs(store.io);
+    const elapsed_us = ended_us - session.started_us;
     try out.appendSlice(arena, "{\"ok\":true,\"done\":");
     try out.appendSlice(arena, if (session.done) "true" else "false");
     try out.appendSlice(arena, ",\"exit_code\":");
@@ -496,7 +502,9 @@ pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Sess
     try out.appendSlice(arena, ",\"truncated_stderr\":");
     try out.appendSlice(arena, if (session.truncated_stderr) "true" else "false");
     try out.appendSlice(arena, ",\"duration_ms\":");
-    try out.print(arena, "{d}", .{ended - session.started_ms});
+    try out.print(arena, "{d}", .{@divTrunc(elapsed_us, std.time.us_per_ms)});
+    try out.appendSlice(arena, ",\"duration_us\":");
+    try out.print(arena, "{d}", .{elapsed_us});
     try out.appendSlice(arena, "}");
 }
 
