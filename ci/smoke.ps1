@@ -51,6 +51,25 @@ try {
     if ($sysJson -notmatch '"os"') { throw "sys_info missing os" }
     if ($sysJson -notmatch '"hostname"') { throw "sys_info missing hostname" }
 
+    # bearer scheme accepted; 401 carries the WWW-Authenticate challenge
+    $bearerHeaders = @{ "Authorization" = "Bearer ci-test-token" }
+    $ping = Invoke-RestMethod -Uri "http://127.0.0.1:8341/mcp" -Method POST `
+        -ContentType "application/json" -Headers $bearerHeaders `
+        -Body '{"jsonrpc":"2.0","id":3,"method":"ping"}'
+    if ($null -eq $ping.result) { throw "bearer ping failed" }
+
+    $resp401 = $null
+    try {
+        $resp401 = Invoke-WebRequest -Uri "http://127.0.0.1:8341/mcp" -Method POST `
+            -ContentType "application/json" -Headers @{ "Authorization" = "Basic d3Jvbmc=" } `
+            -Body '{"jsonrpc":"2.0","id":4,"method":"initialize"}' `
+            -UseBasicParsing
+    } catch {
+        $resp401 = $_.Exception.Response
+    }
+    if ([int]$resp401.StatusCode -ne 401) { throw "basic scheme must be 401" }
+    if (-not $resp401.Headers["WWW-Authenticate"]) { throw "401 without WWW-Authenticate" }
+
     Write-Host "smoke: OK"
 } finally {
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
