@@ -222,6 +222,7 @@ Configuration is environment-only:
 - `MCP_NODE_MAX_CONN` — max concurrent TCP connections, default `128` (`0` -> `128`)
 - `MCP_NODE_MAX_SESSIONS` — max live exec sessions, default `64` (`0` -> `64`)
 - `MCP_NODE_SESSION_TTL_S` — finished-session reap delay, default `600` (`0` -> `600`)
+- `MCP_NODE_TEXT_MIRROR=0` — return `structuredContent` only, without the `content[0].text` JSON mirror; halves response bytes for structured-capable clients (tools declare `outputSchema`). Default keeps the spec-recommended mirror; error results always carry text
 - `MCP_NODE_INSECURE=1` — allow startup without a token (not recommended); on Windows a missing token file always fails startup, so create an empty one instead
 
 Auth header: the standard Bearer scheme most MCP clients send, or `X-Node-Token: <token>`. If a request carries both, they must match; otherwise it gets 401.
