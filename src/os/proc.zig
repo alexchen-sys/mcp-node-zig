@@ -7,12 +7,17 @@
 //!     (exec JSON output), never a control token.
 //!   * `JobField`/`no_job` — the per-session Windows Job Object handle
 //!     (void on POSIX, where the process group is the tree unit).
-//!   * `createStdinPipe`/`stdinFile` — a parent-owned stdin pipe. The read
-//!     end is handed to the child via `SpawnOptions.stdin = .file`, so
+//!   * `createStdinPipe`/`stdinFile` — the POSIX stdin wiring: a
+//!     parent-owned pipe whose read end is handed to the child via
+//!     `SpawnOptions.stdin = .file` (std dups it into the child), so
 //!     `std.process.Child.stdin` stays null and `child.wait()` cleanup can
-//!     never close the write end from under `exec_write`.
-//!     needed an F_DUPFD_CLOEXEC takeover hack because std created that pipe
-//!     itself for `.pipe` stdio).
+//!     never close the write end from under `exec_write`. Windows cannot
+//!     use `.file` for a pipe handle: std re-opens it via NtCreateFile with
+//!     an empty path, which a named pipe answers with
+//!     STATUS_PIPE_NOT_AVAILABLE (`error.NoDevice`). There the daemon
+//!     spawns with `.pipe` stdio instead and takes the parent write end
+//!     over from `child.stdin` (see toolExecStart), so these helpers are
+//!     POSIX-only.
 //!   * `child_pgid`/`spawn_suspended` — comptime SpawnOptions gates: process
 //!     group leader on POSIX (the `0` literal is not expressible on Windows,
 //!     where pid_t is a HANDLE), CREATE_SUSPENDED only on Windows (so the
@@ -61,7 +66,9 @@ pub const child_pgid: ?std.posix.pid_t = if (native_os == .windows) null else 0;
 /// implements it as a pre-exec SIGSTOP, which would hang the session.
 pub const spawn_suspended: bool = native_os == .windows;
 
-/// Both ends of the child's stdin pipe, owned by the parent.
+/// Both ends of the child's stdin pipe, owned by the parent. POSIX only:
+/// Windows hands the stdin pipe lifecycle to std (`.pipe` stdio plus the
+/// post-spawn takeover in toolExecStart — see the header note).
 pub const StdinPipe = struct {
     /// Read end; handed to the child during spawn (`.file` stdio).
     read: std.posix.fd_t,
@@ -70,29 +77,18 @@ pub const StdinPipe = struct {
 };
 
 /// Create the session's stdin pipe with the same end roles std itself uses
-/// for `.pipe` stdin: POSIX — both ends CLOEXEC, so concurrent spawns from
-/// other connection threads can never inherit them (the child's dup2 target
-/// loses CLOEXEC automatically). Windows — non-inheritable synchronous
-/// server (parent write) end and inheritable synchronous client (child read)
-/// end, outbound direction (parent writes, child reads).
-pub fn createStdinPipe(io: std.Io) !StdinPipe {
-    if (comptime native_os == .windows) {
-        // windowsCreatePipe is a Threaded method; the daemon's Io is always a
-        // Threaded (main and the test hook both build it that way).
-        const t: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata.?));
-        const pair = try t.windowsCreatePipe(.{
-            .server = .{ .attributes = .{ .INHERIT = false }, .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
-            .client = .{ .attributes = .{ .INHERIT = true }, .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
-            .outbound = true,
-        });
-        return .{ .read = pair[1], .write = pair[0] };
-    } else {
-        const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
-        return .{ .read = fds[0], .write = fds[1] };
-    }
+/// for `.pipe` stdin: both ends CLOEXEC, so concurrent spawns from other
+/// connection threads can never inherit them (the child's dup2 target loses
+/// CLOEXEC automatically). POSIX only — on Windows `.file` stdio cannot
+/// re-open a pipe handle (STATUS_PIPE_NOT_AVAILABLE → error.NoDevice), so
+/// toolExecStart spawns with std `.pipe` stdio instead and never calls this.
+pub fn createStdinPipe() !StdinPipe {
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    return .{ .read = fds[0], .write = fds[1] };
 }
 
-/// The `.file` stdio view of the pipe's read end, for SpawnOptions.stdin.
+/// The `.file` stdio view of the pipe's read end, for SpawnOptions.stdin
+/// (POSIX only — see createStdinPipe).
 pub fn stdinFile(pipe: *const StdinPipe) std.Io.File {
     return .{ .handle = pipe.read, .flags = .{ .nonblocking = false } };
 }

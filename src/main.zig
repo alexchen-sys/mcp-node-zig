@@ -1455,9 +1455,11 @@ fn sessionWaiterMain(session: *Session, io: Io) void {
 fn freeSession(session: *Session) void {
     // Called only after all session threads were joined (close/evict/error
     // paths), i.e. always after child.wait() already closed child.stdout/
-    // stderr via std cleanup (child.stdin is null by construction: sessions
-    // spawn with .file stdio). The stdin write end is session-owned from the
-    // start, so closing it here can never double-close a std cleanup copy.
+    // stderr via std cleanup. child.stdin is null by construction on both
+    // platforms — POSIX spawns with `.file` stdio (child.stdin starts null),
+    // Windows nulls it in the post-spawn takeover — so std cleanup never
+    // holds a stdin handle and closing Session.stdin_fd here is the single
+    // owner's close, never a double-close.
     if (session.stdin_fd) |fd| os.closeFd(fd);
     // Windows: release the Job Object. The tree is already dead (waiter ran
     // TerminateJobObject), so KILL_ON_JOB_CLOSE is a no-op here.
@@ -1519,17 +1521,34 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         if (!cwd_owned) std.heap.page_allocator.free(cwd);
     }
 
-    // Parent-owned stdin pipe: the read end goes to the child as .file
-    // stdio, the write end becomes Session.stdin_fd. std.process.Child.stdin
-    // stays null, so child.wait() cleanup can never close the write end from
-    // under exec_write — the pipe is owned by the session,
-    // hack on every OS.
-    const stdin_pipe = try proc.createStdinPipe(io);
-    var stdin_read_open = true;
-    errdefer if (stdin_read_open) os.closeFd(stdin_pipe.read);
-    const stdin_fd: std.posix.fd_t = stdin_pipe.write;
+    // Stdin wiring splits by platform (see the src/os/proc.zig header).
+    // POSIX — parent-owned pipe: the read end goes to the child as `.file`
+    // stdio (std dups it in), the write end becomes Session.stdin_fd, and
+    // std.process.Child.stdin stays null, so child.wait() cleanup can never
+    // close the write end from under exec_write. Windows — `.file` stdio
+    // re-opens the pipe read end via NtCreateFile with an empty path, which
+    // a named pipe answers with STATUS_PIPE_NOT_AVAILABLE (error.NoDevice —
+    // every exec_start failed), so spawn with `.pipe` and let std create the
+    // pipe; the parent write end comes back as child.stdin and is taken
+    // over into stdin_fd right after the spawn.
+    const is_windows = builtin.os.tag == .windows;
+    const stdin_pipe: if (is_windows) void else proc.StdinPipe =
+        if (is_windows) {} else try proc.createStdinPipe();
+    var stdin_read_open: if (is_windows) void else bool = if (is_windows) {} else true;
+    var stdin_fd: std.posix.fd_t = undefined;
+    // Windows fills stdin_fd only after the spawn (takeover from
+    // child.stdin), so the close-defer is gated on validity rather than on
+    // the (still undefined) declaration.
+    var stdin_fd_valid = false;
     var stdin_owned = false;
-    errdefer if (!stdin_owned) os.closeFd(stdin_fd);
+    errdefer if (stdin_fd_valid and !stdin_owned) os.closeFd(stdin_fd);
+    errdefer if (!is_windows) {
+        if (stdin_read_open) os.closeFd(stdin_pipe.read);
+    };
+    if (!is_windows) {
+        stdin_fd = stdin_pipe.write;
+        stdin_fd_valid = true;
+    }
 
     // Windows: the Job Object exists before the process so the
     // assign-before-resume sequence can never leak an untracked tree.
@@ -1546,7 +1565,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
-        .stdin = .{ .file = proc.stdinFile(&stdin_pipe) },
+        .stdin = if (is_windows) .pipe else .{ .file = proc.stdinFile(&stdin_pipe) },
         .stdout = .pipe,
         .stderr = .pipe,
         // POSIX: child becomes process-group leader (kill(-pgid) reaches the
@@ -1557,9 +1576,22 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         // it can spawn anything. POSIX keeps running-start semantics.
         .start_suspended = proc.spawn_suspended,
     });
-    // The child owns its stdin read end from here on; drop the parent's copy.
-    os.closeFd(stdin_pipe.read);
-    stdin_read_open = false;
+    if (is_windows) {
+        // std created the stdin pipe for `.pipe` stdio and handed the parent
+        // write end back as child.stdin (a synchronous handle — the
+        // NtWriteFile loop in writeAllFd works unchanged). Take it over:
+        // null the field so childCleanupWindows (behind every child.wait())
+        // can never close our write end, then adopt it as stdin_fd.
+        const f = child.stdin orelse return error.StdinPipeTakeoverFailed;
+        child.stdin = null;
+        stdin_fd = f.handle;
+        stdin_fd_valid = true;
+    } else {
+        // The child owns its stdin read end from here on; drop the parent's
+        // copy.
+        os.closeFd(stdin_pipe.read);
+        stdin_read_open = false;
+    }
 
     // Never leak a running child if session allocation fails after spawn.
     var child_owned = false;
