@@ -16,7 +16,7 @@ Run it on any machine you want your AI to reach — a build box, a homelab serve
 
 SSH bridges need keys and OpenSSH. Runtimes need Node or Python on every box. mcp-node-zig needs neither.
 
-[Quickstart](#quickstart) • [Client setup](#mcp-client-setup) • [Why not SSH](#why-not-ssh-based-mcp) • [Configuration](#configuration) • [Examples](#examples) • [Security](#security-notes) • [Limitations](#limitations) • [Troubleshooting](#troubleshooting) • [Building from source](#building-from-source)
+[Quickstart](#quickstart) • [Client setup](#mcp-client-setup) • [Why not SSH](#why-not-ssh-based-mcp) • [Benchmarks](#benchmarks) • [Configuration](#configuration) • [Examples](#examples) • [Security](#security-notes) • [Limitations](#limitations) • [Troubleshooting](#troubleshooting) • [Building from source](#building-from-source)
 
 ## Quickstart
 
@@ -202,6 +202,10 @@ SSH bridges are a solid, honest choice when every target already runs OpenSSH an
 | NAT / closed networks | needs a reachable SSH port | local only | any HTTP path (reverse tunnel, VPN) |
 
 The SSH column is not a straw man: if you already run OpenSSH everywhere, a bridge may well be the simpler answer. The trade only pays where SSH is missing, unwanted, or expensive to maintain.
+
+## Benchmarks
+
+One question asked of everyone, launched the way their README documents: what does it cost to put a command server on a machine? Measured on a 4-core desktop against `uvx mcp-shell-server` and `npx mcp-server-commands` (installer caches warmed, identical child command, N=50 cold starts / N=200 round-trips): mcp-node-zig answers its first MCP call **1.9 ms** after spawn (rivals: 463 / 888 ms), holds **0.98 MiB** RSS idle (rivals: 189 / 197 MiB), and the whole install is **one 4.3 MiB static binary** with no runtime to provision (rival stacks: ~93–198 MiB). Full tables, honest caveats and the one-command reproducer: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Configuration
 
