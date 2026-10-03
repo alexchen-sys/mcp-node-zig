@@ -33,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
       - name: Install Zig 0.16.0
         shell: bash
         run: |
@@ -76,6 +81,20 @@ jobs:
         shell: pwsh
         run: ci/smoke.ps1
 
+      - name: Python regression suite
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_regressions.py
+
+      - name: Python lifecycle edge suite
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_lifecycle_edge.py
+
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v6
         with:
@@ -83,3 +102,18 @@ jobs:
           path: zig-out/bin/${{ matrix.binary }}
           retention-days: 7
           if-no-files-found: error
+
+      - name: Python compat fixture suite
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_compat.py
+
+      - name: HTTP parser fuzz suite
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/fuzz_http.py
+

@@ -215,14 +215,15 @@ def kill_pid(pid):
 
 def pid_alive_posix(pid):
     """Linux: /proc state (zombie counts as dead). Other POSIX: kill(pid, 0)."""
-    try:
-        data = Path('/proc/%d/stat' % pid).read_bytes()
-        state = data.rsplit(b')', 1)[1].split()[0]
-        return state not in (b'Z', b'X')
-    except FileNotFoundError:
-        return False
-    except OSError:
-        pass
+    if Path('/proc').is_dir():
+        try:
+            data = Path('/proc/%d/stat' % pid).read_bytes()
+            state = data.rsplit(b')', 1)[1].split()[0]
+            return state not in (b'Z', b'X')
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
     try:
         os.kill(pid, 0)
         return True
@@ -318,7 +319,7 @@ class TreeTests(unittest.TestCase):
     def test_done_means_output_drained(self):
         payload = 65536
         started = self.node.tool('exec_start', {'argv': [sys.executable, '-c',
-            "import os,sys; os.write(1, b'x'*%d); os.write(2, b'y'*1024)" % payload]})
+            'import os,sys; os.write(1, b"x"*%d); os.write(2, b"y"*1024)' % payload]})
         self.assertTrue(started.get('ok'), started)
         state = self.node.tool('exec_wait', {'session_id': started['session_id'], 'timeout': 10})
         self.assertTrue(state.get('done'), state)
