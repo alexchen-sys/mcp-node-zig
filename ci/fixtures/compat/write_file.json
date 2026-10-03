@@ -1,0 +1,45 @@
+{
+  "description": "write_file: base64 content, sha256 echo, size in bytes. Payload: ok, path, size, sha256. sha256 is pinned exactly for deterministic content (same digest on every platform). The mkdirs case writes through two new directories and reads the file back through read_file to prove the directories really exist.",
+  "cases": [
+    {
+      "name": "write_ok_deterministic_sha256",
+      "request": {"jsonrpc": "2.0", "id": 112, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-write.txt", "content_b64": "djAgY29tcGF0Cg=="}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 112, "result": {"content": [{"type": "text", "text": "{\"ok\":true,\"path\":\"compat-write.txt\",\"size\":10,\"sha256\":\"cee0dfdca389e4c08930a48c4c79fecbc55e34d8033d2c1adaa4ea21786e81d9\"}"}], "structuredContent": {"ok": true, "path": "compat-write.txt", "size": 10, "sha256": "cee0dfdca389e4c08930a48c4c79fecbc55e34d8033d2c1adaa4ea21786e81d9"}, "isError": false}}
+      }
+    },
+    {
+      "name": "missing_content_b64",
+      "request": {"jsonrpc": "2.0", "id": 113, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-write.txt"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 113, "result": {"content": [{"type": "text", "text": "{\"ok\":false,\"error\":\"MissingContent\"}"}], "structuredContent": {"ok": false, "error": "MissingContent"}, "isError": false}}
+      }
+    },
+    {
+      "name": "content_b64_wrong_type_invalid_params",
+      "request": {"jsonrpc": "2.0", "id": 114, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-write.txt", "content_b64": 5}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 114, "error": {"code": -32602, "message": "Invalid params"}}
+      }
+    },
+    {
+      "name": "nested_mkdirs_creates_parents",
+      "request": {"jsonrpc": "2.0", "id": 115, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-nested/dir/file.txt", "content_b64": "bmVzdGVkCg=="}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 115, "result": {"content": [{"type": "text", "text": "{\"ok\":true,\"path\":\"compat-nested/dir/file.txt\",\"size\":7,\"sha256\":\"370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3\"}"}], "structuredContent": {"ok": true, "path": "compat-nested/dir/file.txt", "size": 7, "sha256": "370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3"}, "isError": false}}
+      }
+    },
+    {
+      "name": "nested_file_is_readable_back",
+      "request": {"jsonrpc": "2.0", "id": 116, "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "compat-nested/dir/file.txt"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 116, "result": {"content": [{"type": "text", "text": "{\"ok\":true,\"path\":\"compat-nested/dir/file.txt\",\"size\":7,\"offset\":0,\"content\":\"nested\\n\",\"has_more\":false}"}], "structuredContent": {"ok": true, "path": "compat-nested/dir/file.txt", "size": 7, "offset": 0, "content": "nested\n", "has_more": false}, "isError": false}}
+      }
+    }
+  ]
+}

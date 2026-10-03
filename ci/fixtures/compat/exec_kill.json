@@ -1,0 +1,48 @@
+{
+  "description": "exec_kill: SIGKILL the session process tree. Payload is just {ok:true}. On Linux a SIGKILLed leader reports exit_code 137 (128+9) once the session is done. The running sleep is left for harness teardown after the wait case observes the kill.",
+  "platforms": ["posix"],
+  "platforms_reason": "golden session argv use POSIX paths; Windows goldens are future work",
+  "cases": [
+    {
+      "name": "setup_start_sleep",
+      "request": {"jsonrpc": "2.0", "id": 77, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/sleep", "30"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 77, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "kill_running_session",
+      "request": {"jsonrpc": "2.0", "id": 78, "method": "tools/call", "params": {"name": "exec_kill", "arguments": {"session_id": "$sid"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 78, "result": {"content": [{"type": "text", "text": "{\"ok\":true}"}], "structuredContent": {"ok": true}, "isError": false}}
+      }
+    },
+    {
+      "name": "wait_after_kill_reports_signal_exit",
+      "request": {"jsonrpc": "2.0", "id": 79, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid", "timeout": 5}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 79, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 137, "stdout": "", "stderr": "", "stdout_offset": 0, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+      }
+    },
+    {
+      "name": "missing_session_id",
+      "request": {"jsonrpc": "2.0", "id": 81, "method": "tools/call", "params": {"name": "exec_kill", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 81, "result": {"content": [{"type": "text", "text": "{\"ok\":false,\"error\":\"MissingSession\"}"}], "structuredContent": {"ok": false, "error": "MissingSession"}, "isError": false}}
+      }
+    },
+    {
+      "name": "session_id_wrong_type_invalid_params",
+      "request": {"jsonrpc": "2.0", "id": 82, "method": "tools/call", "params": {"name": "exec_kill", "arguments": {"session_id": "1"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 82, "error": {"code": -32602, "message": "Invalid params"}}
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "description": "ping liveness: empty result object, id echoed with type fidelity, notifications answered 202 with no body.",
+  "cases": [
+    {
+      "name": "int_id_echoed",
+      "request": {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 7, "result": {}}
+      }
+    },
+    {
+      "name": "string_id_echoed",
+      "request": {"jsonrpc": "2.0", "id": "compat-ping", "method": "ping"},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": "compat-ping", "result": {}}
+      }
+    },
+    {
+      "name": "notification_no_id_202_empty_body",
+      "request": {"jsonrpc": "2.0", "method": "notifications/initialized"},
+      "expect": {
+        "status": 202,
+        "response": null
+      }
+    }
+  ]
+}

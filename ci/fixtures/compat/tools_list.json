@@ -1,0 +1,42 @@
+{
+  "description": "tools/list advertises exactly the 13 v0 tools, in the frozen literal order, each with a description and an object inputSchema whose required array matches the v0 contract (subset match: extra schema keys like properties are allowed and not pinned byte-exact). Also pins the tools/call envelope for an unknown tool name.",
+  "cases": [
+    {
+      "name": "exact_13_tools_in_frozen_order",
+      "request": {"jsonrpc": "2.0", "id": 42, "method": "tools/list"},
+      "expect": {
+        "status": 200,
+        "match": "subset",
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 42,
+          "result": {
+            "tools": [
+              {"name": "sys_info", "description": {"*str": null}, "inputSchema": {"type": "object"}},
+              {"name": "exec", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["argv"]}},
+              {"name": "exec_start", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["argv"]}},
+              {"name": "exec_poll", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}},
+              {"name": "exec_write", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id", "data_b64"]}},
+              {"name": "exec_kill", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}},
+              {"name": "exec_close", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}},
+              {"name": "exec_wait", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}},
+              {"name": "exec_list", "description": {"*str": null}, "inputSchema": {"type": "object"}},
+              {"name": "exec_shell", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["script"]}},
+              {"name": "read_file", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["path"]}},
+              {"name": "write_file", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["path", "content_b64"]}},
+              {"name": "list_dir", "description": {"*str": null}, "inputSchema": {"type": "object"}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown_tool_envelope_is_error_without_structured_content",
+      "request": {"jsonrpc": "2.0", "id": 51, "method": "tools/call", "params": {"name": "no_such_tool_v0", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 51, "result": {"content": [{"type": "text", "text": "Unknown tool: no_such_tool_v0"}], "isError": true}}
+      }
+    }
+  ]
+}

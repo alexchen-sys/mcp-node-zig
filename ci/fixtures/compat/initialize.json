@@ -1,0 +1,29 @@
+{
+  "description": "initialize handshake: protocolVersion echo for supported versions, fallback to the newest supported version otherwise, serverInfo identity.",
+  "cases": [
+    {
+      "name": "supported_version_echoed",
+      "request": {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "compat", "version": "0"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 101, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.0"}}}
+      }
+    },
+    {
+      "name": "unsupported_version_falls_back_to_newest",
+      "request": {"jsonrpc": "2.0", "id": 102, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 102, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.0"}}}
+      }
+    },
+    {
+      "name": "no_params_defaults",
+      "request": {"jsonrpc": "2.0", "id": "init-str", "method": "initialize"},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": "init-str", "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.0"}}}
+      }
+    }
+  ]
+}

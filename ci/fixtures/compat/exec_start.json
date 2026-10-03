@@ -1,0 +1,40 @@
+{
+  "description": "exec_start: spawns a session (own process group, piped stdio). Payload: ok, session_id, pid. The success case captures session_id for flow fixtures; the daemon-side session is closed by the harness teardown, so no explicit close case is needed here.",
+  "platforms": ["posix"],
+  "platforms_reason": "golden session argv use POSIX paths; Windows goldens are future work",
+  "cases": [
+    {
+      "name": "start_echo_ok",
+      "request": {"jsonrpc": "2.0", "id": 57, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/echo", "compat-start"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 57, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "missing_argv",
+      "request": {"jsonrpc": "2.0", "id": 85, "method": "tools/call", "params": {"name": "exec_start", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 85, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingArgv"}, "isError": false}}
+      }
+    },
+    {
+      "name": "argv_not_array_bad_argv",
+      "request": {"jsonrpc": "2.0", "id": 88, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": "/bin/echo"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 88, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "BadArgv"}, "isError": false}}
+      }
+    },
+    {
+      "name": "cwd_wrong_type_invalid_params",
+      "request": {"jsonrpc": "2.0", "id": 89, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/usr/bin/true"], "cwd": 5}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 89, "error": {"code": -32602, "message": "Invalid params"}}
+      }
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "description": "exec_list: session table view. Empty on a fresh daemon, one running entry while /bin/sleep is live, empty again after exec_close (removal contract), and one finished entry with ended_ms set after an echo session completes. Sessions never iterate in map order with more than one entry, so every listing case keeps exactly one live/finished session.",
+  "platforms": ["posix"],
+  "platforms_reason": "golden session argv use POSIX paths; Windows goldens are future work",
+  "cases": [
+    {
+      "name": "list_empty_on_fresh_daemon",
+      "request": {"jsonrpc": "2.0", "id": 100, "method": "tools/call", "params": {"name": "exec_list", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 100, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "sessions": []}, "isError": false}}
+      }
+    },
+    {
+      "name": "setup_start_sleep",
+      "request": {"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/sleep", "30"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 91, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "list_one_running_session",
+      "request": {"jsonrpc": "2.0", "id": 101, "method": "tools/call", "params": {"name": "exec_list", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 101, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "sessions": [{"session_id": {"*int": null}, "pid": {"*int": null}, "argv": ["/bin/sleep", "30"], "done": false, "exit_code": null, "started_ms": {"*int": null}, "ended_ms": null}]}, "isError": false}}
+      }
+    },
+    {
+      "name": "setup_close_session",
+      "request": {"jsonrpc": "2.0", "id": 93, "method": "tools/call", "params": {"name": "exec_close", "arguments": {"session_id": "$sid"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 93, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true}, "isError": false}}
+      }
+    },
+    {
+      "name": "list_empty_after_close",
+      "request": {"jsonrpc": "2.0", "id": 102, "method": "tools/call", "params": {"name": "exec_list", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 102, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "sessions": []}, "isError": false}}
+      }
+    },
+    {
+      "name": "setup_start_echo",
+      "request": {"jsonrpc": "2.0", "id": 103, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/echo", "compat-list"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 103, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid2": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "setup_wait_echo_done",
+      "request": {"jsonrpc": "2.0", "id": 104, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid2", "timeout": 10}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 104, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-list\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+      }
+    },
+    {
+      "name": "list_one_finished_session",
+      "request": {"jsonrpc": "2.0", "id": 105, "method": "tools/call", "params": {"name": "exec_list", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 105, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "sessions": [{"session_id": {"*int": null}, "pid": {"*int": null}, "argv": ["/bin/echo", "compat-list"], "done": true, "exit_code": 0, "started_ms": {"*int": null}, "ended_ms": {"*int": null}}]}, "isError": false}}
+      }
+    }
+  ]
+}

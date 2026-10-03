@@ -1,0 +1,61 @@
+{
+  "description": "list_dir: deterministic name-sorted listings with name/type/size/mtime per entry and count/truncated/has_more. Setup writes two 3-byte files into compat-dir/. The default-cwd case relies on the harness daemon layout: the temp cwd holds exactly auth-fixture (token file), daemon.log, and the compat-dir directory created by the setup cases, sorted by name. mtime and directory sizes are volatile wildcards; file sizes are deterministic.",
+  "cases": [
+    {
+      "name": "setup_write_first_entry",
+      "request": {"jsonrpc": "2.0", "id": 117, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-dir/a.txt", "content_b64": "YWFh"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 117, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "path": "compat-dir/a.txt", "size": 3, "sha256": "9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"}, "isError": false}}
+      }
+    },
+    {
+      "name": "setup_write_second_entry",
+      "request": {"jsonrpc": "2.0", "id": 118, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-dir/b.txt", "content_b64": "YWFh"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 118, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "path": "compat-dir/b.txt", "size": 3, "sha256": "9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"}, "isError": false}}
+      }
+    },
+    {
+      "name": "list_dir_sorted_with_types_and_sizes",
+      "request": {"jsonrpc": "2.0", "id": 119, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": "compat-dir"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 119, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "path": "compat-dir", "items": [{"name": "a.txt", "type": "f", "size": 3, "mtime": {"*int": null}}, {"name": "b.txt", "type": "f", "size": 3, "mtime": {"*int": null}}], "count": 2, "truncated": false, "has_more": false}, "isError": false}}
+      }
+    },
+    {
+      "name": "default_path_lists_cwd",
+      "request": {"jsonrpc": "2.0", "id": 120, "method": "tools/call", "params": {"name": "list_dir", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 120, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "path": ".", "items": [{"name": "auth-fixture", "type": "f", "size": {"*int": null}, "mtime": {"*int": null}}, {"name": "compat-dir", "type": "d", "size": {"*int": null}, "mtime": {"*int": null}}, {"name": "daemon.log", "type": "f", "size": {"*int": null}, "mtime": {"*int": null}}], "count": 3, "truncated": false, "has_more": false}, "isError": false}}
+      }
+    },
+    {
+      "name": "not_found",
+      "request": {"jsonrpc": "2.0", "id": 121, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": "no-such-compat-dir"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 121, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "FileNotFound"}, "isError": false}}
+      }
+    },
+    {
+      "name": "path_is_a_file_not_directory",
+      "request": {"jsonrpc": "2.0", "id": 122, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": "compat-dir/a.txt"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 122, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "NotDirectory"}, "isError": false}}
+      }
+    },
+    {
+      "name": "path_wrong_type_invalid_params",
+      "request": {"jsonrpc": "2.0", "id": 123, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": 5}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 123, "error": {"code": -32602, "message": "Invalid params"}}
+      }
+    }
+  ]
+}

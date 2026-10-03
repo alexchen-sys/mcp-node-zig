@@ -1,0 +1,39 @@
+{
+  "description": "sys_info host summary. Note: the payload has no ok field; every volatile field (hostname, load averages, uptime, memory) is a typed wildcard. os and machine are compile-time constants of the build platform and are pinned. sys_info takes no arguments, so there is no missing-required-arg case; unknown arguments are ignored.",
+  "platforms": ["linux"],
+  "platforms_reason": "pins the compile-time os/machine constants of the Linux x86_64 reference build; per-platform goldens are future work",
+  "cases": [
+    {
+      "name": "baseline_shape",
+      "request": {"jsonrpc": "2.0", "id": 43, "method": "tools/call", "params": {"name": "sys_info", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 43,
+          "result": {
+            "content": [{"type": "text", "text": {"*str": null}}],
+            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}},
+            "isError": false
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown_arguments_ignored",
+      "request": {"jsonrpc": "2.0", "id": 44, "method": "tools/call", "params": {"name": "sys_info", "arguments": {"bogus": [1, 2]}}},
+      "expect": {
+        "status": 200,
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 44,
+          "result": {
+            "content": [{"type": "text", "text": {"*str": null}}],
+            "structuredContent": {"node": {"*str": null}, "hostname": {"*str": null}, "os": "Linux", "machine": "x86_64", "loadavg_raw": {"*str": null}, "uptime_raw": {"*str": null}, "mem": {"MemTotal": {"*int": null}, "MemAvailable": {"*int": null}}},
+            "isError": false
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "description": "exec_wait: long-poll until done or timeout. Success on a finished echo session (full drained output); timeout expiry on a live /bin/sleep session reports done=false with exit_code null. The live sleep session is reaped by harness teardown. The session is resolved before optional-argument types are validated: an unknown session_id beats a bad timeout type and answers UnknownSession — the mirror image of exec_write's data_b64-first gate.",
+  "platforms": ["posix"],
+  "platforms_reason": "golden session argv use POSIX paths; Windows goldens are future work",
+  "cases": [
+    {
+      "name": "setup_start_echo",
+      "request": {"jsonrpc": "2.0", "id": 95, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/echo", "compat-wait"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 95, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "wait_until_done_full_drain",
+      "request": {"jsonrpc": "2.0", "id": 58, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid", "timeout": 10}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 58, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": true, "exit_code": 0, "stdout": "compat-wait\n", "stderr": "", "stdout_offset": 12, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+      }
+    },
+    {
+      "name": "setup_start_sleep_for_timeout_expiry",
+      "request": {"jsonrpc": "2.0", "id": 96, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": ["/bin/sleep", "30"]}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 96, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "session_id": {"*int": null}, "pid": {"*int": null}}, "isError": false}},
+        "capture": {"sid2": "result.structuredContent.session_id"}
+      }
+    },
+    {
+      "name": "wait_timeout_expiry_done_false",
+      "request": {"jsonrpc": "2.0", "id": 97, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid2", "timeout": 1}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 97, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "done": false, "exit_code": null, "stdout": "", "stderr": "", "stdout_offset": 0, "stderr_offset": 0, "truncated_stdout": false, "truncated_stderr": false, "duration_ms": {"*int": null}}, "isError": false}}
+      }
+    },
+    {
+      "name": "missing_session_id",
+      "request": {"jsonrpc": "2.0", "id": 83, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 83, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingSession"}, "isError": false}}
+      }
+    },
+    {
+      "name": "timeout_wrong_type_invalid_params",
+      "request": {"jsonrpc": "2.0", "id": 84, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": "$sid2", "timeout": "abc"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 84, "error": {"code": -32602, "message": "Invalid params"}}
+      }
+    },
+    {
+      "name": "unknown_session_checked_before_timeout_type",
+      "request": {"jsonrpc": "2.0", "id": 98, "method": "tools/call", "params": {"name": "exec_wait", "arguments": {"session_id": 999999, "timeout": "abc"}}},
+      "expect": {
+        "status": 200,
+        "response": {"jsonrpc": "2.0", "id": 98, "result": {"content": [{"type": "text", "text": "{\"ok\":false,\"error\":\"UnknownSession\"}"}], "structuredContent": {"ok": false, "error": "UnknownSession"}, "isError": false}}
+      }
+    }
+  ]
+}
