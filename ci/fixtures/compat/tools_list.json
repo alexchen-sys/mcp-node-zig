@@ -1,9 +1,13 @@
 {
-  "description": "tools/list advertises exactly the 13 v0 tools, in the frozen literal order, each with a description, a human-readable title and MCP annotation hints (subset match: extra schema keys like properties and their descriptions are allowed and not pinned byte-exact). Also pins the tools/call envelope for an unknown tool name, including the tools/list recovery hint.",
+  "description": "tools/list advertises exactly the 13 v0 tools, in the frozen literal order, each with a description, a human-readable title, an outputSchema (subset-pinned to its presence and object type only) and MCP annotation hints (subset match: extra schema keys like properties and their descriptions are allowed and not pinned byte-exact). Also pins the tools/call envelope for an unknown tool name, including the tools/list recovery hint.",
   "cases": [
     {
       "name": "exact_13_tools_in_frozen_order",
-      "request": {"jsonrpc": "2.0", "id": 42, "method": "tools/list"},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/list"
+      },
       "expect": {
         "status": 200,
         "match": "subset",
@@ -12,19 +16,285 @@
           "id": 42,
           "result": {
             "tools": [
-              {"name": "sys_info", "title": "System Info", "description": {"*str": null}, "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "exec", "title": "Run Command (no shell)", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["argv"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}},
-              {"name": "exec_start", "title": "Start Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["argv"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}},
-              {"name": "exec_poll", "title": "Poll Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "exec_write", "title": "Write To Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id", "data_b64"]}, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}},
-              {"name": "exec_kill", "title": "Kill Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}},
-              {"name": "exec_close", "title": "Close Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "exec_wait", "title": "Wait For Session", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["session_id"]}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "exec_list", "title": "List Sessions", "description": {"*str": null}, "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "exec_shell", "title": "Run Shell Script", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["script"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}},
-              {"name": "read_file", "title": "Read File", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["path"]}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
-              {"name": "write_file", "title": "Write File", "description": {"*str": null}, "inputSchema": {"type": "object", "required": ["path", "content_b64"]}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}},
-              {"name": "list_dir", "title": "List Directory", "description": {"*str": null}, "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+              {
+                "name": "sys_info",
+                "title": "System Info",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object"
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec",
+                "title": "Run Command (no shell)",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "argv"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_start",
+                "title": "Start Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "argv"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_poll",
+                "title": "Poll Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "session_id"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_write",
+                "title": "Write To Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "session_id",
+                    "data_b64"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_kill",
+                "title": "Kill Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "session_id"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_close",
+                "title": "Close Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "session_id"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_wait",
+                "title": "Wait For Session",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "session_id"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_list",
+                "title": "List Sessions",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object"
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "exec_shell",
+                "title": "Run Shell Script",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "script"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "read_file",
+                "title": "Read File",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "path"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "write_file",
+                "title": "Write File",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object",
+                  "required": [
+                    "path",
+                    "content_b64"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": false,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              },
+              {
+                "name": "list_dir",
+                "title": "List Directory",
+                "description": {
+                  "*str": null
+                },
+                "inputSchema": {
+                  "type": "object"
+                },
+                "annotations": {
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                },
+                "outputSchema": {
+                  "type": "object"
+                }
+              }
             ]
           }
         }
@@ -32,10 +302,30 @@
     },
     {
       "name": "unknown_tool_envelope_is_error_without_structured_content",
-      "request": {"jsonrpc": "2.0", "id": 51, "method": "tools/call", "params": {"name": "no_such_tool_v0", "arguments": {}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": {
+          "name": "no_such_tool_v0",
+          "arguments": {}
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 51, "result": {"content": [{"type": "text", "text": "Unknown tool: no_such_tool_v0; call tools/list for available tools"}], "isError": true}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 51,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Unknown tool: no_such_tool_v0; call tools/list for available tools"
+              }
+            ],
+            "isError": true
+          }
+        }
       }
     }
   ]
