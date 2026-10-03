@@ -406,7 +406,9 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
         std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
         if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
-            try sendHttpError(ra, fd, 401, "unauthorized", "unauthorized", timeout_ms);
+            // Same body for a missing and for a wrong token: the message must
+            // not leak which of the two it was (constant-time semantics).
+            try sendHttpError(ra, fd, 401, "unauthorized", "missing or invalid X-Node-Token header", timeout_ms);
             return false;
         }
     }
