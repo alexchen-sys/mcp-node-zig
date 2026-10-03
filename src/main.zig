@@ -9,6 +9,8 @@ const proc = @import("os/proc.zig");
 const util = @import("util.zig");
 const http = @import("http.zig");
 const session_mod = @import("session.zig");
+const config = @import("config.zig");
+const env_state = @import("env_state.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -25,27 +27,8 @@ const EXEC_DEFAULT_TIMEOUT_S: i64 = 120; // mirrored in TOOLS_JSON prose
 const EXEC_MAX_TIMEOUT_S: i64 = 1800;
 const WAIT_DEFAULT_TIMEOUT_S: i64 = 30; // mirrored in TOOLS_JSON prose
 const WAIT_MAX_TIMEOUT_S: i64 = 300;
-const TOKEN_FILE_MAX_BYTES: usize = 4096;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
-const MIN_INFLIGHT_BYTES: u64 = 1024 * 1024; // config floor: below this the in-flight budget is unusable
-
-const Config = struct {
-    name: []const u8,
-    host: []const u8,
-    port: u16,
-    token: []const u8,
-    allowed_hosts: [][]const u8,
-    allowed_origins: [][]const u8,
-    max_out: usize,
-    socket_timeout_s: u16,
-    max_conn: u16,
-    max_sessions: u16,
-    session_ttl_s: u32,
-    max_inflight_bytes: u64,
-    sessions: ?*session_mod.SessionStore = null,
-    inflight: ?*InflightGate = null,
-};
 
 const RpcResponse = struct {
     status: u16,
@@ -73,38 +56,9 @@ const ConnGate = struct {
     }
 };
 
-/// Global budget of in-flight request-body bytes (default 64 MiB via
-/// MCP_NODE_MAX_INFLIGHT_BYTES). Bytes are reserved after the gates pass but
-/// BEFORE the body allocation/read, and released on every exit path —
-/// success, error, or disconnect. Only declared body bytes count (arena
-/// growth and response buffers are not budgeted; the contract is in-flight
-/// request bodies).
-const InflightGate = struct {
-    mutex: std.Io.Mutex = .init,
-    io: Io,
-    in_use: u64 = 0,
-    max: u64,
-
-    fn tryReserve(self: *InflightGate, bytes: usize) bool {
-        if (bytes == 0) return true;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (bytes > self.max - self.in_use) return false;
-        self.in_use += bytes;
-        return true;
-    }
-
-    fn release(self: *InflightGate, bytes: usize) void {
-        if (bytes == 0) return;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.in_use -= bytes;
-    }
-};
-
 const Connection = struct {
     io: Io,
-    cfg: *const Config,
+    cfg: *const config.Config,
     gate: *ConnGate,
     stream: Io.net.Stream,
 };
@@ -115,17 +69,17 @@ pub fn main() !void {
     const arena = arena_state.allocator();
 
     // Cross-platform environment snapshot (linux: /proc/self/environ).
-    process_environ = try os.loadEnviron(std.heap.page_allocator);
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = process_environ });
+    env_state.process_environ = try os.loadEnviron(std.heap.page_allocator);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
     defer threaded.deinit();
     const io = threaded.io();
 
-    var cfg = try loadConfig(arena, io);
+    var cfg = try config.loadConfig(arena, io);
     var sessions = session_mod.SessionStore.init(io, cfg.max_sessions);
     sessions.ttl_ms = @as(i64, cfg.session_ttl_s) * 1000;
     cfg.sessions = &sessions;
     var gate = ConnGate{ .io = io, .max = cfg.max_conn };
-    var inflight = InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
+    var inflight = config.InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
     cfg.inflight = &inflight;
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
@@ -204,7 +158,7 @@ fn lingerBeforeClose(io: Io, fd: std.posix.fd_t) void {
     }
 }
 
-fn rejectBusy(cfg: *const Config, io: Io, stream: *Io.net.Stream) void {
+fn rejectBusy(cfg: *const config.Config, io: Io, stream: *Io.net.Stream) void {
     var buf: [1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
@@ -216,91 +170,6 @@ fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} on {s}:{d} path=/mcp\n", .{ msg, host, port }) catch return;
     os.writeAllFd(os.stderrFd(), line) catch {};
-}
-
-fn loadConfig(arena: Allocator, io: Io) !Config {
-    const name = getEnv(arena, "MCP_NODE_NAME") orelse "mcp-node";
-    const host = getEnv(arena, "MCP_NODE_HOST") orelse "127.0.0.1";
-    const port_s = getEnv(arena, "MCP_NODE_PORT") orelse "8341";
-    const port = try std.fmt.parseInt(u16, port_s, 10);
-    const max_out_s = getEnv(arena, "MCP_NODE_MAX_OUT") orelse "400000";
-    const max_out = try std.fmt.parseInt(usize, max_out_s, 10);
-    const socket_timeout_s = getEnv(arena, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
-    var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
-    if (socket_timeout == 0) socket_timeout = 60;
-    const max_conn_s = getEnv(arena, "MCP_NODE_MAX_CONN") orelse "128";
-    var max_conn = try std.fmt.parseInt(u16, max_conn_s, 10);
-    if (max_conn == 0) max_conn = 128;
-    const max_sessions_s = getEnv(arena, "MCP_NODE_MAX_SESSIONS") orelse "64";
-    var max_sessions = try std.fmt.parseInt(u16, max_sessions_s, 10);
-    if (max_sessions == 0) max_sessions = 64;
-    const session_ttl_s = getEnv(arena, "MCP_NODE_SESSION_TTL_S") orelse "600";
-    var session_ttl = try std.fmt.parseInt(u32, session_ttl_s, 10);
-    if (session_ttl == 0) session_ttl = 600;
-    // Global in-flight request-body budget. An invalid or unusably small
-    // value is a config error (fail fast at startup), not a silent fallback.
-    const inflight_s = getEnv(arena, "MCP_NODE_MAX_INFLIGHT_BYTES") orelse "67108864";
-    const max_inflight_bytes = std.fmt.parseInt(u64, inflight_s, 10) catch {
-        std.debug.print("MCP_NODE_MAX_INFLIGHT_BYTES must be an unsigned integer, got '{s}'\n", .{inflight_s});
-        return error.InvalidConfig;
-    };
-    if (max_inflight_bytes < MIN_INFLIGHT_BYTES) {
-        std.debug.print("MCP_NODE_MAX_INFLIGHT_BYTES must be at least {d}\n", .{MIN_INFLIGHT_BYTES});
-        return error.InvalidConfig;
-    }
-
-    const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = os.fd.readFileAlloc(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
-        // Fail-closed on Windows by design: a missing token
-        // file fails startup there instead of degrading to insecure mode;
-        // the FileNotFound recovery branch is compiled out with the read.
-        if (comptime os.gate_posix_file_io) {
-            return err;
-        } else {
-            break :token_blk switch (err) {
-                error.FileNotFound => insecure_blk: {
-                    const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
-                    if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-                    break :insecure_blk try arena.dupe(u8, "");
-                },
-                else => return err,
-            };
-        }
-    };
-    const token = std.mem.trim(u8, token_raw, " \t\r\n");
-    if (token.len == 0) {
-        const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
-        if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-    }
-
-    const hosts_s = getEnv(arena, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
-    const origins_s = getEnv(arena, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
-    return .{
-        .name = name,
-        .host = try arena.dupe(u8, host),
-        .port = port,
-        .token = try arena.dupe(u8, token),
-        .allowed_hosts = try util.splitCsv(arena, hosts_s),
-        .allowed_origins = try util.splitCsv(arena, origins_s),
-        .max_out = max_out,
-        .socket_timeout_s = socket_timeout,
-        .max_conn = max_conn,
-        .max_sessions = max_sessions,
-        .session_ttl_s = session_ttl,
-        .max_inflight_bytes = max_inflight_bytes,
-    };
-}
-
-/// Process environment snapshot, loaded once in `main` before any
-/// connection thread spawns and only read afterwards (the daemon never
-/// calls setenv), so sharing it across threads needs no synchronization.
-var process_environ: std.process.Environ = .empty;
-
-/// All environment reads go through the OS layer's cross-platform
-/// snapshot lookup. Linux reads `/proc/self/environ`
-/// source, same parse, same degrade-to-null-on-missing semantics.
-fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
-    return os.environGet(arena, process_environ, key);
 }
 
 /// Serve one HTTP request on an accepted stream. Returns true while the
@@ -316,7 +185,7 @@ fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
 /// current request (the coalesced head of a pipelined next request); they
 /// seed the next request on this connection instead of being dropped, which
 /// is what keeps pipelined peers from desyncing.
-fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *std.ArrayList(u8)) !bool {
+fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream, carry: *std.ArrayList(u8)) !bool {
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
@@ -507,7 +376,7 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *s
 /// plus the serialized response body: transport errors (parse, shape) map to
 /// HTTP 4xx, method-level errors stay inside a 200 JSON-RPC error object.
 /// Notifications (no id, or method "notifications/*") get 202 with empty body.
-fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !RpcResponse {
+fn handleRpc(arena: Allocator, io: Io, cfg: *const config.Config, body: []const u8) !RpcResponse {
     const req = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch {
         return .{ .status = 400, .body = try rpcError(arena, Value.null, -32700, "Parse error") };
     };
@@ -629,7 +498,7 @@ fn supportedProtocolVersion(v: []const u8) bool {
         std.mem.eql(u8, v, "2025-11-25");
 }
 
-fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, params_v: ?Value) !RpcResponse {
+fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value, params_v: ?Value) !RpcResponse {
     const params = params_v orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     if (params != .object) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     const name_v = params.object.get("name") orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
@@ -656,7 +525,7 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, param
     return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
 }
 
-fn dispatchTool(arena: Allocator, io: Io, cfg: *const Config, name: []const u8, args: Value, out: *std.ArrayList(u8)) !void {
+fn dispatchTool(arena: Allocator, io: Io, cfg: *const config.Config, name: []const u8, args: Value, out: *std.ArrayList(u8)) !void {
     if (std.mem.eql(u8, name, "exec")) return toolExec(arena, io, cfg, args, out);
     if (std.mem.eql(u8, name, "exec_start")) return toolExecStart(arena, io, cfg, args, out);
     if (std.mem.eql(u8, name, "exec_poll")) return toolExecPoll(arena, io, cfg, args, out);
@@ -730,7 +599,7 @@ fn buildErrorPayload(out: *std.ArrayList(u8), arena: Allocator, msg: []const u8)
     try out.appendSlice(arena, "}");
 }
 
-fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const argv_v = util.objGet(args, "argv") orelse return error.MissingArgv;
     if (argv_v != .array) return error.BadArgv;
     if (argv_v.array.items.len == 0) return error.BadArgv;
@@ -781,7 +650,7 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
     try out.appendSlice(arena, "}");
 }
 
-fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecShell(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const script = (try util.optStrArg(args, "script")) orelse return error.MissingScript;
     const default_shell: []const u8 = if (comptime builtin.os.tag == .windows) "cmd" else "bash";
     const shell = (try util.optStrArg(args, "shell")) orelse default_shell;
@@ -818,7 +687,7 @@ fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 /// Resolve session_id to a live Session with +1 ref. Caller MUST balance
 /// with `defer session_mod.sessionRelease(session)` — the store ref alone does not
 /// protect against concurrent exec_close freeing the session.
-fn sessionFromArgs(cfg: *const Config, args: Value) !*session_mod.Session {
+fn sessionFromArgs(cfg: *const config.Config, args: Value) !*session_mod.Session {
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const id_i = (try util.optIntArg(args, "session_id")) orelse return error.MissingSession;
     if (id_i <= 0) return error.BadSession;
@@ -829,7 +698,7 @@ fn sessionFromArgs(cfg: *const Config, args: Value) !*session_mod.Session {
 /// Ownership: argv/cwd/stdin_fd transfer to the Session on success; on any
 /// error path the errdefers free them exactly once. The child is always
 /// reaped — either by the session waiter thread or by the error path.
-fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const argv_v = util.objGet(args, "argv") orelse return error.MissingArgv;
     if (argv_v != .array) return error.BadArgv;
@@ -1019,7 +888,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "}");
 }
 
-fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecPoll(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer session_mod.sessionRelease(session);
@@ -1028,7 +897,7 @@ fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     try session_mod.renderSessionState(arena, cfg.sessions.?, session, stdout_offset, stderr_offset, out);
 }
 
-fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecWait(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer session_mod.sessionRelease(session);
@@ -1050,7 +919,7 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     try session_mod.renderSessionState(arena, store, session, stdout_offset, stderr_offset, out);
 }
 
-fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
+fn toolExecList(arena: Allocator, io: Io, cfg: *const config.Config, out: *std.ArrayList(u8)) !void {
     _ = io;
     const store = cfg.sessions orelse return error.SessionsDisabled;
     store.reapDone();
@@ -1092,7 +961,7 @@ fn toolExecList(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayLis
     try out.appendSlice(arena, "]}");
 }
 
-fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecWrite(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
     // Validate protocol-level argument types before resolving the session:
     // a wrong-typed argument is -32602 regardless of whether the session id
@@ -1126,7 +995,7 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "}");
 }
 
-fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecKill(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const session = try sessionFromArgs(cfg, args);
     defer session_mod.sessionRelease(session);
     // session_mod.killTreeGuarded serializes check+kill against the waiter's reap: the
@@ -1139,7 +1008,7 @@ fn toolExecKill(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
 /// Idempotent session teardown: kill if running, join all session threads,
 /// drop the store's ref. Safe against concurrent exec_close — the loser of
 /// the removal race reports already_closed and frees nothing.
-fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolExecClose(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const session = sessionFromArgs(cfg, args) catch |err| switch (err) {
         error.UnknownSession => {
@@ -1166,7 +1035,7 @@ fn toolExecClose(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "{\"ok\":true}");
 }
 
-fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList(u8)) !void {
+fn toolSysInfo(arena: Allocator, io: Io, cfg: *const config.Config, out: *std.ArrayList(u8)) !void {
     _ = cfg;
     // Per-OS fetchers live in os.sysinfo; every field
     // degrades independently to ""/0.
@@ -1186,7 +1055,7 @@ fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList
     try out.appendSlice(arena, "}}");
 }
 
-fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolReadFile(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
     const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse return error.MissingPath);
     const offset = (try util.optIntArg(args, "offset")) orelse 0;
@@ -1218,7 +1087,7 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     try out.appendSlice(arena, "}");
 }
 
-fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolWriteFile(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
     const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse return error.MissingPath);
     const content_b64 = (try util.optStrArg(args, "content_b64")) orelse return error.MissingContent;
@@ -1256,7 +1125,7 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     try out.appendSlice(arena, "}");
 }
 
-fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
+fn toolListDir(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
     const path = try expandPath(arena, io, (try util.optStrArg(args, "path")) orelse ".");
     var dir = std.Io.Dir.openDir(.cwd(), io, path, .{ .iterate = true }) catch |err| switch (err) {
@@ -1332,7 +1201,7 @@ fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
     // %HOMEDRIVE%%HOMEPATH% fallback on Windows).
     if (path.len == 0 or path[0] != '~') return path;
     if (path.len > 1 and path[1] != '/') return path; // "~user" unsupported
-    const home = os.homeDir(arena, process_environ) orelse return path;
+    const home = os.homeDir(arena, env_state.process_environ) orelse return path;
     if (home.len == 0) return path;
     return std.mem.concat(arena, u8, &.{ home, path[1..] });
 }
@@ -1360,7 +1229,7 @@ test "rpc parse error and notification semantics" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = Io.Threaded.global_single_threaded.io();
-    const cfg = Config{
+    const cfg = config.Config{
         .name = "test-node",
         .host = "127.0.0.1",
         .port = 1,
