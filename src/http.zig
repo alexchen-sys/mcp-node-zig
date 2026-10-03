@@ -723,3 +723,654 @@ test "expect continue matching is case insensitive and whitespace trimmed" {
     try std.testing.expect(!(try parseHead("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341")).expect_continue);
     try std.testing.expect(!(try parseHead("POST /mcp HTTP/1.1")).expect_continue);
 }
+
+// ---------------------------------------------------------------------------
+// fd-level framing tests (POSIX only).
+//
+// Every fd-level test drives the real serve loop (serveOneRequest) over a
+// loopback TCP pair: the peer end plays the HTTP client (writes request
+// bytes, reads back the 100-continue interim response and the final status
+// line), the subject end is the accepted stream serveOneRequest owns. A
+// genuine TCP pair is required because setSocketTimeouts arms TCP_NODELAY
+// and socket timeouts, which an AF_UNIX socketpair cannot carry. Windows
+// skips these at runtime; the helpers below are referenced only from
+// comptime-gated branches, so they are never analyzed for that target.
+// ---------------------------------------------------------------------------
+
+const builtin = @import("builtin");
+
+const TestSock = struct {
+    peer: std.posix.fd_t,
+    subject: std.posix.fd_t,
+};
+
+/// A connected TCP pair over the loopback: `peer` is the client side,
+/// `subject` the accepted server side. The listener is closed right after
+/// the accept: both ends live on as plain fds owned by the caller.
+fn testSocketPair(io: Io) !TestSock {
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const addr = server.socket.address;
+    const client = try addr.connect(io, .{ .mode = .stream });
+    const server_side = try server.accept(io);
+    return .{ .peer = client.socket.handle, .subject = server_side.socket.handle };
+}
+
+fn testShutdownWrite(fd: std.posix.fd_t) void {
+    if (comptime builtin.os.tag == .linux) {
+        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.WR);
+    } else {
+        // libc POSIX path (macOS et al.).
+        _ = std.c.shutdown(fd, std.posix.SHUT.WR);
+    }
+}
+
+fn testSocketReadable(fd: std.posix.fd_t) bool {
+    return testWaitReadable(fd, 0);
+}
+
+/// Polls `fd` for readability, waiting up to `timeout_ms`. Returns false on
+/// timeout or poll failure, so callers can fail the test explicitly instead
+/// of hanging on a blocking read.
+fn testWaitReadable(fd: std.posix.fd_t, timeout_ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return false;
+    return n == 1 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+/// Writes `bytes` from a helper thread. The writer normally finishes before
+/// the fds close, so `catch {}` only guards a close race.
+fn testWriteAllIgnoringErrors(fd: std.posix.fd_t, bytes: []const u8) void {
+    os.writeAllFd(fd, bytes) catch {};
+}
+
+/// Minimal listen-mode config for the fd-level tests: empty token (auth gate
+/// passes), a single wildcard-port allowed host, no in-flight budget.
+fn testServeConfig() config.Config {
+    return .{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 8341,
+        .token = "",
+        .allowed_hosts = @constCast(&[_][]const u8{"127.0.0.1:*"}),
+        .allowed_origins = @constCast(&[_][]const u8{}),
+        .max_out = 4096,
+        .socket_timeout_s = 2,
+        .max_conn = 8,
+        .max_sessions = 8,
+        .session_ttl_s = 60,
+        .max_inflight_bytes = 1024 * 1024,
+    };
+}
+
+const TestServeOutcome = struct {
+    keep: bool,
+    /// The bytes the client (peer) received: the 100-continue interim
+    /// response first, then the final response, when both were sent.
+    response: []const u8,
+};
+
+/// Runs one serveOneRequest cycle on the subject end and returns what the
+/// client saw. The response is read only when the peer reports readability
+/// within 2 s, so the clean-EOF path (nothing written) is testable too.
+fn testServeRequest(io: Io, arena: Allocator, sock: TestSock, carry: *std.ArrayList(u8)) !TestServeOutcome {
+    var stream = Io.net.Stream{ .socket = .{ .handle = sock.subject, .address = undefined } };
+    const cfg = testServeConfig();
+    const keep = try serveOneRequest(io, &cfg, &stream, carry);
+    var response: []const u8 = "";
+    if (testWaitReadable(sock.peer, 2000)) {
+        var buf: [4096]u8 = undefined;
+        const m = try std.posix.read(sock.peer, &buf);
+        response = try arena.dupe(u8, buf[0..m]);
+    }
+    return .{ .keep = keep, .response = response };
+}
+
+test "read http request extracts full post request" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // A complete, well-formed POST through every gate: the head is
+        // parsed, the body delivered byte-exact, and the JSON-RPC layer
+        // answers 202 for a notification — proof the framing survived.
+        const body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        const request = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:8341\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "\r\n" ++
+            "{s}", .{ body.len, body });
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
+    }
+}
+
+test "read http request extracts lowercase header names" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Header names arrive lowercased, as some clients and proxies send
+        // them: every field must still be matched case-insensitively.
+        const request = "POST /mcp HTTP/1.1\r\n" ++
+            "host: 127.0.0.1:8341\r\n" ++
+            "content-type: application/json\r\n" ++
+            "content-length: 5\r\n" ++
+            "\r\n" ++
+            "hello";
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        // "hello" is not JSON: the RPC layer answers 400 parse error, which
+        // still proves the lowercase head passed every gate.
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+    }
+}
+
+test "read http request body containing crlfcrlf sequence" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // The first CRLFCRLF must terminate the head; a CRLFCRLF inside
+        // the body is ordinary body payload bounded by Content-Length.
+        const body = "{\"v\":\"a\r\n\r\nb\"}";
+        const request = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:8341\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "\r\n" ++
+            "{s}GARBAGE", .{ body.len, body });
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        // Three observable facts pin the framing down:
+        //  * 400 with -32700: raw CR/LF inside a JSON string makes the body
+        //    invalid JSON, so the RPC layer answered parse error — the body
+        //    bytes (including the embedded CRLFCRLF) reached the parser.
+        //  * carry == "GARBAGE": the serve loop consumed exactly
+        //    Content-Length body bytes; the first CRLFCRLF in the stream
+        //    terminated the head, not the one inside the body.
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "-32700") != null);
+        try std.testing.expectEqualStrings("GARBAGE", carry.items);
+    }
+}
+
+test "read http request sends 100 continue for expect header" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        const request = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:8341\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Expect: 100-continue\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "\r\n" ++
+            "{s}", .{ body.len, body });
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+
+        // The interim response was written before the body read started, so
+        // it is buffered on the peer end ahead of the final response.
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 100 Continue\r\n\r\n"));
+        // The request body still arrived in full: the final answer is 202.
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "HTTP/1.1 202") != null);
+    }
+}
+
+test "read http request ignores non continue expect value" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Any Expect value other than 100-continue is rejected outright by
+        // the strict parser (417), never silently ignored: no interim
+        // response is sent and the connection is closed.
+        const request = "POST /mcp HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:8341\r\n" ++
+            "Expect: tokens-still-valid\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n" ++
+            "hello";
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 417"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "HTTP/1.1 100") == null);
+    }
+}
+
+test "read http request skips 100 continue without body" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // The interim response only buys time for a body that is actually
+        // coming: with no Content-Length at all — or a zero one — there is
+        // nothing to continue into and no interim is sent. The RPC layer
+        // answers 400 parse error for the empty body either way.
+        const no_length = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nExpect: 100-continue\r\n\r\n";
+        const zero_length = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n";
+
+        for ([_][]const u8{ no_length, zero_length }) |request| {
+            const sock = try testSocketPair(io);
+            defer os.closeFd(sock.peer);
+            defer os.closeFd(sock.subject);
+            try os.writeAllFd(sock.peer, request);
+
+            var carry: std.ArrayList(u8) = .empty;
+            const out = try testServeRequest(io, arena, sock, &carry);
+            try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+            // No interim response was sent: the first buffered bytes are the
+            // final answer, not a 100 Continue.
+            try std.testing.expect(!std.mem.startsWith(u8, out.response, "HTTP/1.1 100"));
+        }
+    }
+}
+
+test "read http request rejects malformed content length" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Garbage, empty, and negative values all answer 400 with the
+        // BadContentLength reason named in the response body.
+        for ([_][]const u8{
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: abc\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length:\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: -1\r\n\r\n",
+        }) |request| {
+            const sock = try testSocketPair(io);
+            defer os.closeFd(sock.peer);
+            defer os.closeFd(sock.subject);
+            try os.writeAllFd(sock.peer, request);
+
+            var carry: std.ArrayList(u8) = .empty;
+            const out = try testServeRequest(io, arena, sock, &carry);
+            try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+            try std.testing.expect(std.mem.indexOf(u8, out.response, "BadContentLength") != null);
+        }
+    }
+}
+
+test "read http request rejects conflicting duplicate content length" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Conflicting duplicates (request smuggling vector) answer 400.
+        {
+            const sock = try testSocketPair(io);
+            defer os.closeFd(sock.peer);
+            defer os.closeFd(sock.subject);
+            try os.writeAllFd(sock.peer, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nAB");
+
+            var carry: std.ArrayList(u8) = .empty;
+            const out = try testServeRequest(io, arena, sock, &carry);
+            try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+            try std.testing.expect(std.mem.indexOf(u8, out.response, "BadContentLength") != null);
+        }
+
+        // Identical duplicates are accepted: the body is delivered in full.
+        {
+            const body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+            const sock = try testSocketPair(io);
+            defer os.closeFd(sock.peer);
+            defer os.closeFd(sock.subject);
+            try os.writeAllFd(sock.peer, try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body.len, body }));
+
+            var carry: std.ArrayList(u8) = .empty;
+            const out = try testServeRequest(io, arena, sock, &carry);
+            try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
+        }
+    }
+}
+
+test "read http request rejects oversized content length" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Cheap by design: only the header is sent; the serve loop must
+        // reject on Content-Length alone without waiting for body bytes.
+        const request = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: {d}\r\n\r\n", .{MAX_BODY_BYTES + 1});
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 413"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "RequestTooLarge") != null);
+    }
+}
+
+test "read http request short body after eof errors" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Content-Length announces 10 bytes, only 5 arrive before EOF: the
+        // declared body never fully arrived and the client is told so.
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\nfive!");
+        testShutdownWrite(sock.peer);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "ShortBody") != null);
+    }
+}
+
+test "read http request unterminated headers error on eof" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Headers never terminated by CRLFCRLF, then EOF: BadHeaders.
+        // LF-only line endings never form the CRLFCRLF terminator either.
+        for ([_][]const u8{
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\n",
+            "POST /mcp HTTP/1.1\nHost: 127.0.0.1:8341\n\n",
+        }) |request| {
+            const sock = try testSocketPair(io);
+            defer os.closeFd(sock.peer);
+            defer os.closeFd(sock.subject);
+            try os.writeAllFd(sock.peer, request);
+            testShutdownWrite(sock.peer);
+
+            var carry: std.ArrayList(u8) = .empty;
+            const out = try testServeRequest(io, arena, sock, &carry);
+            try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+            try std.testing.expect(std.mem.indexOf(u8, out.response, "BadHeaders") != null);
+        }
+    }
+}
+
+test "read http request clean eof on empty socket" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // A keep-alive connection closed before any request bytes arrived:
+        // the serve loop ends quietly — no zombie 400 into a dying socket.
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        testShutdownWrite(sock.peer);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expectEqual(false, out.keep);
+        try std.testing.expectEqual(@as(usize, 0), out.response.len);
+    }
+}
+
+test "read http request oversized headers rejected" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // ~69KB of header bytes with no CRLFCRLF terminator. The payload is
+        // written from a helper thread: once the serve loop stops reading
+        // (it answers 431 at the 64 KiB cap), the loopback stack can apply
+        // backpressure to the sender, so a blocking write on the test thread
+        // would deadlock before the answer is even read.
+        const oversized = try arena.alloc(u8, MAX_HEADER_BYTES + 5 * 1024);
+        @memset(oversized, 'A');
+
+        const sock = try testSocketPair(io);
+        const writer = std.Thread.spawn(.{}, testWriteAllIgnoringErrors, .{ sock.peer, oversized }) catch |err| {
+            os.closeFd(sock.peer);
+            os.closeFd(sock.subject);
+            return err;
+        };
+        // Both ends close before the join so the writer always finishes: a
+        // write blocked on a full socket buffer fails once its peer end is
+        // closed, and a late write hits an already-closed fd.
+        defer writer.join();
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 431"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "headers_too_large") != null);
+    }
+}
+
+test "read http request rejects malformed request line" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // A request line with no path component.
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, "POST\r\n\r\n");
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "BadRequestLine") != null);
+    }
+}
+
+test "read http request keeps pipelined bytes as carry for the next request" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Bytes past header_end + Content-Length are the coalesced head of
+        // the next pipelined request: the serve loop never desyncs on them —
+        // the first request is answered intact and the tail is carried over
+        // for the next serveOneRequest call on the same connection.
+        const body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        const request = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}GARBAGE-SECOND-REQUEST", .{ body.len, body });
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
+        try std.testing.expectEqualStrings("GARBAGE-SECOND-REQUEST", carry.items);
+    }
+}
+
+test "read http request rejects chunked transfer encoding" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // Transfer-Encoding is refused outright (request smuggling guard):
+        // the answer names the error, and chunk frames written afterwards
+        // stay unread in the socket — the framing was never interpreted.
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nTransfer-Encoding: chunked\r\n\r\n");
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+        try std.testing.expect(std.mem.indexOf(u8, out.response, "TransferEncodingUnsupported") != null);
+
+        // Frames written after the serve loop returned stay unread in the
+        // socket: chunk framing was never interpreted.
+        try os.writeAllFd(sock.peer, "5\r\nhello\r\n0\r\n\r\n");
+        try std.testing.expect(testSocketReadable(sock.subject));
+    }
+}
+
+test "read http request without content length has empty body" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // No Content-Length: the body is empty and the serve loop treats
+        // the bytes after the header terminator as the head of the next
+        // request, carrying them over instead of reading them as body.
+        // Proof of emptiness: the RPC layer sees an empty body (400 parse
+        // error), never the 202 the unread notification would produce;
+        // proof of preservation: the tail lands in the carry buffer whole.
+        const tail = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+        const request = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\n\r\n" ++ tail;
+
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+        try os.writeAllFd(sock.peer, request);
+
+        var carry: std.ArrayList(u8) = .empty;
+        const out = try testServeRequest(io, arena, sock, &carry);
+        try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
+        try std.testing.expectEqualStrings(tail, carry.items);
+    }
+}
