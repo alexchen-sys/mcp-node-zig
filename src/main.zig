@@ -607,6 +607,15 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *s
         try sendHttpError(ra, fd, 400, "bad_request", "BadHeaders", timeout_ms);
         return false;
     };
+    // The in-loop checkpoint only fires when the accumulator is over the cap
+    // WITHOUT the terminator: a single read that both crosses the cap and
+    // delivers CRLFCRLF takes the `break` above and skips it (possible with
+    // short reads, e.g. on Windows). Re-check the completed head length so
+    // the 431 contract is independent of TCP chunking.
+    if (he > MAX_HEADER_BYTES) {
+        try sendHttpError(ra, fd, 431, "headers_too_large", "request headers too large", timeout_ms);
+        return false;
+    }
     const info = parseHead(data.items[0 .. he - 4]) catch |err| {
         const status: u16 = switch (err) {
             error.RequestTooLarge => 413,
