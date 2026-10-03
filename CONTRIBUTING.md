@@ -16,6 +16,13 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 CI runs these plus smoke and regression tests on Linux, macOS, and Windows.
+The Linux CI job additionally runs `ci/check_tests.sh`: a test-floor gate
+that re-runs `zig build test` and then enforces a manifest — a minimum
+count of `test "` blocks across `src/`, plus the required presence of the
+HTTP framing test names (socketpair-driven serve-loop coverage and
+the pure-function edge cases). When you add tests, bump `MIN_TESTS` and
+extend the required-names list in the same PR; lowering either is a review
+decision, not a mechanical fix.
 
 ## Guidelines
 

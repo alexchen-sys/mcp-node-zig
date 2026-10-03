@@ -67,6 +67,11 @@ jobs:
         shell: bash
         run: zig build test
 
+      - name: Test floor (manifest + count)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ci/check_tests.sh
+
       - name: Release build
         shell: bash
         run: zig build -Doptimize=ReleaseSafe
