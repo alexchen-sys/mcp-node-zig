@@ -456,6 +456,41 @@ class FramingTests(unittest.TestCase):
                 self.assertLess(elapsed, 1.5,
                                 'gate answered only after %.2fs (body read before gate?)' % elapsed)
 
+    def test_expect_continue_never_precedes_gate_rejection(self):
+        """Expect: 100-continue must not let a rejected request skip the
+        gates: the first status line is the rejection, never 100."""
+        cases = [
+            ('unauthorized', dict(token='wrong-token'), 401),
+            ('bad path', dict(path=b'/nope'), 404),
+            ('bad content type', dict(content_type=b'text/plain'), 415),
+        ]
+        for name, kw, expected in cases:
+            with self.subTest(name=name):
+                head = self.node.head_for(1024, extra_headers=[b'Expect: 100-continue'], **kw)
+                sock = self.node.connect()
+                try:
+                    sock.sendall(head)
+                    status, _, _, _ = read_http_response(sock, deadline_s=8)
+                finally:
+                    sock.close()
+                self.assertEqual(status, expected,
+                                 '%s: got %d before the gate answer' % (name, status))
+
+    def test_expect_continue_sent_before_body_when_accepted(self):
+        body = json.dumps({'jsonrpc': '2.0', 'id': 9, 'method': 'ping'}).encode()
+        head = self.node.head_for(len(body), extra_headers=[b'Expect: 100-continue'])
+        sock = self.node.connect()
+        try:
+            sock.sendall(head)
+            status, _, _, _ = read_http_response(sock, deadline_s=8)
+            self.assertEqual(status, 100, 'accepted request with Expect got %d instead of 100' % status)
+            sock.sendall(body)
+            status, _, _, data = read_http_response(sock, deadline_s=8)
+        finally:
+            sock.close()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data).get('id'), 9)
+
     def test_oversize_body_413_before_read(self):
         head = self.node.head_for(BODY_CAP + 1)
         sock = self.node.connect()
