@@ -1511,8 +1511,13 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
     var it = dir.iterate();
     const Item = struct { name: []const u8, kind: []const u8, size: i64, mtime: i64 };
     var items: std.ArrayList(Item) = .empty;
+    var truncated = false;
     while (try it.next(io)) |entry| {
-        if (items.items.len >= LIST_DIR_MAX_ENTRIES) break;
+        if (items.items.len >= LIST_DIR_MAX_ENTRIES) {
+            // One more entry exists beyond the cap: the listing is partial.
+            truncated = true;
+            break;
+        }
         const kind: []const u8 = switch (entry.kind) {
             .directory => "d",
             .sym_link => "l",
@@ -1550,6 +1555,15 @@ fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *
     }
     try out.appendSlice(arena, "],\"count\":");
     try out.print(arena, "{d}", .{items.items.len});
+    // Frozen contract: `truncated` and `has_more` carry the same fact (at
+    // least one entry exists beyond the returned page); both names are
+    // emitted so clients can rely on either spelling. No paging is offered:
+    // the returned set is the first LIST_DIR_MAX_ENTRIES entries, sorted by
+    // name for determinism.
+    try out.appendSlice(arena, ",\"truncated\":");
+    try out.appendSlice(arena, if (truncated) "true" else "false");
+    try out.appendSlice(arena, ",\"has_more\":");
+    try out.appendSlice(arena, if (truncated) "true" else "false");
     try out.appendSlice(arena, "}");
 }
 
