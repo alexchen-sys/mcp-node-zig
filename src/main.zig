@@ -63,6 +63,7 @@ const HeadInfo = struct {
     content_type: ?[]const u8 = null,
     content_length: usize = 0,
     token: ?[]const u8 = null,
+    authorization: ?[]const u8 = null,
     connection: ?[]const u8 = null,
     expect_continue: bool = false,
 };
@@ -629,7 +630,9 @@ fn serveOneRequest(io: Io, cfg: *const Config, stream: *Io.net.Stream, carry: *s
         }
     }
     if (cfg.token.len != 0) {
-        const got = info.token orelse "";
+        // Conflicting credentials count as a failed login, not as a choice.
+        const presented = presentedToken(info) catch null;
+        const got = presented orelse "";
         var got_hash: [32]u8 = undefined;
         var cfg_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
@@ -856,6 +859,9 @@ fn parseHead(head: []const u8) !HeadInfo {
         } else if (asciiEqlIgnoreCase(name, "x-node-token")) {
             if (info.token != null) return error.DuplicateHeader;
             info.token = value;
+        } else if (asciiEqlIgnoreCase(name, "authorization")) {
+            if (info.authorization != null) return error.DuplicateHeader;
+            info.authorization = value;
         } else if (asciiEqlIgnoreCase(name, "connection")) {
             if (info.connection != null) return error.DuplicateHeader;
             info.connection = value;
@@ -877,6 +883,35 @@ fn parseHead(head: []const u8) !HeadInfo {
     }
     info.content_length = seen_cl orelse 0;
     return info;
+}
+
+/// Extract the credential from an `Authorization` value using the Bearer
+/// scheme. The scheme name is case-insensitive (RFC 7235 §2.1) and must be
+/// followed by at least one SP; the credential is trimmed at both ends.
+/// Any other scheme, or an empty credential, yields null (treated as "no
+/// token presented").
+fn bearerToken(value: []const u8) ?[]const u8 {
+    const scheme = "bearer";
+    if (value.len <= scheme.len) return null;
+    if (!asciiEqlIgnoreCase(value[0..scheme.len], scheme)) return null;
+    if (value[scheme.len] != ' ') return null;
+    const cred = std.mem.trim(u8, value[scheme.len..], " \t");
+    if (cred.len == 0) return null;
+    return cred;
+}
+
+/// The token the client presented, from `X-Node-Token` or a Bearer
+/// `Authorization` header. If both carry a token and they differ, the request
+/// is ambiguous and is refused rather than silently picking one.
+fn presentedToken(info: HeadInfo) error{ConflictingTokens}!?[]const u8 {
+    const bearer = if (info.authorization) |a| bearerToken(a) else null;
+    if (info.token) |x| {
+        if (bearer) |b| {
+            if (!std.mem.eql(u8, x, b)) return error.ConflictingTokens;
+        }
+        return x;
+    }
+    return bearer;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -2221,7 +2256,9 @@ fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_ty
         else => "Unknown",
     };
     const connection = if (keep_alive) "keep-alive" else "close";
-    try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ status, reason, content_type, body.len, connection });
+    // RFC 9110 §15.5.2: a 401 must carry a challenge.
+    const challenge = if (status == 401) "www-authenticate: Bearer\r\n" else "";
+    try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n{s}\r\n", .{ status, reason, content_type, body.len, connection, challenge });
     try out.appendSlice(arena, body);
     try os.net.socketWriteAll(fd, out.items, timeout_ms);
 }
@@ -2319,6 +2356,58 @@ test "head parser rejects ambiguous and legacy framing" {
     const info = try parseHead("POST /mcp HTTP/1.1\r\nExpect: 100-continue");
     try std.testing.expect(info.expect_continue);
     try std.testing.expectError(error.BadExpectation, parseHead("POST /mcp HTTP/1.1\r\nExpect: magic"));
+}
+
+test "bearer authorization value parsing" {
+    const scheme = "Bearer";
+    // scheme is case-insensitive
+    try std.testing.expectEqualStrings("abc", bearerToken(scheme ++ " abc").?);
+    try std.testing.expectEqualStrings("abc", bearerToken("bearer abc").?);
+    try std.testing.expectEqualStrings("abc", bearerToken("BEARER abc").?);
+    // one or more spaces after the scheme, credential trimmed
+    try std.testing.expectEqualStrings("abc", bearerToken(scheme ++ "   abc  ").?);
+    // empty credential
+    try std.testing.expect(bearerToken(scheme) == null);
+    try std.testing.expect(bearerToken(scheme ++ " ") == null);
+    try std.testing.expect(bearerToken(scheme ++ "    ") == null);
+    // scheme must be followed by a space, not glued to the credential
+    try std.testing.expect(bearerToken(scheme ++ "abc") == null);
+    try std.testing.expect(bearerToken(scheme ++ "\tabc") == null);
+    // other schemes count as no token
+    try std.testing.expect(bearerToken("Basic dXNlcjpwYXNz") == null);
+    try std.testing.expect(bearerToken("Token abc") == null);
+    try std.testing.expect(bearerToken("") == null);
+}
+
+test "presented token from x-node-token and authorization headers" {
+    const auth = "Authorization: Bear" ++ "er ";
+    // either header alone
+    const x_only = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(x_only)).?);
+    const b_only = try parseHead("POST /mcp HTTP/1.1\r\n" ++ auth ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(b_only)).?);
+    // header name is case-insensitive too
+    const b_lower = try parseHead("POST /mcp HTTP/1.1\r\nauthorization: bear" ++ "er " ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(b_lower)).?);
+    // both present and equal: accepted
+    const same = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\n" ++ auth ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(same)).?);
+    // both present and different: refused, never silently picked
+    const diff = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\n" ++ auth ++ "t2");
+    try std.testing.expectError(error.ConflictingTokens, presentedToken(diff));
+    // Basic is not a token; X-Node-Token still wins on its own
+    const basic = try parseHead("POST /mcp HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz");
+    try std.testing.expect((try presentedToken(basic)) == null);
+    const basic_x = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\nAuthorization: Basic dXNlcjpwYXNz");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(basic_x)).?);
+    // empty bearer credential is no token
+    const empty = try parseHead("POST /mcp HTTP/1.1\r\n" ++ auth);
+    try std.testing.expect((try presentedToken(empty)) == null);
+    // nothing presented
+    const none = try parseHead("POST /mcp HTTP/1.1\r\nHost: a");
+    try std.testing.expect((try presentedToken(none)) == null);
+    // duplicate Authorization is an ambiguous head, like other auth headers
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\n" ++ auth ++ "t1\r\n" ++ auth ++ "t1"));
 }
 
 test "content type accepts only strict application/json media type" {

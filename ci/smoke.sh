@@ -31,4 +31,21 @@ sys=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
 echo "$sys" | grep -q os
 echo "$sys" | grep -q hostname
 
+# Standard bearer auth is accepted alongside X-Node-Token.
+scheme=Bearer
+tok=$(cat "$TF")
+bearer=$(curl -fsS -X POST http://127.0.0.1:8341/mcp \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: ${scheme} ${tok}" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"ping"}')
+echo "$bearer" | grep -q result
+
+# A wrong bearer token gets 401 with a Bearer challenge.
+hdrs=$(curl -s -o /dev/null -D - -X POST http://127.0.0.1:8341/mcp \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: ${scheme} wrong-${tok}" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"ping"}')
+echo "$hdrs" | head -n1 | grep -q ' 401 '
+echo "$hdrs" | grep -qi '^www-authenticate: Bearer'
+
 echo "smoke: OK"
