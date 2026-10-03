@@ -76,12 +76,12 @@ jobs:
         shell: bash
         run: zig build -Doptimize=ReleaseSafe
 
-      - name: Smoke test (auth gate + initialize)
+      - name: Smoke test (auth check + initialize)
         if: runner.os != 'Windows'
         shell: bash
         run: ci/smoke.sh
 
-      - name: Smoke test (auth gate + initialize, Windows)
+      - name: Smoke test (auth check + initialize, Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: ci/smoke.ps1

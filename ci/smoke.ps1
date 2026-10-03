@@ -1,4 +1,4 @@
-# Smoke test: auth gate + initialize + sys_info. Windows (pwsh).
+# Smoke test: auth check + initialize + sys_info. Windows (pwsh).
 $ErrorActionPreference = "Stop"
 
 $tokenFile = Join-Path $env:RUNNER_TEMP "mcp-node-ci-token"

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Test-floor gate: run the unit tests, then verify the test manifest.
+# Test-floor guard: run the unit tests, then verify the test manifest.
 #
 # Zig 0.16 has no coverage instrumentation, so the floor is enforced by a
 # manifest instead: (a) a minimum count of `test "` blocks across src/, and
@@ -7,7 +7,7 @@
 # driven readHttpRequest coverage plus the pure-function edge cases).
 #
 # When you add tests, bump MIN_TESTS and extend REQUIRED_TESTS in the same
-# PR. Lowering either is a review decision, not a mechanical fix.
+# PR. Lowering either is a maintainer decision, not a mechanical fix.
 #
 # Runs from the repo root. The zig binary comes from $ZIG or PATH.
 set -eu
