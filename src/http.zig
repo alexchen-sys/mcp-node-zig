@@ -700,3 +700,26 @@ test "routes: listen mode keeps only /mcp; hub adds /n and /n/<name>/mcp" {
     try std.testing.expect(routeFor(.hub, "/n/pc") == null);
     try std.testing.expect(routeFor(.hub, "/mcp/") == null);
 }
+
+test "content length rejects malformed values and documents plus prefix" {
+    // Documents the std.fmt.parseInt behavior surfaced by parseHead's
+    // content-length handling: garbage, empty, and negative values all
+    // collapse to BadContentLength ("-" on an unsigned parse fails, empty
+    // fails InvalidCharacter), while a leading "+" IS accepted by parseInt
+    // and parses to its plain value.
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: abc"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length:"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: -1"));
+    try std.testing.expectEqual(@as(usize, 5), (try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: +5")).content_length);
+}
+
+test "expect continue matching is case insensitive and whitespace trimmed" {
+    try std.testing.expect((try parseHead("POST /mcp HTTP/1.1\r\nExpect: 100-continue")).expect_continue);
+    try std.testing.expect((try parseHead("POST /mcp HTTP/1.1\r\nEXPECT: 100-Continue")).expect_continue);
+    try std.testing.expect((try parseHead("POST /mcp HTTP/1.1\r\nexpect:  100-continue  ")).expect_continue);
+    // Non-100-continue expectations are rejected outright by parseHead
+    // (BadExpectation) rather than silently ignored.
+    try std.testing.expectError(error.BadExpectation, parseHead("POST /mcp HTTP/1.1\r\nExpect: garbage"));
+    try std.testing.expect(!(try parseHead("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341")).expect_continue);
+    try std.testing.expect(!(try parseHead("POST /mcp HTTP/1.1")).expect_continue);
+}
