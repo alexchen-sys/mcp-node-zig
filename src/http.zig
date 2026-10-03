@@ -1,0 +1,425 @@
+//! HTTP/1.1 transport: strict head parsing, header validation,
+//! auth-token extraction, deadline-bounded reads and raw response
+//! writers. The per-request serving loop (serveOneRequest) still
+//! lives in main.zig.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const os = @import("os.zig");
+const util = @import("util.zig");
+
+pub const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
+
+/// Parsed request head: request line plus the security-relevant headers.
+/// Duplicates of these are rejected at parse time (ambiguous duplicates are
+/// a classic desync primitive), so every field here is single-valued.
+const HeadInfo = struct {
+    method: []const u8,
+    path: []const u8,
+    host: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    content_length: usize = 0,
+    token: ?[]const u8 = null,
+    authorization: ?[]const u8 = null,
+    connection: ?[]const u8 = null,
+    expect_continue: bool = false,
+};
+
+/// Milliseconds left on the absolute request deadline; null when expired.
+pub fn remainingMs(started: std.Io.Timestamp, io: Io, deadline_ms: u64) ?u64 {
+    const elapsed_i = started.untilNow(io, .awake).toMilliseconds();
+    if (elapsed_i < 0) return deadline_ms; // clock moved backwards: keep the full budget
+    const elapsed: u64 = @intCast(elapsed_i);
+    if (elapsed >= deadline_ms) return null;
+    return deadline_ms - elapsed;
+}
+
+/// One socket read bounded by `remaining_ms` — the leftover of the absolute
+/// request deadline, not a fresh per-read timeout. POSIX re-arms SO_RCVTIMEO
+/// per call; Windows enforces the software deadline inside socketReadSome.
+/// Returns 0 on clean EOF; an expired deadline is error.RequestTimeout.
+pub fn readWithDeadline(fd: std.posix.fd_t, buf: []u8, remaining_ms: u64) !usize {
+    os.net.setSocketReadTimeoutMs(fd, remaining_ms) catch return error.SocketOptionFailed;
+    const n = os.net.socketReadSome(fd, buf, remaining_ms) catch |err| {
+        // SO_RCVTIMEO expiry on POSIX, software-deadline expiry on Windows.
+        if (os.net.isReadTimeout(err)) return error.RequestTimeout;
+        return err;
+    };
+    return n;
+}
+
+fn isTokenChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn validToken(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!isTokenChar(c)) return false;
+    }
+    return true;
+}
+
+/// RFC 9110 field-content: HTAB / SP / VCHAR / obs-text only; no other
+/// controls and no DEL.
+fn validHeaderValue(s: []const u8) bool {
+    for (s) |c| {
+        if (c == '\t' or c == ' ') continue;
+        if (c >= 0x21 and c != 0x7f) continue;
+        return false;
+    }
+    return true;
+}
+
+const RequestLine = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+/// Strict HTTP/1.1 request line: exactly `METHOD SP path SP HTTP/1.1`. This
+/// daemon speaks 1.1 semantics (keep-alive by default, 100-continue), so
+/// other versions are refused rather than guessed.
+fn parseRequestLine(line: []const u8) !RequestLine {
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const method = parts.next() orelse return error.BadRequestLine;
+    const path = parts.next() orelse return error.BadRequestLine;
+    const version = parts.next() orelse return error.BadRequestLine;
+    if (parts.next() != null) return error.BadRequestLine;
+    if (!validToken(method)) return error.BadRequestLine;
+    if (path.len == 0 or path[0] != '/') return error.BadRequestLine;
+    for (path) |c| {
+        if (c <= 0x20 or c == 0x7f) return error.BadRequestLine;
+    }
+    if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.BadRequestLine;
+    return .{ .method = method, .path = path };
+}
+
+/// Strict media-type check: exactly `application/json` (case-insensitive),
+/// optionally followed by well-formed `; token=value` parameters such as
+/// charset=utf-8. `application/json-not-real` must not pass a startsWith
+/// shortcut ever again.
+pub fn contentTypeJson(ct: []const u8) bool {
+    var it = std.mem.splitScalar(u8, ct, ';');
+    const media = std.mem.trim(u8, it.first(), " \t");
+    if (!asciiEqlIgnoreCase(media, "application/json")) return false;
+    while (it.next()) |param_raw| {
+        const param = std.mem.trim(u8, param_raw, " \t");
+        if (param.len == 0) return false; // "application/json;" is malformed
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse return false;
+        const name = std.mem.trim(u8, param[0..eq], " \t");
+        const value = std.mem.trim(u8, param[eq + 1 ..], " \t");
+        if (!validToken(name)) return false;
+        if (value.len == 0) return false;
+        if (value[0] == '"') {
+            // quoted-string: must close; no raw CR/LF/DEL inside.
+            if (value.len < 2 or value[value.len - 1] != '"') return false;
+            for (value[1 .. value.len - 1]) |c| {
+                if (c == '\r' or c == '\n' or c == 0x7f) return false;
+            }
+        } else if (!validToken(value)) return false;
+    }
+    return true;
+}
+
+/// Parse and validate the request head (request line + headers, without the
+/// trailing CRLFCRLF). Strict HTTP/1.1 grammar. Security-relevant headers
+/// reject duplicates instead of last-wins. `Transfer-Encoding` is refused
+/// outright: this server speaks Content-Length only, and accepting TE (let
+/// alone TE+CL) would invite request smuggling.
+pub fn parseHead(head: []const u8) !HeadInfo {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    const request_line = lines.next() orelse return error.BadRequestLine;
+    const rl = try parseRequestLine(request_line);
+    var info = HeadInfo{ .method = rl.method, .path = rl.path };
+    var seen_cl: ?usize = null;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // obs-fold (a line starting with SP/HTAB) died with RFC 7230: reject.
+        if (line[0] == ' ' or line[0] == '\t') return error.BadHeader;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
+        const name = line[0..colon];
+        // No whitespace between field name and colon (RFC 9112 §5.1).
+        if (!validToken(name)) return error.BadHeader;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (!validHeaderValue(value)) return error.BadHeader;
+        if (asciiEqlIgnoreCase(name, "host")) {
+            if (info.host != null) return error.DuplicateHeader;
+            info.host = value;
+        } else if (asciiEqlIgnoreCase(name, "origin")) {
+            if (info.origin != null) return error.DuplicateHeader;
+            info.origin = value;
+        } else if (asciiEqlIgnoreCase(name, "content-type")) {
+            if (info.content_type != null) return error.DuplicateHeader;
+            info.content_type = value;
+        } else if (asciiEqlIgnoreCase(name, "x-node-token")) {
+            if (info.token != null) return error.DuplicateHeader;
+            info.token = value;
+        } else if (asciiEqlIgnoreCase(name, "authorization")) {
+            if (info.authorization != null) return error.DuplicateHeader;
+            info.authorization = value;
+        } else if (asciiEqlIgnoreCase(name, "connection")) {
+            if (info.connection != null) return error.DuplicateHeader;
+            info.connection = value;
+        } else if (asciiEqlIgnoreCase(name, "expect")) {
+            if (!asciiEqlIgnoreCase(value, "100-continue")) return error.BadExpectation;
+            if (info.expect_continue) return error.DuplicateHeader;
+            info.expect_continue = true;
+        } else if (asciiEqlIgnoreCase(name, "transfer-encoding")) {
+            return error.TransferEncodingUnsupported;
+        } else if (asciiEqlIgnoreCase(name, "content-length")) {
+            const parsed = std.fmt.parseInt(usize, value, 10) catch return error.BadContentLength;
+            if (parsed > MAX_BODY_BYTES) return error.RequestTooLarge;
+            if (seen_cl) |prev| {
+                if (prev != parsed) return error.BadContentLength;
+            } else {
+                seen_cl = parsed;
+            }
+        }
+    }
+    info.content_length = seen_cl orelse 0;
+    return info;
+}
+
+/// Extract the credential from an `Authorization` value using the Bearer
+/// scheme. The scheme name is case-insensitive (RFC 7235 §2.1) and must be
+/// followed by at least one SP; the credential is trimmed at both ends.
+/// Any other scheme, or an empty credential, yields null (treated as "no
+/// token presented").
+fn bearerToken(value: []const u8) ?[]const u8 {
+    const scheme = "bearer";
+    if (value.len <= scheme.len) return null;
+    if (!asciiEqlIgnoreCase(value[0..scheme.len], scheme)) return null;
+    if (value[scheme.len] != ' ') return null;
+    const cred = std.mem.trim(u8, value[scheme.len..], " \t");
+    if (cred.len == 0) return null;
+    return cred;
+}
+
+/// The token the client presented, from `X-Node-Token` or a Bearer
+/// `Authorization` header. If both carry a token and they differ, the request
+/// is ambiguous and is refused rather than silently picking one.
+pub fn presentedToken(info: HeadInfo) error{ConflictingTokens}!?[]const u8 {
+    const bearer = if (info.authorization) |a| bearerToken(a) else null;
+    if (info.token) |x| {
+        if (bearer) |b| {
+            if (!std.mem.eql(u8, x, b)) return error.ConflictingTokens;
+        }
+        return x;
+    }
+    return bearer;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+pub fn connectionCloseRequested(connection: ?[]const u8) bool {
+    const raw = connection orelse return false;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        if (asciiEqlIgnoreCase(std.mem.trim(u8, part, " \t"), "close")) return true;
+    }
+    return false;
+}
+
+/// Wildcard list match: exact string, or `base:*` matches `base:anything`.
+fn listAllowed(value: []const u8, allowed: [][]const u8) bool {
+    for (allowed) |pat| {
+        if (std.mem.eql(u8, value, pat)) return true;
+        if (std.mem.endsWith(u8, pat, ":*")) {
+            const base = pat[0 .. pat.len - 2];
+            if (std.mem.startsWith(u8, value, base) and value.len > base.len and value[base.len] == ':') return true;
+        }
+    }
+    return false;
+}
+
+pub fn hostAllowed(host_opt: ?[]const u8, allowed: [][]const u8) bool {
+    return listAllowed(host_opt orelse return false, allowed);
+}
+
+pub fn originAllowed(origin: []const u8, allowed: [][]const u8) bool {
+    return listAllowed(origin, allowed);
+}
+
+fn sendHttpRaw(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, timeout_ms: u64) !void {
+    try sendHttpRawMode(arena, fd, status, content_type, body, false, timeout_ms);
+}
+
+pub fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, content_type: []const u8, body: []const u8, keep_alive: bool, timeout_ms: u64) !void {
+    var out: std.ArrayList(u8) = .empty;
+    const reason = switch (status) {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        408 => "Request Timeout",
+        417 => "Expectation Failed",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        421 => "Misdirected Request",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
+        else => "Unknown",
+    };
+    const connection = if (keep_alive) "keep-alive" else "close";
+    // RFC 9110 §15.5.2: a 401 must carry a challenge.
+    const challenge = if (status == 401) "www-authenticate: Bearer\r\n" else "";
+    try out.print(arena, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n{s}\r\n", .{ status, reason, content_type, body.len, connection, challenge });
+    try out.appendSlice(arena, body);
+    try os.net.socketWriteAll(fd, out.items, timeout_ms);
+}
+
+pub fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []const u8, message: []const u8, timeout_ms: u64) !void {
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(arena, "{\"error\":");
+    try util.appendJsonString(&body, arena, code);
+    try body.appendSlice(arena, ",\"message\":");
+    try util.appendJsonString(&body, arena, message);
+    try body.appendSlice(arena, "}");
+    try sendHttpRaw(arena, fd, status, "application/json", body.items, timeout_ms);
+}
+
+test "host allowlist supports exact and wildcard-port patterns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const allowed = try util.splitCsv(arena, "127.0.0.1:*,localhost:*,192.0.2.1:*");
+    try std.testing.expect(hostAllowed("127.0.0.1:8341", allowed));
+    try std.testing.expect(hostAllowed("192.0.2.1:8341", allowed));
+    try std.testing.expect(!hostAllowed("evil.example:8341", allowed));
+}
+
+test "content length rejects overflow and conflicting duplicates" {
+    try std.testing.expectError(error.RequestTooLarge, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 18446744073709551615"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2"));
+    const info = try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2");
+    try std.testing.expectEqual(@as(usize, 2), info.content_length);
+}
+
+test "request line enforces HTTP/1.1 and exact three-token shape" {
+    const ok = try parseRequestLine("POST /mcp HTTP/1.1");
+    try std.testing.expectEqualStrings("POST", ok.method);
+    try std.testing.expectEqualStrings("/mcp", ok.path);
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /mcp HTTP/1.0"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /mcp HTTP/1.1 extra"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST  /mcp HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("PO ST /mcp HTTP/1.1"));
+    try std.testing.expectError(error.BadRequestLine, parseRequestLine("POST /m cp HTTP/1.1"));
+}
+
+test "head parser rejects ambiguous and legacy framing" {
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\nHost: a\r\nHost: a"));
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: a\r\nx-node-token: b"));
+    try std.testing.expectError(error.TransferEncodingUnsupported, parseHead("POST /mcp HTTP/1.1\r\nTransfer-Encoding: chunked"));
+    try std.testing.expectError(error.TransferEncodingUnsupported, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked"));
+    // obs-fold died with RFC 7230
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nX-A: 1\r\n folded"));
+    // whitespace before the colon is a smuggling primitive
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nHost : a"));
+    // control bytes in a value
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\nX-A: a\x07b"));
+    // header line without a colon
+    try std.testing.expectError(error.BadHeader, parseHead("POST /mcp HTTP/1.1\r\njusttext"));
+    // Expect: only 100-continue is legal
+    const info = try parseHead("POST /mcp HTTP/1.1\r\nExpect: 100-continue");
+    try std.testing.expect(info.expect_continue);
+    try std.testing.expectError(error.BadExpectation, parseHead("POST /mcp HTTP/1.1\r\nExpect: magic"));
+}
+
+test "bearer authorization value parsing" {
+    const scheme = "Bearer";
+    // scheme is case-insensitive
+    try std.testing.expectEqualStrings("abc", bearerToken(scheme ++ " abc").?);
+    try std.testing.expectEqualStrings("abc", bearerToken("bearer abc").?);
+    try std.testing.expectEqualStrings("abc", bearerToken("BEARER abc").?);
+    // one or more spaces after the scheme, credential trimmed
+    try std.testing.expectEqualStrings("abc", bearerToken(scheme ++ "   abc  ").?);
+    // empty credential
+    try std.testing.expect(bearerToken(scheme) == null);
+    try std.testing.expect(bearerToken(scheme ++ " ") == null);
+    try std.testing.expect(bearerToken(scheme ++ "    ") == null);
+    // scheme must be followed by a space, not glued to the credential
+    try std.testing.expect(bearerToken(scheme ++ "abc") == null);
+    try std.testing.expect(bearerToken(scheme ++ "\tabc") == null);
+    // other schemes count as no token
+    try std.testing.expect(bearerToken("Basic dXNlcjpwYXNz") == null);
+    try std.testing.expect(bearerToken("Token abc") == null);
+    try std.testing.expect(bearerToken("") == null);
+}
+
+test "presented token from x-node-token and authorization headers" {
+    const auth = "Authorization: Bear" ++ "er ";
+    // either header alone
+    const x_only = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(x_only)).?);
+    const b_only = try parseHead("POST /mcp HTTP/1.1\r\n" ++ auth ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(b_only)).?);
+    // header name is case-insensitive too
+    const b_lower = try parseHead("POST /mcp HTTP/1.1\r\nauthorization: bear" ++ "er " ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(b_lower)).?);
+    // both present and equal: accepted
+    const same = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\n" ++ auth ++ "t1");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(same)).?);
+    // both present and different: refused, never silently picked
+    const diff = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\n" ++ auth ++ "t2");
+    try std.testing.expectError(error.ConflictingTokens, presentedToken(diff));
+    // Basic is not a token; X-Node-Token still wins on its own
+    const basic = try parseHead("POST /mcp HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz");
+    try std.testing.expect((try presentedToken(basic)) == null);
+    const basic_x = try parseHead("POST /mcp HTTP/1.1\r\nX-Node-Token: t1\r\nAuthorization: Basic dXNlcjpwYXNz");
+    try std.testing.expectEqualStrings("t1", (try presentedToken(basic_x)).?);
+    // empty bearer credential is no token
+    const empty = try parseHead("POST /mcp HTTP/1.1\r\n" ++ auth);
+    try std.testing.expect((try presentedToken(empty)) == null);
+    // nothing presented
+    const none = try parseHead("POST /mcp HTTP/1.1\r\nHost: a");
+    try std.testing.expect((try presentedToken(none)) == null);
+    // duplicate Authorization is an ambiguous head, like other auth headers
+    try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\n" ++ auth ++ "t1\r\n" ++ auth ++ "t1"));
+}
+
+test "content type accepts only strict application/json media type" {
+    try std.testing.expect(contentTypeJson("application/json"));
+    try std.testing.expect(contentTypeJson("application/json; charset=utf-8"));
+    try std.testing.expect(contentTypeJson("Application/JSON;charset=UTF-8"));
+    try std.testing.expect(contentTypeJson("application/json; charset=\"utf-8\""));
+    try std.testing.expect(!contentTypeJson("application/json-not-real"));
+    try std.testing.expect(!contentTypeJson("application/jsonx"));
+    try std.testing.expect(!contentTypeJson("text/json"));
+    try std.testing.expect(!contentTypeJson("application/json;"));
+    try std.testing.expect(!contentTypeJson("application/json; charset"));
+    try std.testing.expect(!contentTypeJson("application/json; =utf-8"));
+}
+
+test "origin allowlist supports exact and wildcard-port patterns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const allowed = try util.splitCsv(arena, "http://127.0.0.1:*,https://node.example");
+    try std.testing.expect(originAllowed("http://127.0.0.1:8341", allowed));
+    try std.testing.expect(originAllowed("https://node.example", allowed));
+    try std.testing.expect(!originAllowed("https://evil.example", allowed));
+}
+
+test "connection close header parsing" {
+    try std.testing.expect(connectionCloseRequested("close"));
+    try std.testing.expect(connectionCloseRequested(" Close "));
+    try std.testing.expect(connectionCloseRequested("keep-alive, close"));
+    try std.testing.expect(!connectionCloseRequested(null));
+    try std.testing.expect(!connectionCloseRequested("keep-alive"));
+}
