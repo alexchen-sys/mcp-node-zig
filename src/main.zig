@@ -670,17 +670,55 @@ fn handleRpc(arena: Allocator, io: Io, cfg: *const Config, body: []const u8) !Rp
         return .{ .status = 400, .body = try rpcError(arena, Value.null, -32600, "Invalid Request") };
     }
     const id_opt = req.object.get("id");
+    // Errors echo the id only when it is of a legal type (string/integer/
+    // null); anything else renders the request itself invalid with id null.
+    const err_id = validIdOrNull(id_opt);
+    // The JSON-RPC 2.0 envelope member is mandatory and must equal "2.0";
+    // anything else is an Invalid Request, never silently tolerated.
+    const jsonrpc_v = req.object.get("jsonrpc") orelse {
+        return .{ .status = 400, .body = try rpcError(arena, err_id, -32600, "Invalid Request") };
+    };
+    if (jsonrpc_v != .string or !std.mem.eql(u8, jsonrpc_v.string, "2.0")) {
+        return .{ .status = 400, .body = try rpcError(arena, err_id, -32600, "Invalid Request") };
+    }
+    // id typing per JSON-RPC: string, integer, or null. A present null id is
+    // a (discouraged but legal) request id, NOT a notification: it is
+    // answered with the echoed null. Absent id is the notification marker.
+    if (id_opt) |id_v| {
+        switch (id_v) {
+            .string, .integer, .number_string, .null => {},
+            else => return .{ .status = 400, .body = try rpcError(arena, Value.null, -32600, "Invalid Request") },
+        }
+    }
     const method_v = req.object.get("method") orelse {
-        return .{ .status = 400, .body = try rpcError(arena, id_opt orelse Value.null, -32600, "Invalid Request") };
+        return .{ .status = 400, .body = try rpcError(arena, err_id, -32600, "Invalid Request") };
     };
     if (method_v != .string) {
-        return .{ .status = 400, .body = try rpcError(arena, id_opt orelse Value.null, -32600, "Invalid Request") };
+        return .{ .status = 400, .body = try rpcError(arena, err_id, -32600, "Invalid Request") };
     }
     const method = method_v.string;
-    if (id_opt == null or std.mem.startsWith(u8, method, "notifications/")) {
+    // params, when present, must be structured (object or array); null is
+    // tolerated as "omitted" for client compatibility. A scalar params makes
+    // the whole message an Invalid Request — including for notifications,
+    // which must not unconditionally pass.
+    if (req.object.get("params")) |params| {
+        switch (params) {
+            .object, .array, .null => {},
+            else => return .{ .status = 400, .body = try rpcError(arena, err_id, -32600, "Invalid Request") },
+        }
+    }
+    // A request without an id is a notification: 202 with no response body,
+    // but only after the full shape validation above.
+    if (id_opt == null) {
         return .{ .status = 202, .body = "" };
     }
     const id = id_opt.?;
+    // MCP notifications/* are notifications by definition; carrying an id
+    // makes the message an Invalid Request that must be answered — the
+    // response must never be silently dropped with a 202.
+    if (std.mem.startsWith(u8, method, "notifications/")) {
+        return .{ .status = 400, .body = try rpcError(arena, id, -32600, "Invalid Request") };
+    }
 
     if (std.mem.eql(u8, method, "initialize")) {
         var protocol_version: []const u8 = "2025-11-25";
@@ -751,40 +789,43 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const Config, id: Value, param
     if (params != .object) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     const name_v = params.object.get("name") orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     if (name_v != .string) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
-    const args = params.object.get("arguments") orelse Value.null;
+    // arguments, when present, must be an object: anything else is a
+    // protocol-level Invalid params (-32602), not a tool-domain error.
+    const args_v = params.object.get("arguments");
+    if (args_v) |a| {
+        if (a != .object) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
+    }
+    const args = args_v orelse Value.null;
 
     var payload: std.ArrayList(u8) = .empty;
-    if (std.mem.eql(u8, name_v.string, "exec")) {
-        toolExec(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_start")) {
-        toolExecStart(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_poll")) {
-        toolExecPoll(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_write")) {
-        toolExecWrite(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_kill")) {
-        toolExecKill(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_close")) {
-        toolExecClose(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_wait")) {
-        toolExecWait(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_list")) {
-        toolExecList(arena, io, cfg, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "exec_shell")) {
-        toolExecShell(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "sys_info")) {
-        toolSysInfo(arena, io, cfg, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "read_file")) {
-        toolReadFile(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "write_file")) {
-        toolWriteFile(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else if (std.mem.eql(u8, name_v.string, "list_dir")) {
-        toolListDir(arena, io, cfg, args, &payload) catch |err| try buildErrorPayload(&payload, arena, @errorName(err));
-    } else {
-        return unknownToolResult(arena, id, name_v.string);
-    }
-
+    dispatchTool(arena, io, cfg, name_v.string, args, &payload) catch |err| {
+        switch (err) {
+            error.UnknownTool => return unknownToolResult(arena, id, name_v.string),
+            // A present argument with the wrong JSON type is a protocol
+            // error (-32602), never a silent default.
+            error.InvalidParams => return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") },
+            else => try buildErrorPayload(&payload, arena, @errorName(err)),
+        }
+        return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
+    };
     return .{ .status = 200, .body = try toolEnvelope(arena, id, payload.items, false, true) };
+}
+
+fn dispatchTool(arena: Allocator, io: Io, cfg: *const Config, name: []const u8, args: Value, out: *std.ArrayList(u8)) !void {
+    if (std.mem.eql(u8, name, "exec")) return toolExec(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_start")) return toolExecStart(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_poll")) return toolExecPoll(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_write")) return toolExecWrite(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_kill")) return toolExecKill(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_close")) return toolExecClose(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_wait")) return toolExecWait(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "exec_list")) return toolExecList(arena, io, cfg, out);
+    if (std.mem.eql(u8, name, "exec_shell")) return toolExecShell(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "sys_info")) return toolSysInfo(arena, io, cfg, out);
+    if (std.mem.eql(u8, name, "read_file")) return toolReadFile(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "write_file")) return toolWriteFile(arena, io, cfg, args, out);
+    if (std.mem.eql(u8, name, "list_dir")) return toolListDir(arena, io, cfg, args, out);
+    return error.UnknownTool;
 }
 
 fn toolEnvelope(arena: Allocator, id: Value, payload: []const u8, is_error: bool, structured: bool) ![]const u8 {
@@ -817,6 +858,14 @@ fn unknownToolResult(arena: Allocator, id: Value, name: []const u8) !RpcResponse
     return .{ .status = 200, .body = out.items };
 }
 
+fn validIdOrNull(id_opt: ?Value) Value {
+    const v = id_opt orelse return Value.null;
+    return switch (v) {
+        .string, .integer, .number_string, .null => v,
+        else => Value.null,
+    };
+}
+
 fn rpcError(arena: Allocator, id: Value, code: i32, message: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -845,8 +894,8 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
         if (item != .string) return error.BadArgv;
         argv[i] = item.string;
     }
-    const cwd = strArg(args, "cwd") orelse "";
-    var timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
+    const cwd = (try optStrArg(args, "cwd")) orelse "";
+    var timeout_s = (try optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > EXEC_MAX_TIMEOUT_S) timeout_s = EXEC_MAX_TIMEOUT_S;
     const started = std.Io.Clock.awake.now(io);
@@ -888,9 +937,9 @@ fn toolExec(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std
 }
 
 fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
-    const script = strArg(args, "script") orelse return error.MissingScript;
+    const script = (try optStrArg(args, "script")) orelse return error.MissingScript;
     const default_shell: []const u8 = if (comptime builtin.os.tag == .windows) "cmd" else "bash";
-    const shell = strArg(args, "shell") orelse default_shell;
+    const shell = (try optStrArg(args, "shell")) orelse default_shell;
     // Comptime platform allowlist: POSIX shells on POSIX, cmd/powershell on
     // Windows (mirrored in TOOLS_JSON prose).
     const shell_ok = if (comptime builtin.os.tag == .windows)
@@ -898,8 +947,8 @@ fn toolExecShell(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     else
         (std.mem.eql(u8, shell, "bash") or std.mem.eql(u8, shell, "sh") or std.mem.eql(u8, shell, "fish") or std.mem.eql(u8, shell, "zsh"));
     if (!shell_ok) return error.UnsupportedShell;
-    const cwd = strArg(args, "cwd") orelse "";
-    const timeout_s = intArg(args, "timeout") orelse EXEC_DEFAULT_TIMEOUT_S;
+    const cwd = (try optStrArg(args, "cwd")) orelse "";
+    const timeout_s = (try optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
     var new_args: std.ArrayList(u8) = .empty;
     try new_args.appendSlice(arena, "{\"argv\":[");
     try appendJsonString(&new_args, arena, shell);
@@ -1044,7 +1093,7 @@ fn sessionRelease(session: *Session) void {
 /// protect against concurrent exec_close freeing the session.
 fn sessionFromArgs(cfg: *const Config, args: Value) !*Session {
     const store = cfg.sessions orelse return error.SessionsDisabled;
-    const id_i = intArg(args, "session_id") orelse return error.MissingSession;
+    const id_i = (try optIntArg(args, "session_id")) orelse return error.MissingSession;
     if (id_i <= 0) return error.BadSession;
     return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
 }
@@ -1075,7 +1124,7 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         argv[i] = try std.heap.page_allocator.dupe(u8, item.string);
         argv_filled += 1;
     }
-    const cwd_s = strArg(args, "cwd") orelse "";
+    const cwd_s = (try optStrArg(args, "cwd")) orelse "";
     const cwd = try std.heap.page_allocator.dupe(u8, cwd_s);
     var cwd_owned = false;
     errdefer {
@@ -1265,8 +1314,8 @@ fn toolExecPoll(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const stdout_offset = intArg(args, "stdout_offset") orelse 0;
-    const stderr_offset = intArg(args, "stderr_offset") orelse 0;
+    const stdout_offset = (try optIntArg(args, "stdout_offset")) orelse 0;
+    const stderr_offset = (try optIntArg(args, "stderr_offset")) orelse 0;
     try renderSessionState(arena, cfg.sessions.?, session, stdout_offset, stderr_offset, out);
 }
 
@@ -1274,9 +1323,9 @@ fn toolExecWait(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const stdout_offset = intArg(args, "stdout_offset") orelse 0;
-    const stderr_offset = intArg(args, "stderr_offset") orelse 0;
-    var timeout_s = intArg(args, "timeout") orelse WAIT_DEFAULT_TIMEOUT_S;
+    const stdout_offset = (try optIntArg(args, "stdout_offset")) orelse 0;
+    const stderr_offset = (try optIntArg(args, "stderr_offset")) orelse 0;
+    var timeout_s = (try optIntArg(args, "timeout")) orelse WAIT_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > WAIT_MAX_TIMEOUT_S) timeout_s = WAIT_MAX_TIMEOUT_S;
     const store = cfg.sessions.?;
@@ -1338,8 +1387,8 @@ fn toolExecWrite(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
     _ = io;
     const session = try sessionFromArgs(cfg, args);
     defer sessionRelease(session);
-    const data_b64 = strArg(args, "data_b64") orelse return error.MissingData;
-    const eof = boolArg(args, "eof") orelse false;
+    const data_b64 = (try optStrArg(args, "data_b64")) orelse return error.MissingData;
+    const eof = (try optBoolArg(args, "eof")) orelse false;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
     const data = try std.heap.page_allocator.alloc(u8, size);
     defer std.heap.page_allocator.free(data);
@@ -1431,9 +1480,9 @@ fn toolSysInfo(arena: Allocator, io: Io, cfg: *const Config, out: *std.ArrayList
 
 fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, strArg(args, "path") orelse return error.MissingPath);
-    const offset = intArg(args, "offset") orelse 0;
-    const limit = intArg(args, "limit") orelse READ_FILE_DEFAULT_LIMIT_CHARS;
+    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse return error.MissingPath);
+    const offset = (try optIntArg(args, "offset")) orelse 0;
+    const limit = (try optIntArg(args, "limit")) orelse READ_FILE_DEFAULT_LIMIT_CHARS;
     if (offset < 0 or limit < 0) return error.BadOffset;
     const data = os.fd.readFileAlloc(arena, io, path, READ_FILE_MAX_BYTES) catch |err| {
         // The read path is cross-platform, so the mapping holds
@@ -1463,10 +1512,10 @@ fn toolReadFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: 
 
 fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, strArg(args, "path") orelse return error.MissingPath);
-    const content_b64 = strArg(args, "content_b64") orelse return error.MissingContent;
-    const mode_i = intArg(args, "mode") orelse 0o644;
-    const mkdirs = boolArg(args, "mkdirs") orelse true;
+    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse return error.MissingPath);
+    const content_b64 = (try optStrArg(args, "content_b64")) orelse return error.MissingContent;
+    const mode_i = (try optIntArg(args, "mode")) orelse 0o644;
+    const mkdirs = (try optBoolArg(args, "mkdirs")) orelse true;
     if (mode_i < 0 or mode_i > 0o7777) return error.BadMode;
 
     const size = try std.base64.standard.Decoder.calcSizeForSlice(content_b64);
@@ -1501,7 +1550,7 @@ fn toolWriteFile(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
 
 fn toolListDir(arena: Allocator, io: Io, cfg: *const Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = cfg;
-    const path = try expandPath(arena, io, strArg(args, "path") orelse ".");
+    const path = try expandPath(arena, io, (try optStrArg(args, "path")) orelse ".");
     var dir = std.Io.Dir.openDir(.cwd(), io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.NotDir => return error.NotDirectory,
@@ -1572,19 +1621,41 @@ fn objGet(v: Value, key: []const u8) ?Value {
     return v.object.get(key);
 }
 
-fn strArg(args: Value, key: []const u8) ?[]const u8 {
+/// Optional string argument: absent/null -> null; a present value of the
+/// wrong JSON type is a strict error (error.InvalidParams -> -32602), never
+/// a silent default.
+fn optStrArg(args: Value, key: []const u8) !?[]const u8 {
     const v = objGet(args, key) orelse return null;
-    if (v != .string) return null;
+    if (v == .null) return null;
+    if (v != .string) return error.InvalidParams;
     return v.string;
 }
 
-fn intArg(args: Value, key: []const u8) ?i64 {
+/// Optional integer argument: absent/null -> null; wrong type, non-integral
+/// float, or unrepresentable number -> strict error.
+fn optIntArg(args: Value, key: []const u8) !?i64 {
     const v = objGet(args, key) orelse return null;
+    if (v == .null) return null;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| floatToI64(f),
-        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-        else => null,
+        .float => |f| blk: {
+            const i = floatToI64(f) orelse return error.InvalidParams;
+            // Reject fractional floats that a bare cast would truncate.
+            if (@as(f64, @floatFromInt(i)) != f) return error.InvalidParams;
+            break :blk i;
+        },
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch return error.InvalidParams,
+        else => return error.InvalidParams,
+    };
+}
+
+/// Optional boolean argument: absent/null -> null; wrong type -> strict error.
+fn optBoolArg(args: Value, key: []const u8) !?bool {
+    const v = objGet(args, key) orelse return null;
+    if (v == .null) return null;
+    return switch (v) {
+        .bool => |b| b,
+        else => return error.InvalidParams,
     };
 }
 
@@ -1592,14 +1663,6 @@ fn floatToI64(f: f64) ?i64 {
     if (!std.math.isFinite(f)) return null;
     if (f >= 9223372036854775808.0 or f < -9223372036854775808.0) return null;
     return @as(i64, @intFromFloat(f));
-}
-
-fn boolArg(args: Value, key: []const u8) ?bool {
-    const v = objGet(args, key) orelse return null;
-    return switch (v) {
-        .bool => |b| b,
-        else => null,
-    };
 }
 
 fn appendJsonValue(out: *std.ArrayList(u8), arena: Allocator, v: Value) !void {
