@@ -50,9 +50,13 @@ def free_port():
 
 
 def read_http_response(sock, deadline_s=8.0):
-    """Read one HTTP/1.1 response; returns (status, reason, headers, body)."""
+    """Read one HTTP/1.1 response; returns (status, reason, headers, body).
+
+    Bytes over-read past this response (a pipelined next response delivered
+    in the same recv) are kept on the socket object and seed the next call,
+    so coalesced delivery never loses a response."""
     sock.settimeout(deadline_s)
-    data = b''
+    data = getattr(sock, '_response_overread', b'')
     while b'\r\n\r\n' not in data:
         chunk = sock.recv(65536)
         if not chunk:
@@ -76,6 +80,7 @@ def read_http_response(sock, deadline_s=8.0):
         if not chunk:
             raise AssertionError('connection closed mid-body: %d/%d bytes' % (len(body), length))
         body += chunk
+    sock._response_overread = body[length:]
     return status, reason, headers, body[:length]
 
 
@@ -303,7 +308,7 @@ class TreeTests(unittest.TestCase):
     def test_done_means_output_drained(self):
         payload = 65536
         started = self.node.tool('exec_start', {'argv': [sys.executable, '-c',
-            'import os,sys; os.write(1, b"x"*%d); os.write(2, b"y"*1024)' % payload]})
+            "import os,sys; os.write(1, b'x'*%d); os.write(2, b'y'*1024)" % payload]})
         self.assertTrue(started.get('ok'), started)
         state = self.node.tool('exec_wait', {'session_id': started['session_id'], 'timeout': 10})
         self.assertTrue(state.get('done'), state)
@@ -796,7 +801,14 @@ class JsonRpcTests(unittest.TestCase):
                 self.assertEqual(err_code(reply), -32602)
 
     def test_tool_arg_correct_types_still_work(self):
-        reply = self.node.tool('exec', {'argv': ['/bin/true'], 'timeout': 5, 'cwd': '/'})
+        # /bin/true is Linux-only (macOS keeps `true` in /usr/bin, Windows has
+        # neither): use the interpreter running this harness plus a
+        # platform-valid root cwd — the types under test are unchanged.
+        if os.name == 'nt':
+            cwd = str(Path(sys.executable).anchor)
+        else:
+            cwd = '/'
+        reply = self.node.tool('exec', {'argv': [sys.executable, '-c', 'pass'], 'timeout': 5, 'cwd': cwd})
         self.assertTrue(reply.get('ok'), reply)
         self.assertEqual(reply.get('exit_code'), 0)
 
