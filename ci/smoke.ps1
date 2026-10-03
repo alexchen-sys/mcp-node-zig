@@ -68,7 +68,12 @@ try {
         $resp401 = $_.Exception.Response
     }
     if ([int]$resp401.StatusCode -ne 401) { throw "basic scheme must be 401" }
-    if (-not $resp401.Headers["WWW-Authenticate"]) { throw "401 without WWW-Authenticate" }
+    # pwsh 7 surfaces a 4xx as HttpResponseException whose .Response is a bare
+    # HttpResponseMessage: its Headers has no string indexer, so read the
+    # challenge via GetValues (works on WebHeaderCollection too).
+    $waHeader = $null
+    try { $waHeader = ($resp401.Headers.GetValues("WWW-Authenticate") -join ", ") } catch { $waHeader = $null }
+    if (-not $waHeader) { throw "401 without WWW-Authenticate" }
 
     Write-Host "smoke: OK"
 } finally {
