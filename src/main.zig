@@ -1576,13 +1576,30 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         // it can spawn anything. POSIX keeps running-start semantics.
         .start_suspended = proc.spawn_suspended,
     });
+    // Never leak a running child if session allocation fails after spawn.
+    // Declared before the stdin takeover: its failure return runs this
+    // errdefer too.
+    var child_owned = false;
+    errdefer {
+        if (!child_owned) {
+            proc.killTree(childPidOrZero(child.id), job);
+            _ = child.wait(io) catch null;
+        }
+    }
+
     if (is_windows) {
         // std created the stdin pipe for `.pipe` stdio and handed the parent
         // write end back as child.stdin (a synchronous handle — the
         // NtWriteFile loop in writeAllFd works unchanged). Take it over:
         // null the field so childCleanupWindows (behind every child.wait())
         // can never close our write end, then adopt it as stdin_fd.
-        const f = child.stdin orelse return error.StdinPipeTakeoverFailed;
+        const f = child.stdin orelse {
+            // Not in the job yet (assignToJob runs below): a job kill would
+            // miss the suspended child and the errdefer's child.wait() would
+            // hang. Kill by handle.
+            proc.terminateHandle(child.id.?);
+            return error.StdinPipeTakeoverFailed;
+        };
         child.stdin = null;
         stdin_fd = f.handle;
         stdin_fd_valid = true;
@@ -1591,15 +1608,6 @@ fn toolExecStart(arena: Allocator, io: Io, cfg: *const Config, args: Value, out:
         // copy.
         os.closeFd(stdin_pipe.read);
         stdin_read_open = false;
-    }
-
-    // Never leak a running child if session allocation fails after spawn.
-    var child_owned = false;
-    errdefer {
-        if (!child_owned) {
-            proc.killTree(childPidOrZero(child.id), job);
-            _ = child.wait(io) catch null;
-        }
     }
 
     if (comptime builtin.os.tag == .windows) {
