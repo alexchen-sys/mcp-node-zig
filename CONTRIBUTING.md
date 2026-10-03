@@ -9,7 +9,7 @@ license your contribution under the project's MIT license.
   versions may fail to build
 - Linux, macOS, and Windows: platform specifics live behind the `src/os/` layer (POSIX process groups, Windows Job Objects) — put new platform code there, not in `main.zig`
 
-## Gates
+## Checks
 
 Run all three before opening a PR — CI runs exactly these plus a live
 auth-gate smoke test, and red CI is not reviewed:
