@@ -773,11 +773,18 @@ test "childRelative mirrors the child's post-chdir path resolution" {
     try std.testing.expectEqualStrings("rel/b", try childRelative(arena, "rel", "b"));
 }
 
+/// Build a pid_t from a small number on every target: pid_t is an integer on
+/// POSIX but a HANDLE (*anyopaque) on Windows, where a bare literal does not
+/// coerce.
+fn testPid(n: usize) std.posix.pid_t {
+    return if (comptime native_os == .windows) @ptrFromInt(n) else @intCast(n);
+}
+
 test "protectedPid flags exactly the listed pids" {
-    const protected = [_]std.posix.pid_t{ 10, 20, 30 };
-    try std.testing.expect(protectedPid(&protected, 20));
-    try std.testing.expect(!protectedPid(&protected, 99));
-    try std.testing.expect(!protectedPid(&[_]std.posix.pid_t{}, 1));
+    const protected = [_]std.posix.pid_t{ testPid(10), testPid(20), testPid(30) };
+    try std.testing.expect(protectedPid(&protected, testPid(20)));
+    try std.testing.expect(!protectedPid(&protected, testPid(99)));
+    try std.testing.expect(!protectedPid(&[_]std.posix.pid_t{}, testPid(1)));
 }
 
 test "child tracking answers false for pids that are not our children" {
