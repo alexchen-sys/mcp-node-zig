@@ -230,6 +230,12 @@ pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Confi
                 std.debug.print("MCP_NODE_HUB_LISTEN must be ip:port, got '{s}'\n", .{hub_s.?});
                 return error.InvalidConfig;
             };
+            // Same parser the hub listener uses: a host name would only
+            // fail later, at bind time, without naming the variable.
+            _ = std.Io.net.IpAddress.parse(cfg.hub_listen.?.host, cfg.hub_listen.?.port) catch {
+                std.debug.print("MCP_NODE_HUB_LISTEN must be an IP literal with a port, got '{s}'\n", .{hub_s.?});
+                return error.InvalidConfig;
+            };
             const path = getEnv(arena, "MCP_NODE_HUB_SECRET_FILE") orelse {
                 std.debug.print("MCP_NODE_HUB_SECRET_FILE is required in hub mode\n", .{});
                 return error.InvalidConfig;
@@ -776,6 +782,20 @@ test "config link modes: connect, hub, exclusivity and fatal secrets" {
     try testing.expectEqual(Mode.hub, hub.mode);
     try testing.expectEqualStrings("tok", hub.token);
     try testing.expectEqualStrings("two", hub.hub_secrets.?.lookup("laptop").?);
+
+    // Hub listen must be an IP literal: a host name is refused up front.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        .{ .key = "MCP_NODE_HUB_LISTEN", .value = "hub.example:8443" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        .{ .key = "MCP_NODE_HUB_LISTEN", .value = "[::1]:8443" },
+    });
+    try testing.expectEqual(Mode.hub, (try loadConfig(arena, io)).mode);
 
     // Hub without a secret file is fatal.
     env_state.process_environ = try makeEnviron(arena, &.{
