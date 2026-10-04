@@ -158,14 +158,20 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
         .stopped => |sig| 128 + @as(i32, @intCast(@intFromEnum(sig))),
         .unknown => |code| @as(i32, @intCast(code)),
     };
+    // Same UTF-8 contract as read_file and the session tools: stdout/stderr
+    // are byte streams that may contain invalid UTF-8; they are decoded
+    // lossily (U+FFFD per bad byte) instead of silently dropping bytes in
+    // the JSON encoder.
+    const stdout_text = try util.utf8LossyAlloc(arena, result.stdout);
+    const stderr_text = try util.utf8LossyAlloc(arena, result.stderr);
     try out.appendSlice(arena, "{\"ok\":");
     try out.appendSlice(arena, if (exit_code == 0) "true" else "false");
     try out.appendSlice(arena, ",\"exit_code\":");
     try out.print(arena, "{d}", .{exit_code});
     try out.appendSlice(arena, ",\"stdout\":");
-    try util.appendJsonString(out, arena, result.stdout);
+    try util.appendJsonString(out, arena, stdout_text);
     try out.appendSlice(arena, ",\"stderr\":");
-    try util.appendJsonString(out, arena, result.stderr);
+    try util.appendJsonString(out, arena, stderr_text);
     try out.appendSlice(arena, ",\"truncated\":false,\"duration_ms\":");
     try out.print(arena, "{d}", .{elapsed.toMilliseconds()});
     // Same measurement, microsecond resolution: sub-millisecond commands

@@ -954,6 +954,18 @@ class SanityTests(unittest.TestCase):
         self.assertIn('hostname', info)
         self.assertTrue(info['hostname'])
 
+    def test_exec_output_replaces_invalid_utf8(self):
+        """exec decodes stdout/stderr lossily (U+FFFD), matching read_file
+        and the session tools, instead of dropping invalid bytes."""
+        node = Node()
+        self.addCleanup(node.close)
+        code = 'import os; os.write(1, b"\\xff\\xfeabc"); os.write(2, b"\\x80xy")'
+        reply = node.tool('exec', {'argv': [sys.executable, '-c', code], 'timeout': 10})
+        self.assertTrue(reply.get('ok'), reply)
+        self.assertEqual(reply.get('exit_code'), 0, reply)
+        self.assertEqual(reply.get('stdout'), '\ufffd\ufffdabc', reply)
+        self.assertEqual(reply.get('stderr'), '\ufffdxy', reply)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
