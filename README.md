@@ -8,7 +8,7 @@ English | [Русский](README.ru.md)
 
 Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
 
-<!-- TODO: session demo gif -->
+![mcp-node-zig: 1.86 ms cold start, 0.98 MiB idle, one 4.30 MiB binary](assets/demo.gif)
 
 **1.86 ms** cold start · **0.98 MiB** idle RSS · **4.30 MiB** on disk · **0.66 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
 
