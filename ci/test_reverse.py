@@ -605,6 +605,25 @@ def case_tls_link(env):
         out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-tls'], 'timeout': 10})
         check(out.get('ok') and out.get('stdout') == 'over-tls\n', out)
 
+        # 16 concurrent exec over one TLS link: RESP writes from many
+        # workers interleave with the reader decrypting REQ records.
+        results = {}
+
+        def one(i):
+            try:
+                r = env.tool('tlsnode', 'exec', {'argv': ['echo', 'tls-%d' % i], 'timeout': 20}, timeout=40)
+                results[i] = r.get('stdout')
+            except Exception as e:  # recorded, checked below
+                results[i] = repr(e)
+        threads = [threading.Thread(target=one, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        bad_answers = {i: v for i, v in results.items() if v != 'tls-%d\n' % i}
+        check(len(results) == 16 and not bad_answers, bad_answers or results)
+        check('tlsnode' in env.nodes(), 'TLS link dropped under concurrency')
+
         bad = env.start_node('tlsbad', target=target, extra={
             'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'other-ca.pem')})
         failed = wait_until(lambda: 'TLS handshake failed' in bad.logs(), 10, 0.1)

@@ -100,6 +100,10 @@ fn sessionOn(node: *Node, stream: Io.net.Stream, conn: Conn) !u64 {
     };
     ln.* = .{ .node = node, .stream = stream, .conn = conn };
     defer ln.release();
+    switch (conn) {
+        .tls => |t| t.lock = &ln.write_mutex,
+        .plain => {},
+    }
     const fd = stream.socket.handle;
     const timeout_ms = @as(u64, node.cfg.socket_timeout_s) * 1000;
     os.net.setSocketTimeouts(fd, node.cfg.socket_timeout_s) catch return error.SocketOptionFailed;
@@ -146,7 +150,8 @@ fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
             }
         },
         .goaway => {
-            std.debug.print("node link: hub refused: {s}\n", .{reply.payload});
+            var safe: [GOAWAY_PRINT_MAX]u8 = undefined;
+            std.debug.print("node link: hub refused: {s}\n", .{printable(&safe, reply.payload)});
             return error.Refused;
         },
         else => {
@@ -154,6 +159,17 @@ fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
             return error.HubAuthFailed;
         },
     }
+}
+
+const GOAWAY_PRINT_MAX = 200;
+
+/// Copy hub-supplied text for the log: printable ASCII only (others become
+/// '?'), at most GOAWAY_PRINT_MAX bytes, so a peer cannot inject terminal
+/// escapes or flood the log.
+fn printable(out: *[GOAWAY_PRINT_MAX]u8, text: []const u8) []const u8 {
+    const n = @min(text.len, out.len);
+    for (text[0..n], out[0..n]) |c, *o| o.* = if (c >= 0x20 and c <= 0x7e) c else '?';
+    return out[0..n];
 }
 
 /// Byte channel of one link: the plain socket, or TLS over it.
@@ -194,13 +210,27 @@ const Conn = union(enum) {
 /// to the socket reader/writer). Ciphertext moves through the os.net
 /// helpers, so read deadlines behave exactly like the plain path: every
 /// socket read is armed with SO_RCVTIMEO (software deadline on Windows)
-/// and a timeout surfaces as error.LinkTimeout. One thread reads, writers
-/// are serialized by the link mutex.
+/// and a timeout surfaces as error.LinkTimeout.
+///
+/// Locking: writers run under the link write mutex. The std client is not
+/// split into independent read and write halves: when a received TLS 1.3
+/// KeyUpdate asks for an update, the read path rotates the client write
+/// key and resets the write sequence number. Decrypting therefore also
+/// runs under the write mutex. To keep socket waits out of the lock, the
+/// reader first buffers one complete ciphertext record without the lock
+/// (only the read path touches that input buffer), then decrypts exactly
+/// that record under the lock, which needs no socket I/O. std does not
+/// send the KeyUpdate reply the RFC asks for; a hub that requests one may
+/// then fail to decrypt our records and drop the link, which reconnects.
 const TlsState = struct {
     const tls = std.crypto.tls;
     const BUF = tls.Client.min_buffer_len;
 
     fd: os.net.Handle,
+    io: Io,
+    /// The link write mutex; null until the link exists (handshake is
+    /// single-threaded).
+    lock: ?*Io.Mutex = null,
     /// Deadline for the next socket read and the error behind ReadFailed.
     read_timeout_ms: u64 = HANDSHAKE_MS,
     read_err: ?anyerror = null,
@@ -223,6 +253,7 @@ const TlsState = struct {
         errdefer gpa.destroy(self);
         self.* = .{
             .fd = stream.socket.handle,
+            .io = io,
             .send_timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000,
             .sock_in = .{ .vtable = &.{ .stream = sockStream }, .buffer = &.{}, .seek = 0, .end = 0 },
             .sock_out = .{ .vtable = &.{ .drain = sockDrain }, .buffer = &.{} },
@@ -276,14 +307,61 @@ const TlsState = struct {
     }
 
     fn readSome(self: *TlsState, buf: []u8, timeout_ms: u64) !usize {
-        self.read_timeout_ms = timeout_ms;
-        self.read_err = null;
-        return self.client.reader.readSliceShort(buf) catch {
-            if (self.read_err) |e| {
-                if (e == error.LinkTimeout) return error.LinkTimeout;
+        if (buf.len == 0) return 0;
+        const plain = &self.client.reader;
+        while (true) {
+            // Plaintext already decrypted: only this thread moves the
+            // client reader's seek/end, so no lock is needed to copy it.
+            const ready = plain.buffered();
+            if (ready.len > 0) {
+                const n = @min(ready.len, buf.len);
+                @memcpy(buf[0..n], ready[0..n]);
+                plain.toss(n);
+                return n;
             }
-            return error.LinkClosed;
-        };
+            self.read_timeout_ms = timeout_ms;
+            self.read_err = null;
+            self.bufferRecord() catch return self.readError();
+            self.decryptOne() catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                error.ReadFailed => return self.readError(),
+            };
+        }
+    }
+
+    fn readError(self: *TlsState) error{ LinkTimeout, LinkClosed } {
+        if (self.read_err) |e| {
+            if (e == error.LinkTimeout) return error.LinkTimeout;
+        }
+        return error.LinkClosed;
+    }
+
+    /// Read ciphertext (no lock) until one whole record is buffered, the
+    /// header announces an oversize record, or the socket hit EOF; the
+    /// std client reports the last two on decrypt.
+    fn bufferRecord(self: *TlsState) error{ReadFailed}!void {
+        const in = &self.sock_in;
+        while (true) {
+            const b = in.buffered();
+            if (b.len >= tls.record_header_len) {
+                const rec_len = std.mem.readInt(u16, b[3..5], .big);
+                if (rec_len > tls.max_ciphertext_len) return;
+                if (b.len >= tls.record_header_len + rec_len) return;
+            }
+            in.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return,
+                error.ReadFailed => return error.ReadFailed,
+            };
+        }
+    }
+
+    /// Process the buffered record under the write mutex. With a whole
+    /// record buffered the std client does not touch the socket here,
+    /// except after EOF, where the read returns at once.
+    fn decryptOne(self: *TlsState) Io.Reader.Error!void {
+        if (self.lock) |m| m.lockUncancelable(self.io);
+        defer if (self.lock) |m| m.unlock(self.io);
+        try self.client.reader.fillMore();
     }
 
     fn write(self: *TlsState, bytes: []const u8) !void {
@@ -380,7 +458,8 @@ fn readLoop(ln: *Link) !void {
             .pong => gpa.free(frame.payload),
             .goaway => {
                 defer gpa.free(frame.payload);
-                std.debug.print("node link: hub said goaway: {s}\n", .{frame.payload});
+                var safe: [GOAWAY_PRINT_MAX]u8 = undefined;
+                std.debug.print("node link: hub said goaway: {s}\n", .{printable(&safe, frame.payload)});
                 return error.GoAway;
             },
             else => {
@@ -484,6 +563,14 @@ fn pinger(ln: *Link) void {
 const testing = std.testing;
 /// The shared in-flight body budget type, named via the config field.
 const InflightBudget = @typeInfo(@typeInfo(@FieldType(config.Config, "inflight")).optional.child).pointer.child;
+
+test "node link goaway text is escaped and capped for the log" {
+    var out: [GOAWAY_PRINT_MAX]u8 = undefined;
+    try testing.expectEqualStrings("bye ?[2J?", printable(&out, "bye \x1b[2J\xff"));
+    const long = "x" ** 300;
+    try testing.expectEqual(@as(usize, GOAWAY_PRINT_MAX), printable(&out, long).len);
+    try testing.expectEqualStrings("", printable(&out, ""));
+}
 
 test "node link backoff cap doubles from 0.5 s to 30 s" {
     try testing.expectEqual(@as(u64, 500), backoffCapMs(0));
