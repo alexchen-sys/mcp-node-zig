@@ -1,17 +1,15 @@
 ---
 name: Feature request
-about: Suggest a new tool or behavior
+about: Suggest a tool or behavior
 title: ''
 labels: enhancement
 assignees: ''
 ---
 
-**Problem** — what are you trying to do:
+**What are you trying to do?**
 
-**Proposal**:
+**What would help?**
 
-**Alternatives considered**:
+**Workarounds you've tried:**
 
-**Scope note**: mcp-node aims to stay a tiny trusted edge agent — one static
-no-libc binary, no frameworks. Proposals that pull in dependencies or widen
-the attack surface need a strong reason.
+<!-- mcp-node stays a single static binary with no dependencies. Ideas that keep it that way are easiest to accept. -->

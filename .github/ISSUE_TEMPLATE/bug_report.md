@@ -1,21 +1,21 @@
 ---
 name: Bug report
-about: Something broke or misbehaves
+about: Something doesn't work as expected
 title: ''
 labels: bug
 assignees: ''
 ---
 
-**Version** (tag or commit):
+**Version:** <!-- tag or commit; Zig version if built from source -->
 
-**Zig version** (`zig version`, if you built from source):
+**OS / arch:**
 
-**OS / arch**:
+**Steps to reproduce:**
+<!-- command, curl, or tool call, plus relevant env vars. Remove your token. -->
 
-**What you did** (command, curl, config env — redact your token):
+**Expected:**
 
-**What happened**:
+**Actual:**
 
-**What you expected**:
-
-**Logs** (mcp-node stderr, redact tokens/hosts as needed):
+**Logs:**
+<!-- mcp-node stderr. Remove tokens and hostnames. -->
