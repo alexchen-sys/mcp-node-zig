@@ -510,3 +510,307 @@ pub fn start(hub: *Hub, server: *Io.net.Server) !void {
     const p = try std.Thread.spawn(.{}, pinger, .{hub});
     p.detach();
 }
+
+// ---------------------------------------------------------------------------
+// Tests: loopback TCP pairs; the test plays the node or uses node_link.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const node_link = @import("node_link.zig");
+const InflightBudget = @typeInfo(@typeInfo(@FieldType(config.Config, "inflight")).optional.child).pointer.child;
+
+fn testConfig(arena: Allocator, mode: config.Mode) !config.Config {
+    return .{
+        .name = "pc",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 5,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+        .mode = mode,
+        .connect_secret = "s3cret",
+    };
+}
+
+const Pair = struct { near: Io.net.Stream, far: Io.net.Stream };
+
+/// A connected loopback pair: `near` is the accepted side, `far` the dialer.
+fn tcpPair(io: Io, server: *Io.net.Server) !Pair {
+    const far = try server.socket.address.connect(io, .{ .mode = .stream });
+    const near = try server.accept(io);
+    try os.net.setSocketTimeouts(near.socket.handle, 5);
+    try os.net.setSocketTimeouts(far.socket.handle, 5);
+    return .{ .near = near, .far = far };
+}
+
+fn waitZero(v: *std.atomic.Value(u32)) !void {
+    var spins: u32 = 0;
+    while (v.load(.acquire) != 0 and spins < 1000) : (spins += 1) os.sleepMs(5);
+    try testing.expectEqual(@as(u32, 0), v.load(.acquire));
+}
+
+const Fixture = struct {
+    threaded: Io.Threaded,
+    arena_state: std.heap.ArenaAllocator,
+    cfg: config.Config,
+    hub: Hub,
+    server: Io.net.Server,
+
+    fn init(self: *Fixture, secrets: link.SecretSet) !void {
+        self.threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        self.arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const io = self.threaded.io();
+        self.cfg = try testConfig(self.arena_state.allocator(), .hub);
+        self.hub = Hub.init(io, &self.cfg, secrets);
+        const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try any.listen(io, .{ .reuse_address = true });
+    }
+
+    fn deinit(self: *Fixture) void {
+        self.hub.killAll();
+        waitZero(&self.hub.threads) catch {};
+        self.hub.registry.deinit(gpa);
+        self.server.deinit(self.threaded.io());
+        self.arena_state.deinit();
+        self.threaded.deinit();
+    }
+};
+
+test "hub registry: a new link for a name replaces the old one" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+
+    const p1 = try tcpPair(io, &fx.server);
+    defer p1.far.close(io);
+    const p2 = try tcpPair(io, &fx.server);
+    defer p2.far.close(io);
+    const a = try Link.create(&fx.hub, p1.near, "pc");
+    const b = try Link.create(&fx.hub, p2.near, "pc");
+    try fx.hub.register(a);
+    try testing.expect(fx.hub.acquire("pc").? == a);
+    a.release();
+
+    var w = Waiter{};
+    try a.addWaiter(5, &w);
+    try fx.hub.register(b);
+    // The old link is dead, its waiter failed, and it got GOAWAY.
+    try testing.expect(a.dead.load(.acquire));
+    try testing.expectEqual(WaiterState.failed, w.state);
+    try testing.expect(w.event.isSet());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ga = try link.readFrame(arena_state.allocator(), p1.far.socket.handle, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.goaway, ga.kind);
+
+    const cur = fx.hub.acquire("pc").?;
+    try testing.expect(cur == b);
+    cur.release();
+    // A stale reader unregistering the old link must not drop the new one.
+    fx.hub.unregister(a);
+    const still = fx.hub.acquire("pc").?;
+    try testing.expect(still == b);
+    still.release();
+    try testing.expect(fx.hub.acquire("nobody") == null);
+
+    const listing = try fx.hub.listJson(arena_state.allocator());
+    try testing.expect(std.mem.startsWith(u8, listing, "{\"nodes\":[{\"name\":\"pc\",\"connected_s\":"));
+    try testing.expect(std.mem.endsWith(u8, listing, ",\"inflight\":0}]}"));
+
+    a.release();
+    b.release();
+}
+
+test "hub waiter: fulfil, timeout with late RESP, and link loss" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const ln = try Link.create(&fx.hub, p.near, "pc");
+    defer ln.release();
+    const far = p.far.socket.handle;
+
+    // Fulfil: a peer thread answers the REQ with the same stream_id.
+    const Peer = struct {
+        fn answer(owner: *Link, fd: os.net.Handle) void {
+            const f = link.readFrame(gpa, fd, link.MAX_PAYLOAD, 5000) catch return;
+            defer gpa.free(f.payload);
+            const resp = gpa.alloc(u8, 2 + f.payload.len) catch return;
+            std.mem.writeInt(u16, resp[0..2], 201, .big);
+            @memcpy(resp[2..], f.payload);
+            // Feed it straight to the hub side, as the reader would.
+            owner.fulfil(f.stream_id, resp);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Peer.answer, .{ ln, far });
+    const ok = try forwardOn(ln, arena, "{\"x\":1}", 5000);
+    t.join();
+    try testing.expectEqual(@as(u16, 201), ok.resp.status);
+    try testing.expectEqualStrings("{\"x\":1}", ok.resp.body);
+    try testing.expectEqual(@as(usize, 0), ln.waiterCount());
+
+    // Timeout: nobody answers; the waiter is removed and a late RESP for
+    // that stream_id is dropped (freed) instead of being delivered.
+    const before = ln.next_sid.load(.acquire);
+    const late = try forwardOn(ln, arena, "{}", 50);
+    try testing.expect(late == .node_timeout);
+    try testing.expectEqual(@as(usize, 0), ln.waiterCount());
+    const stale = try gpa.alloc(u8, 2);
+    std.mem.writeInt(u16, stale[0..2], 200, .big);
+    ln.fulfil(before, stale);
+    try testing.expectEqual(@as(usize, 0), ln.waiterCount());
+    // drain the REQ frame the peer side never answered
+    _ = try link.readFrame(arena, far, link.MAX_PAYLOAD, 5000);
+
+    // Loss: the link dies while a request waits.
+    const Killer = struct {
+        fn run(owner: *Link) void {
+            os.sleepMs(50);
+            owner.kill();
+        }
+    };
+    const k = try std.Thread.spawn(.{}, Killer.run, .{ln});
+    const lost = try forwardOn(ln, arena, "{}", 5000);
+    k.join();
+    try testing.expect(lost == .node_disconnected);
+    // A dead link refuses new waiters outright.
+    try testing.expect((try forwardOn(ln, arena, "{}", 5000)) == .node_disconnected);
+}
+
+test "hub relay deadline is at least one hour" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var cfg = try testConfig(arena_state.allocator(), .hub);
+    try testing.expectEqual(MIN_FORWARD_MS, forwardDeadlineMs(&cfg));
+    cfg.socket_timeout_s = 7200;
+    try testing.expectEqual(@as(u64, 7200 * 1000), forwardDeadlineMs(&cfg));
+}
+
+fn nodeSessionThread(node: *node_link.Node, stream: Io.net.Stream, out: *anyerror!u64) void {
+    out.* = node_link.session(node, stream);
+}
+
+fn waitRegistered(hub: *Hub, name: []const u8) !*Link {
+    var spins: u32 = 0;
+    while (spins < 1000) : (spins += 1) {
+        if (hub.acquire(name)) |ln| return ln;
+        os.sleepMs(5);
+    }
+    return error.NotRegistered;
+}
+
+test "hub handshake accepts a real node and relays a request end to end" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ncfg = try testConfig(arena, .node);
+    var budget = InflightBudget{ .io = io, .max = ncfg.max_inflight_bytes };
+    ncfg.inflight = &budget;
+    var node = node_link.Node{ .io = io, .cfg = &ncfg };
+
+    const p = try tcpPair(io, &fx.server);
+    adopt(&fx.hub, p.near);
+    var result: anyerror!u64 = error.NotRun;
+    const t = try std.Thread.spawn(.{}, nodeSessionThread, .{ &node, p.far, &result });
+
+    const ln = try waitRegistered(&fx.hub, "pc");
+    ln.release();
+    try waitZero(&fx.hub.handshakes);
+
+    const res = try forward(&fx.hub, arena, "pc", "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}", 5000);
+    try testing.expectEqual(@as(u16, 200), res.resp.status);
+    try testing.expect(std.mem.indexOf(u8, res.resp.body, "\"id\":42") != null);
+    try testing.expect((try forward(&fx.hub, arena, "other", "{}", 5000)) == .unknown_node);
+    try testing.expect((try forward(&fx.hub, arena, "a/b", "{}", 5000)) == .unknown_node);
+
+    // Dropping the link on the hub side ends the node session.
+    fx.hub.killAll();
+    t.join();
+    _ = try result;
+    try waitZero(&node.workers);
+    try waitZero(&fx.hub.threads);
+    try testing.expect(fx.hub.acquire("pc") == null);
+}
+
+test "hub handshake refuses a wrong secret and an unpinned name" {
+    const cases = [_]link.SecretSet{
+        .{ .single = "not-the-secret" },
+        .{ .pinned = &.{.{ .name = "laptop", .secret = "s3cret" }} },
+    };
+    for (cases) |secrets| {
+        var fx: Fixture = undefined;
+        try fx.init(secrets);
+        defer fx.deinit();
+        const io = fx.threaded.io();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const ncfg = try testConfig(arena_state.allocator(), .node);
+        var node = node_link.Node{ .io = io, .cfg = &ncfg };
+
+        const p = try tcpPair(io, &fx.server);
+        adopt(&fx.hub, p.near);
+        var result: anyerror!u64 = error.NotRun;
+        const t = try std.Thread.spawn(.{}, nodeSessionThread, .{ &node, p.far, &result });
+        t.join();
+        try testing.expectError(error.Refused, result);
+        try waitZero(&fx.hub.threads);
+        try testing.expectEqual(@as(u32, 0), fx.hub.handshakes.load(.acquire));
+        try testing.expect(fx.hub.acquire("pc") == null);
+    }
+}
+
+test "hub handshake drops a peer that sends a non-hello frame" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    adopt(&fx.hub, p.near);
+    const fd = p.far.socket.handle;
+    const ch = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.challenge, ch.kind);
+    try testing.expectEqual(link.NONCE_LEN, ch.payload.len);
+    try link.writeFrame(fd, .ping, 0, "12345678", 5000);
+    const ga = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.goaway, ga.kind);
+    try waitZero(&fx.hub.threads);
+}
+
+test "hub caps handshakes in progress" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    fx.hub.handshakes.store(MAX_PENDING_HANDSHAKES, .release);
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    adopt(&fx.hub, p.near); // over budget: closed without a CHALLENGE
+    var buf: [16]u8 = undefined;
+    const n = os.net.socketReadSome(p.far.socket.handle, &buf, 5000) catch 0;
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(MAX_PENDING_HANDSHAKES, fx.hub.handshakes.load(.acquire));
+    fx.hub.handshakes.store(0, .release);
+}

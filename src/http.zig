@@ -684,3 +684,19 @@ test "connection close header parsing" {
     try std.testing.expect(!connectionCloseRequested(null));
     try std.testing.expect(!connectionCloseRequested("keep-alive"));
 }
+
+test "routes: listen mode keeps only /mcp; hub adds /n and /n/<name>/mcp" {
+    try std.testing.expect(routeFor(.listen, "/mcp").? == .local);
+    try std.testing.expect(routeFor(.listen, "/n") == null);
+    try std.testing.expect(routeFor(.listen, "/n/pc/mcp") == null);
+    try std.testing.expect(routeFor(.node, "/n") == null);
+    try std.testing.expect(routeFor(.hub, "/mcp").? == .local);
+    try std.testing.expect(routeFor(.hub, "/n").? == .list);
+    try std.testing.expectEqualStrings("pc", routeFor(.hub, "/n/pc/mcp").?.node);
+    // invalid names reach the relay, which answers unknown_node
+    try std.testing.expectEqualStrings("a/b", routeFor(.hub, "/n/a/b/mcp").?.node);
+    try std.testing.expect(routeFor(.hub, "/n//mcp") == null);
+    try std.testing.expect(routeFor(.hub, "/n/") == null);
+    try std.testing.expect(routeFor(.hub, "/n/pc") == null);
+    try std.testing.expect(routeFor(.hub, "/mcp/") == null);
+}
