@@ -587,3 +587,210 @@ pub fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) WriteAllError!void {
         return os_layer.writeAllFd(fd, bytes);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests. The pre-flight is stat-only: no process is ever spawned, so
+// every fixture is just files and directories under a testing tmp dir. CI
+// runs unit tests on Linux only (same SkipZigTest gate as sysinfo.zig);
+// bodies stay analyzable on every target — the platform-only helpers below
+// split their bodies at comptime, mirroring os.fd.writeFile's dispatcher.
+// ---------------------------------------------------------------------------
+
+/// Relative path of `sub_path` inside a testing tmp dir, resolved against
+/// the test binary's cwd (std.testing.tmpDir nests under .zig-cache/tmp
+/// there) — the same cwd preflightExec resolves relative paths against.
+fn tmpRelPath(arena: std.mem.Allocator, tmp: *const std.testing.TmpDir, sub_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, sub_path });
+}
+
+/// Write a fixture file at a cwd-relative `path` with the requested
+/// permission bits on Linux (openat applies them, subject to umask); other
+/// targets never execute these tests and get a plain write so every mode_t
+/// flavor stays compilable.
+fn writeFixtureFile(io: Io, path: []const u8, data: []const u8, mode: u32) !void {
+    // No `_ = mode` discard in the fallback branch: the unused/discard
+    // checks are ZIR-level and see both comptime branches, so the parameter
+    // must simply appear used somewhere in the body (same reason os.fd
+    // splits its writeFile bodies the way it does).
+    if (comptime native_os == .linux) {
+        return os_layer.fd.writeFile(io, path, data, mode);
+    } else {
+        return os_layer.fd.writeFile(io, path, data, 0);
+    }
+}
+
+/// Absolute location of the test binary's cwd via the raw getcwd syscall
+/// (0.16 std ships no allocating wrapper). Returns null when the kernel
+/// answer fails or does not fit; callers then skip the affected assertion.
+fn testCwdInto(buf: []u8) ?[]const u8 {
+    if (comptime native_os != .linux) return null;
+    const rc = std.os.linux.getcwd(buf.ptr, buf.len);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    const end = @min(rc, buf.len);
+    const nul = std.mem.indexOfScalar(u8, buf[0..end], 0) orelse end;
+    return buf[0..nul];
+}
+
+test "preflightExec resolves a tool through relative and absolute PATH entries" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bin_dir = try tmp.dir.createDirPathOpen(io, "bin", .{});
+    defer bin_dir.close(io);
+    const tool_rel = try tmpRelPath(arena, &tmp, "bin/mytool");
+    try writeFixtureFile(io, tool_rel, "#!/bin/sh\nexit 0\n", 0o755);
+
+    // A relative PATH entry resolves against the daemon cwd — here the test
+    // binary's cwd, which is exactly where the tmp tree lives.
+    const bin_rel = try tmpRelPath(arena, &tmp, "bin");
+    try preflightExec(arena, io, "mytool", "", bin_rel);
+
+    // An absolute PATH entry is used verbatim, no cwd join.
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_abs = testCwdInto(&cwd_buf) orelse return error.SkipZigTest;
+    const bin_abs = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd_abs, bin_rel });
+    try preflightExec(arena, io, "mytool", "", bin_abs);
+
+    // A tool missing from every PATH entry is pure ENOENT, so the taxonomy
+    // stays FileNotFound even after the full loop.
+    try std.testing.expectError(
+        error.FileNotFound,
+        preflightExec(arena, io, "definitely-missing-tool-xqz", "", bin_rel),
+    );
+}
+
+test "preflightExec reports AccessDenied for non-executable files and directories" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bin_dir = try tmp.dir.createDirPathOpen(io, "bin", .{});
+    defer bin_dir.close(io);
+
+    // Present but without any execute bit: access(X_OK) fails, the EACCES
+    // candidate is remembered across the PATH loop and surfaces as
+    // AccessDenied — the same error the execvpe loop would report.
+    const plain_rel = try tmpRelPath(arena, &tmp, "bin/plain");
+    try writeFixtureFile(io, plain_rel, "data\n", 0o644);
+    const bin_rel = try tmpRelPath(arena, &tmp, "bin");
+    try std.testing.expectError(
+        error.AccessDenied,
+        preflightExec(arena, io, "plain", "", bin_rel),
+    );
+
+    // A directory where a program is expected: execve refuses it with
+    // EACCES even though stat succeeds (probeCandidate maps non-regular
+    // files into the EACCES candidate set).
+    const sub_dir = try tmp.dir.createDirPathOpen(io, "somedir", .{});
+    defer sub_dir.close(io);
+    const dir_rel = try tmpRelPath(arena, &tmp, "somedir");
+    try std.testing.expectError(
+        error.AccessDenied,
+        preflightExec(arena, io, dir_rel, "", null),
+    );
+}
+
+test "preflightExec handles slash-containing argv0 and validates the cwd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bin_dir = try tmp.dir.createDirPathOpen(io, "bin", .{});
+    defer bin_dir.close(io);
+    const tool_rel = try tmpRelPath(arena, &tmp, "bin/mytool");
+    try writeFixtureFile(io, tool_rel, "#!/bin/sh\nexit 0\n", 0o755);
+
+    // An argv0 with slashes but no leading slash joins the (empty) cwd:
+    // identical resolution against the daemon cwd.
+    try preflightExec(arena, io, tool_rel, "", null);
+
+    // An absolute argv0 probes the path directly; PATH never participates.
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_abs = testCwdInto(&cwd_buf) orelse return error.SkipZigTest;
+    const tool_abs = try std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd_abs, tool_rel });
+    try preflightExec(arena, io, tool_abs, "", null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        preflightExec(arena, io, "/definitely/missing-xqz/tool", "", null),
+    );
+
+    // A relative argv0 joined onto a non-empty relative cwd: the child's
+    // post-chdir view, which is what childRelative models.
+    const tmp_root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try preflightExec(arena, io, "bin/mytool", tmp_root, null);
+
+    // The cwd is validated before any resolution: missing → FileNotFound.
+    try std.testing.expectError(
+        error.FileNotFound,
+        preflightExec(arena, io, "sh", "/definitely/missing-xqz", null),
+    );
+
+    // A cwd that exists but is a regular file → NotDir.
+    try std.testing.expectError(
+        error.NotDir,
+        preflightExec(arena, io, "sh", tool_rel, null),
+    );
+}
+
+test "preflightExec falls back to the default PATH when path_env is null" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    // null mirrors std's default PATH fallback; "sh" lives in /bin on every
+    // Linux the host and CI run.
+    try preflightExec(arena, io, "sh", "", null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        preflightExec(arena, io, "no-such-mcpnz-tool-xqz", "", null),
+    );
+}
+
+test "childRelative mirrors the child's post-chdir path resolution" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Empty cwd inherits the daemon cwd: rel passes through untouched.
+    try std.testing.expectEqualStrings("x", try childRelative(arena, "", "x"));
+    // Absolute and relative cwds both join with a single slash.
+    try std.testing.expectEqualStrings("/a/b", try childRelative(arena, "/a", "b"));
+    try std.testing.expectEqualStrings("rel/b", try childRelative(arena, "rel", "b"));
+}
+
+test "protectedPid flags exactly the listed pids" {
+    const protected = [_]std.posix.pid_t{ 10, 20, 30 };
+    try std.testing.expect(protectedPid(&protected, 20));
+    try std.testing.expect(!protectedPid(&protected, 99));
+    try std.testing.expect(!protectedPid(&[_]std.posix.pid_t{}, 1));
+}
+
+test "child tracking answers false for pids that are not our children" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    // pid 1 is nobody's child, and a pid far beyond anything the test binary
+    // could have spawned is equally foreign: waitid answers ECHILD for both,
+    // so the protected-set bookkeeping drops them.
+    try std.testing.expect(!childStillTracked(1));
+    try std.testing.expect(!childStillTracked(999999));
+
+    // Crash-safety sweep only: the reaped count depends on whether earlier
+    // exec tests in this binary left zombies behind, so the value itself is
+    // deliberately not asserted — reaping a stray is always safe (a stray
+    // by definition has no owner left to steal a reap from).
+    _ = reapStrayChildren(&[_]std.posix.pid_t{});
+}
