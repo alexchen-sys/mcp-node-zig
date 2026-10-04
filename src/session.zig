@@ -523,3 +523,321 @@ pub fn killTreeGuarded(session: *Session, io: Io) void {
         session.tree_killed.store(true, .release);
     }
 }
+
+// Sessions in these tests are synthetic: no process is ever spawned here
+// (tools.zig owns spawn coverage), so child stays undefined and neither
+// store operations nor renderSessionState touch it. A session inserted
+// into the store is owned by the store's single reference and freed by
+// evict, reap or remove plus sessionRelease; a session never inserted is
+// freed through freeSession directly, mirroring the store's free path.
+
+fn newSyntheticSession(io: Io, id: u64) !*Session {
+    const alloc = std.heap.page_allocator;
+    const argv = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(argv);
+    argv[0] = try alloc.dupe(u8, "synthetic");
+    errdefer alloc.free(argv[0]);
+    const cwd = try alloc.dupe(u8, ".");
+    errdefer alloc.free(cwd);
+    const session = try alloc.create(Session);
+    session.* = .{
+        .id = id,
+        .pid = 0,
+        .argv = argv,
+        .cwd = cwd,
+        .child = undefined,
+        .stdin_fd = null,
+        .started_us = nowUs(io),
+    };
+    return session;
+}
+
+test "session store allocates monotonic ids and tracks sessions" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+
+    try std.testing.expectEqual(@as(u64, 1), store.allocId());
+    try std.testing.expectEqual(@as(u64, 2), store.allocId());
+    try std.testing.expectEqual(@as(u64, 3), store.allocId());
+
+    const session = try newSyntheticSession(io, store.allocId());
+    try store.put(session);
+    try std.testing.expect(store.map.count() == 1);
+    // put() transfers ownership of the initial reference to the store map.
+    try std.testing.expectEqual(@as(u32, 1), session.refs.load(.monotonic));
+
+    // get() returns the same pointer and takes a reference for the caller.
+    const got = store.get(session.id).?;
+    try std.testing.expect(got == session);
+    try std.testing.expectEqual(@as(u32, 2), session.refs.load(.monotonic));
+    sessionRelease(got);
+    try std.testing.expectEqual(@as(u32, 1), session.refs.load(.monotonic));
+
+    // Unknown ids and repeated removals are inert.
+    try std.testing.expect(store.get(9999) == null);
+    const removed = store.remove(session.id).?;
+    try std.testing.expect(removed == session);
+    try std.testing.expect(store.remove(session.id) == null);
+    try std.testing.expect(store.get(session.id) == null);
+
+    // Dropping the removed session's reference frees it and empties the map.
+    sessionRelease(removed);
+    try std.testing.expect(store.map.count() == 0);
+}
+
+test "session store put rejects overflow and evicts a done session" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 1);
+    defer store.map.deinit();
+
+    const live = try newSyntheticSession(io, store.allocId());
+    try store.put(live);
+
+    // A full store with no finished session has no evict candidate: the
+    // second put must fail and leave the store untouched.
+    const next = try newSyntheticSession(io, store.allocId());
+    try std.testing.expectError(error.TooManySessions, store.put(next));
+    try std.testing.expect(store.map.count() == 1);
+
+    // Finish the live session: the next put evicts it (reader and waiter
+    // threads are null, so the joins return instantly and the store's
+    // reference is released, freeing the session) instead of failing.
+    live.done = true;
+    live.ended_us = nowUs(io);
+    const live_id = live.id;
+    try store.put(next);
+    try std.testing.expect(store.map.count() == 1);
+    try std.testing.expect(store.get(live_id) == null);
+
+    const got = store.get(next.id).?;
+    sessionRelease(got);
+    sessionRelease(store.remove(next.id).?);
+    try std.testing.expect(store.map.count() == 0);
+}
+
+test "session store reaps finished sessions past the ttl" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    store.ttl_ms = 0;
+
+    const first = try newSyntheticSession(io, store.allocId());
+    try store.put(first);
+    const second = try newSyntheticSession(io, store.allocId());
+    try store.put(second);
+    try std.testing.expect(store.map.count() == 2);
+
+    // Finish the first session one second in the past: with ttl_ms = 0 the
+    // next sweep must drop it (put calls reapDone before inserting).
+    first.done = true;
+    first.ended_us = nowUs(io) - 1_000_000;
+    const first_id = first.id;
+
+    const third = try newSyntheticSession(io, store.allocId());
+    try store.put(third);
+    try std.testing.expect(store.map.count() == 2);
+    try std.testing.expect(store.get(first_id) == null);
+
+    // A direct reapDone sweep reaps the same way.
+    second.done = true;
+    second.ended_us = nowUs(io) - 1_000_000;
+    const second_id = second.id;
+    store.reapDone();
+    try std.testing.expect(store.map.count() == 1);
+    try std.testing.expect(store.get(second_id) == null);
+
+    const got = store.get(third.id).?;
+    sessionRelease(got);
+    sessionRelease(store.remove(third.id).?);
+    try std.testing.expect(store.map.count() == 0);
+}
+
+test "render session state emits the full status snapshot" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const session = try newSyntheticSession(io, 4);
+    defer freeSession(session);
+    session.done = true;
+    session.exit_code = 7;
+    session.started_us = 1_700_000_000_000_000;
+    session.ended_us = session.started_us + 1_500_000;
+    session.truncated_stdout = true;
+    try session.stdout.appendSlice(std.heap.page_allocator, "abcdef");
+    try session.stderr.appendSlice(std.heap.page_allocator, "ghijkl");
+
+    var out: std.ArrayList(u8) = .empty;
+    try renderSessionState(arena, &store, session, 0, 0, &out);
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+    try std.testing.expect(parsed == .object);
+    const obj = parsed.object;
+    try std.testing.expect(obj.get("ok").?.bool);
+    try std.testing.expect(obj.get("done").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), obj.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("abcdef", obj.get("stdout").?.string);
+    try std.testing.expectEqualStrings("ghijkl", obj.get("stderr").?.string);
+    try std.testing.expectEqual(@as(i64, 6), obj.get("stdout_offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), obj.get("stderr_offset").?.integer);
+    try std.testing.expect(obj.get("truncated_stdout").?.bool);
+    try std.testing.expect(!obj.get("truncated_stderr").?.bool);
+    try std.testing.expectEqual(@as(i64, 1500), obj.get("duration_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_500_000), obj.get("duration_us").?.integer);
+}
+
+test "render session state applies byte offsets and rejects bad ones" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const session = try newSyntheticSession(io, 5);
+    defer freeSession(session);
+    try session.stdout.appendSlice(std.heap.page_allocator, "abcdef");
+    try session.stderr.appendSlice(std.heap.page_allocator, "xyz");
+
+    // The delta starts at the requested byte offset and the reported
+    // offset advances by the delta length.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 2, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        const obj = parsed.object;
+        try std.testing.expectEqualStrings("cdef", obj.get("stdout").?.string);
+        try std.testing.expectEqual(@as(i64, 6), obj.get("stdout_offset").?.integer);
+        try std.testing.expectEqualStrings("xyz", obj.get("stderr").?.string);
+        try std.testing.expectEqual(@as(i64, 3), obj.get("stderr_offset").?.integer);
+    }
+
+    // An offset equal to the length is legal: the delta is empty and the
+    // offset stays pinned at the end.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 6, 3, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        const obj = parsed.object;
+        try std.testing.expectEqualStrings("", obj.get("stdout").?.string);
+        try std.testing.expectEqual(@as(i64, 6), obj.get("stdout_offset").?.integer);
+        try std.testing.expectEqualStrings("", obj.get("stderr").?.string);
+        try std.testing.expectEqual(@as(i64, 3), obj.get("stderr_offset").?.integer);
+    }
+
+    // Negative and past-the-end offsets are rejected on both streams.
+    var sink: std.ArrayList(u8) = .empty;
+    try std.testing.expectError(error.BadOffset, renderSessionState(arena, &store, session, -1, 0, &sink));
+    try std.testing.expectError(error.BadOffset, renderSessionState(arena, &store, session, 7, 0, &sink));
+    try std.testing.expectError(error.BadOffset, renderSessionState(arena, &store, session, 0, -1, &sink));
+    try std.testing.expectError(error.BadOffset, renderSessionState(arena, &store, session, 0, 4, &sink));
+}
+
+test "render session state holds back a partial utf8 tail while alive" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const session = try newSyntheticSession(io, 6);
+    defer freeSession(session);
+    try session.stdout.appendSlice(std.heap.page_allocator, "ab\xc3");
+
+    // Alive: the dangling lead byte of a two-byte sequence must not be
+    // split; the reported offset stops at the last complete boundary.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 0, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        const obj = parsed.object;
+        try std.testing.expect(!obj.get("done").?.bool);
+        try std.testing.expect(obj.get("exit_code").? == .null);
+        try std.testing.expectEqualStrings("ab", obj.get("stdout").?.string);
+        try std.testing.expectEqual(@as(i64, 2), obj.get("stdout_offset").?.integer);
+    }
+
+    // Done: the partial tail is flushed through the lossy renderer (the
+    // dangling lead byte becomes one U+FFFD) and the offset covers it.
+    session.done = true;
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 0, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        const obj = parsed.object;
+        try std.testing.expect(obj.get("done").?.bool);
+        try std.testing.expectEqualStrings("ab\xef\xbf\xbd", obj.get("stdout").?.string);
+        try std.testing.expectEqual(@as(i64, 3), obj.get("stdout_offset").?.integer);
+    }
+
+    // Complete multi-byte sequences pass through untouched while alive.
+    const complete = try newSyntheticSession(io, 7);
+    defer freeSession(complete);
+    try complete.stdout.appendSlice(std.heap.page_allocator, "a\xc3\xa9z");
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, complete, 0, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        const obj = parsed.object;
+        try std.testing.expectEqualStrings("a\xc3\xa9z", obj.get("stdout").?.string);
+        try std.testing.expectEqual(@as(i64, 4), obj.get("stdout_offset").?.integer);
+    }
+}
+
+test "render session state replaces invalid utf8 with replacement chars" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const session = try newSyntheticSession(io, 8);
+    defer freeSession(session);
+    try session.stdout.appendSlice(std.heap.page_allocator, "a\xffb");
+
+    // Alive: invalid bytes are not held back (only partial tails are), so
+    // the lossy renderer replaces them the same way in both modes.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 0, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        try std.testing.expectEqualStrings("a\xef\xbf\xbdb", parsed.object.get("stdout").?.string);
+    }
+
+    session.done = true;
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionState(arena, &store, session, 0, 0, &out);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
+        try std.testing.expectEqualStrings("a\xef\xbf\xbdb", parsed.object.get("stdout").?.string);
+    }
+}
+
+test "utf8 prefix and offset slicing helpers" {
+    // Complete ASCII and multi-byte prefixes pass through in full.
+    try std.testing.expectEqualStrings("", utf8CompletePrefix(""));
+    try std.testing.expectEqualStrings("ab", utf8CompletePrefix("ab"));
+    try std.testing.expectEqualStrings("a\xc3\xa9z", utf8CompletePrefix("a\xc3\xa9z"));
+    try std.testing.expectEqualStrings("\xf0\x9f\x92\xa9", utf8CompletePrefix("\xf0\x9f\x92\xa9"));
+
+    // A partial multi-byte tail is held back at the last complete boundary.
+    try std.testing.expectEqualStrings("ab", utf8CompletePrefix("ab\xc3"));
+    try std.testing.expectEqualStrings("", utf8CompletePrefix("\xe4\xb8"));
+
+    // Invalid bytes stay in the prefix for the lossy renderer to replace.
+    try std.testing.expectEqualStrings("a\xffb", utf8CompletePrefix("a\xffb"));
+    try std.testing.expectEqualStrings("\xc3\x28", utf8CompletePrefix("\xc3\x28"));
+
+    // Offsets slice by raw byte count; out-of-range values are rejected.
+    try std.testing.expectEqualStrings("cdef", try sliceFromOffset("abcdef", 2));
+    try std.testing.expectEqualStrings("abcdef", try sliceFromOffset("abcdef", 0));
+    try std.testing.expectEqualStrings("", try sliceFromOffset("abcdef", 6));
+    try std.testing.expectError(error.BadOffset, sliceFromOffset("abcdef", -1));
+    try std.testing.expectError(error.BadOffset, sliceFromOffset("abcdef", 7));
+}
