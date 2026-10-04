@@ -70,6 +70,22 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 - **Kills the whole tree.** Process groups on POSIX, Job Objects on Windows. No orphaned children holding pipes.
 - **Linux, macOS, Windows.** All three are built and smoke-tested in CI on every push.
 
+## How is this different from SSH?
+
+They solve different problems, and they work well together.
+
+SSH is a secure transport and a terminal for people. It has encryption, key management, agent forwarding, PTYs, scp/sftp/rsync and decades of hardening. Keep using it for all of that.
+
+mcp-node is an execution API for agents. Through SSH, an agent gets one string that a remote shell parses again, plus raw bytes and an exit status. Here it gets:
+
+- **argv without a shell.** No second round of quoting for a remote shell to reparse. A shell is used only when you ask for `exec_shell`.
+- **Structured results.** `stdout`, `stderr`, `exit_code`, `truncated_*` and timings as JSON, with per-call timeouts.
+- **Sessions that outlive the request.** `exec_start`, then `exec_poll` by byte offset, `exec_write` to stdin, `exec_wait` up to 300 s, `exec_kill` for the whole tree. A dropped connection doesn't kill the build.
+- **Verified file writes.** `write_file` takes base64 and returns the SHA-256 of what landed on disk.
+- **A self-describing interface.** Any MCP client discovers the tools from `tools/list`; nothing to teach the agent.
+
+Speed isn't the argument: on an open connection both are fast. mcp-node has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
+
 ## Tools
 
 | Tool | Does |
