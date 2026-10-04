@@ -23,9 +23,9 @@ SSH bridges need keys and OpenSSH. Runtimes need Node or Python on every box. mc
 Four commands to a working node (Linux, x86_64):
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-linux.tar.gz | tar xz
 openssl rand -hex 32 > token
-./mcp-node-v0.1.1-x86_64-linux/mcp-node &
+./mcp-node-v0.1.2-x86_64-linux/mcp-node &
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json' \
@@ -59,20 +59,20 @@ No `openssl`? `head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > token` work
 **macOS (Apple Silicon)** — same flow with the aarch64 archive:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-aarch64-macos.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-aarch64-macos.tar.gz | tar xz
 openssl rand -hex 32 > token
-./mcp-node-v0.1.1-aarch64-macos/mcp-node &
+./mcp-node-v0.1.2-aarch64-macos/mcp-node &
 ```
 
-then the same `curl` verify as on Linux. ARM64 Linux: swap in `mcp-node-v0.1.1-aarch64-linux.tar.gz`. Intel Macs: [build from source](#building-from-source).
+then the same `curl` verify as on Linux. ARM64 Linux: swap in `mcp-node-v0.1.2-aarch64-linux.tar.gz`. Intel Macs: [build from source](#building-from-source).
 
 **Windows (PowerShell)** — run the server in one window:
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.1.1-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.1.2-x86_64-windows\mcp-node.exe
 ```
 
 and verify from a second window:

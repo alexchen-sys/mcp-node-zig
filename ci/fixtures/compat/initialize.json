@@ -6,7 +6,7 @@
       "request": {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "compat", "version": "0"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 101, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.1"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
+        "response": {"jsonrpc": "2.0", "id": 101, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.2"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
       }
     },
     {
@@ -14,7 +14,7 @@
       "request": {"jsonrpc": "2.0", "id": 102, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 102, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.1"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
+        "response": {"jsonrpc": "2.0", "id": 102, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.2"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
       }
     },
     {
@@ -22,7 +22,7 @@
       "request": {"jsonrpc": "2.0", "id": "init-str", "method": "initialize"},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": "init-str", "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.1"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
+        "response": {"jsonrpc": "2.0", "id": "init-str", "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.1.2"}, "instructions": "This node runs commands and file operations directly on the host it is deployed on. Prefer exec over exec_shell: exec passes argv verbatim without a shell, so metacharacters are data; use exec_shell only for pipelines, redirects and other shell syntax. Use exec_start for long-running or interactive processes, then poll with exec_poll and always release sessions with exec_close - sessions survive across HTTP requests. Every request must carry the node token in the X-Node-Token header (or Authorization: Bearer)."}}
       }
     }
   ]

@@ -23,9 +23,9 @@ SSH-мостам нужны ключи и OpenSSH. Рантаймам нужен
 Четыре команды до рабочей ноды (Linux, x86_64):
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-linux.tar.gz | tar xz
 openssl rand -hex 32 > token
-./mcp-node-v0.1.1-x86_64-linux/mcp-node &
+./mcp-node-v0.1.2-x86_64-linux/mcp-node &
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json' \
@@ -59,20 +59,20 @@ curl -sS http://127.0.0.1:8341/mcp \
 **macOS (Apple Silicon)** — тот же флоу с aarch64-архивом:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-aarch64-macos.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-aarch64-macos.tar.gz | tar xz
 openssl rand -hex 32 > token
-./mcp-node-v0.1.1-aarch64-macos/mcp-node &
+./mcp-node-v0.1.2-aarch64-macos/mcp-node &
 ```
 
-затем тот же `curl`-verify, что и на Linux. Linux ARM64: подставьте `mcp-node-v0.1.1-aarch64-linux.tar.gz`. Intel Mac: [сборка из исходников](#сборка-из-исходников).
+затем тот же `curl`-verify, что и на Linux. Linux ARM64: подставьте `mcp-node-v0.1.2-aarch64-linux.tar.gz`. Intel Mac: [сборка из исходников](#сборка-из-исходников).
 
 **Windows (PowerShell)** — запустите сервер в одном окне:
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.1/mcp-node-v0.1.1-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.1.1-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.1.2-x86_64-windows\mcp-node.exe
 ```
 
 и проверьте из второго окна:
