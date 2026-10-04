@@ -250,6 +250,37 @@ pub fn readFrame(gpa: Allocator, fd: os.net.Handle, max_payload: u32, idle_ms: u
     return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
 }
 
+/// Read one frame under one absolute deadline of `budget_ms` counted from
+/// `started`: a peer dribbling one byte per read cannot stretch it. Used
+/// for the handshake, where an unauthenticated peer must finish in time.
+pub fn readFrameWithin(gpa: Allocator, fd: os.net.Handle, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
+    var hdr: [HEADER_LEN]u8 = undefined;
+    try readExactWithin(fd, &hdr, io, started, budget_ms);
+    const h = try decodeHeader(&hdr, max_payload);
+    const payload = try gpa.alloc(u8, h.len);
+    errdefer gpa.free(payload);
+    try readExactWithin(fd, payload, io, started, budget_ms);
+    return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
+}
+
+fn readExactWithin(fd: os.net.Handle, buf: []u8, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const elapsed_i = started.untilNow(io, .awake).toMilliseconds();
+        const elapsed: u64 = if (elapsed_i > 0) @intCast(elapsed_i) else 0;
+        if (elapsed >= budget_ms) return error.LinkTimeout;
+        const remaining = budget_ms - elapsed;
+        // Every read is armed with what is left of the one deadline.
+        os.net.setSocketReadTimeoutMs(fd, remaining) catch return error.SocketOptionFailed;
+        const n = os.net.socketReadSome(fd, buf[filled..], remaining) catch |err| {
+            if (os.net.isReadTimeout(err)) return error.LinkTimeout;
+            return error.LinkClosed;
+        };
+        if (n == 0) return error.LinkClosed;
+        filled += n;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

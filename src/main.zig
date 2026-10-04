@@ -8,6 +8,7 @@ const session_mod = @import("session.zig");
 const config = @import("config.zig");
 const env_state = @import("env_state.zig");
 const node_link = @import("node_link.zig");
+const hub_mod = @import("hub.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -72,6 +73,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var node = node_link.Node{ .io = io, .cfg = &cfg };
         node_link.run(&node);
         return;
+    }
+
+    // Hub mode: node links on their own listener; clients keep this one.
+    var hub = hub_mod.Hub.init(io, &cfg, cfg.hub_secrets orelse .{ .single = "" });
+    var hub_server: Io.net.Server = undefined;
+    if (cfg.mode == .hub) {
+        try hub_mod.start(&hub, &hub_server);
+        cfg.hub = &hub;
+        const ep = cfg.hub_listen.?;
+        logLine("mcp-node hub accepting node links", ep.host, ep.port);
     }
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
@@ -200,4 +211,5 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("rpc.zig"));
     std.testing.refAllDecls(@import("link.zig"));
     std.testing.refAllDecls(@import("node_link.zig"));
+    std.testing.refAllDecls(@import("hub.zig"));
 }
