@@ -152,7 +152,9 @@ do not survive a node restart.
 
 Measured on x86_64 Linux, ReleaseSafe:
 
-- binary: 5.18 MB with the link and hub, 9.08 MB with the TLS client
-  (std TLS and X.509 parsing account for the difference);
+- binary: 4.62 MB before this feature, 8.62 MB with the link, hub and TLS
+  client (+4.0 MB, almost all of it std TLS and X.509 parsing; the link and
+  hub alone added about 0.6 MB);
 - idle RSS after 6 s: plain node 0.5 MB, hub with one node 1.0 MB, plain
-  listen mode 0.5 MB; threads: hub 4, node 2, listen 1.
+  listen mode 0.5 MB (512 kB before this feature, 520 kB after); threads:
+  hub 4, node 2, listen 1.
