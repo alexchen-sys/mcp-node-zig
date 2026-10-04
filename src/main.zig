@@ -7,6 +7,7 @@ const http = @import("http.zig");
 const session_mod = @import("session.zig");
 const config = @import("config.zig");
 const env_state = @import("env_state.zig");
+const node_link = @import("node_link.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -44,7 +45,7 @@ const Connection = struct {
     stream: Io.net.Stream,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -55,13 +56,23 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var cfg = try config.loadConfig(arena, io);
+    const cli_connect = try parseArgs(try init.args.toSlice(arena));
+    var cfg = try config.loadConfigMode(arena, io, cli_connect);
     var sessions = session_mod.SessionStore.init(io, cfg.max_sessions);
     sessions.ttl_ms = @as(i64, cfg.session_ttl_s) * 1000;
     cfg.sessions = &sessions;
     var gate = ConnGate{ .io = io, .max = cfg.max_conn };
     var inflight = config.InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
     cfg.inflight = &inflight;
+
+    if (cfg.mode == .node) {
+        // Node mode opens no listener: every request arrives over the link.
+        const ep = cfg.connect.?;
+        logLine("mcp-node connecting", ep.host, ep.port);
+        var node = node_link.Node{ .io = io, .cfg = &cfg };
+        node_link.run(&node);
+        return;
+    }
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -153,10 +164,40 @@ fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     os.writeAllFd(os.stderrFd(), line) catch {};
 }
 
+/// Command line: `--connect host:port` (or `--connect=host:port`). Other
+/// arguments are ignored, exactly as before this flag existed.
+fn parseArgs(argv: []const [:0]const u8) !?[]const u8 {
+    var connect: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a: []const u8 = argv[i];
+        if (std.mem.eql(u8, a, "--connect")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("--connect needs host:port\n", .{});
+                return error.InvalidConfig;
+            }
+            i += 1;
+            connect = argv[i];
+        } else if (std.mem.startsWith(u8, a, "--connect=")) {
+            connect = a["--connect=".len..];
+        }
+    }
+    return connect;
+}
+
+test "command line picks up --connect and ignores the rest" {
+    try std.testing.expect((try parseArgs(&.{"mcp-node"})) == null);
+    try std.testing.expectEqualStrings("h:1", (try parseArgs(&.{ "mcp-node", "--connect", "h:1" })).?);
+    try std.testing.expectEqualStrings("h:2", (try parseArgs(&.{ "mcp-node", "--connect=h:2" })).?);
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--connect" }));
+    try std.testing.expect((try parseArgs(&.{ "mcp-node", "-x" })) == null);
+}
+
 test "discover module tests" {
     // Test builds analyze decls lazily per decl: a module not referenced by
     // any root test would have its test blocks silently skipped. Pull them in.
     std.testing.refAllDecls(@import("http.zig"));
     std.testing.refAllDecls(@import("rpc.zig"));
     std.testing.refAllDecls(@import("link.zig"));
+    std.testing.refAllDecls(@import("node_link.zig"));
 }
