@@ -61,10 +61,22 @@ pub fn encodeHeader(out: *[HEADER_LEN]u8, h: Header) void {
 
 pub const DecodeError = error{ UnknownFrameType, FrameTooLarge };
 
+/// Per-type payload ceiling. Control frames are tiny by construction, so a
+/// peer announcing more is dropped before anything is allocated.
+pub fn typeCap(kind: FrameType) u32 {
+    return switch (kind) {
+        .ping, .pong, .challenge => 64,
+        .goaway, .welcome => 256,
+        .hello => MAX_HANDSHAKE_PAYLOAD,
+        .req, .resp => MAX_PAYLOAD,
+    };
+}
+
 pub fn decodeHeader(in: *const [HEADER_LEN]u8, max_payload: u32) DecodeError!Header {
     const len = std.mem.readInt(u32, in[0..4], .big);
     if (len > max_payload) return error.FrameTooLarge;
     const kind = std.enums.fromInt(FrameType, in[4]) orelse return error.UnknownFrameType;
+    if (len > typeCap(kind)) return error.FrameTooLarge;
     return .{ .len = len, .kind = kind, .stream_id = std.mem.readInt(u32, in[5..9], .big) };
 }
 
@@ -383,6 +395,45 @@ test "link header round-trips and rejects unknown types and oversize" {
     try testing.expectError(error.UnknownFrameType, decodeHeader(&buf, std.math.maxInt(u32)));
     buf[4] = 9;
     try testing.expectError(error.UnknownFrameType, decodeHeader(&buf, std.math.maxInt(u32)));
+}
+
+test "link control frames are capped per type before allocation" {
+    var buf: [HEADER_LEN]u8 = undefined;
+    const cases = [_]struct { kind: FrameType, ok: u32 }{
+        .{ .kind = .ping, .ok = 64 },
+        .{ .kind = .pong, .ok = 64 },
+        .{ .kind = .challenge, .ok = 64 },
+        .{ .kind = .goaway, .ok = 256 },
+        .{ .kind = .welcome, .ok = 256 },
+        .{ .kind = .hello, .ok = MAX_HANDSHAKE_PAYLOAD },
+    };
+    for (cases) |c| {
+        encodeHeader(&buf, .{ .len = c.ok, .kind = c.kind, .stream_id = 0 });
+        _ = try decodeHeader(&buf, MAX_PAYLOAD);
+        encodeHeader(&buf, .{ .len = c.ok + 1, .kind = c.kind, .stream_id = 0 });
+        try testing.expectError(error.FrameTooLarge, decodeHeader(&buf, MAX_PAYLOAD));
+    }
+    encodeHeader(&buf, .{ .len = 1 << 20, .kind = .req, .stream_id = 1 });
+    _ = try decodeHeader(&buf, MAX_PAYLOAD);
+}
+
+test "link oversize ping is refused on the read path without reading the body" {
+    // A header announcing a 1 MiB PING followed by nothing: the read must
+    // fail on the header alone instead of waiting for (and allocating) it.
+    const Fake = struct {
+        bytes: []const u8,
+        off: usize = 0,
+        pub fn readSome(self: *@This(), out: []u8, _: u64) !usize {
+            const n = @min(out.len, self.bytes.len - self.off);
+            @memcpy(out[0..n], self.bytes[self.off .. self.off + n]);
+            self.off += n;
+            return n;
+        }
+    };
+    var hdr: [HEADER_LEN]u8 = undefined;
+    encodeHeader(&hdr, .{ .len = 1 << 20, .kind = .ping, .stream_id = 0 });
+    var fake = Fake{ .bytes = &hdr };
+    try testing.expectError(error.FrameTooLarge, readFrameOn(testing.allocator, &fake, MAX_PAYLOAD, 1000));
 }
 
 test "link node names follow the documented alphabet and length" {
