@@ -126,6 +126,20 @@ do not survive a node restart.
   identity check. A secret is a shell on that node; store it with `0600`
   permissions.
 
+## Limits
+
+- The hub keeps at most 16 unauthenticated handshakes at once; further
+  connections are closed at once. If the link port is reachable from the
+  internet, firewall it to known sources.
+- Each link has one write lock, so a large response delays the other
+  frames on the same link until it is written.
+- A relayed request waits for its node up to max(socket timeout, 1 h).
+- Control frames are capped: PING, PONG and CHALLENGE at 64 bytes,
+  WELCOME and GOAWAY at 256 bytes. A larger frame drops the link.
+- On a TLS link the node does not answer a TLS 1.3 KeyUpdate request with
+  its own KeyUpdate (std limitation). A terminator that insists on one may
+  drop the link; the node then reconnects.
+
 ## What it deliberately does not do
 
 - No TLS server in the hub, no own cryptography beyond std HMAC and TLS.
