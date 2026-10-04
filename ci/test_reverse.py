@@ -397,6 +397,124 @@ def case_listen_mode_unaffected(env):
     check(status == 404, 'listen mode must not expose /n: %d' % status)
 
 
+class SkipCase(Exception):
+    pass
+
+
+def _openssl(*args, cwd):
+    subprocess.run(['openssl', *args], cwd=cwd, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _make_ca(d, tag):
+    _openssl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+             '-nodes', '-days', '2', '-subj', '/CN=throwaway %s ca' % tag,
+             '-addext', 'basicConstraints=critical,CA:TRUE',
+             '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+             '-keyout', '%s-ca.key' % tag, '-out', '%s-ca.pem' % tag, cwd=d)
+
+
+def _make_server_cert(d, ca_tag):
+    (Path(d) / 'ext.cnf').write_text(
+        'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+        'extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n')
+    _openssl('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+             '-subj', '/CN=localhost', '-keyout', 'server.key', '-out', 'server.csr', cwd=d)
+    _openssl('x509', '-req', '-in', 'server.csr', '-CA', '%s-ca.pem' % ca_tag,
+             '-CAkey', '%s-ca.key' % ca_tag, '-CAcreateserial', '-days', '2',
+             '-extfile', 'ext.cnf', '-out', 'server.pem', cwd=d)
+
+
+class TlsTerminator:
+    """TLS server on loopback that pipes each connection to a plain port."""
+
+    def __init__(self, cert, key, upstream_port):
+        import ssl
+        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ctx.load_cert_chain(cert, key)
+        self.upstream_port = upstream_port
+        self.port = pick_port()
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('127.0.0.1', self.port))
+        self.sock.listen(8)
+        self.closed = False
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while not self.closed:
+            try:
+                raw, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(raw,), daemon=True).start()
+
+    def _serve(self, raw):
+        try:
+            tls = self.ctx.wrap_socket(raw, server_side=True)
+        except OSError:
+            raw.close()
+            return
+        try:
+            up = socket.create_connection(('127.0.0.1', self.upstream_port), timeout=5)
+        except OSError:
+            tls.close()
+            return
+        up.settimeout(None)
+        tls.settimeout(None)
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            for s in (src, dst):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        threading.Thread(target=pump, args=(up, tls), daemon=True).start()
+        pump(tls, up)
+
+    def close(self):
+        self.closed = True
+        self.sock.close()
+
+
+def case_tls_link(env):
+    import shutil
+    if shutil.which('openssl') is None:
+        raise SkipCase('openssl CLI not found')
+    d = str(env.dir)
+    _make_ca(d, 'good')
+    _make_ca(d, 'other')
+    _make_server_cert(d, 'good')
+    env.start_hub()
+    term = TlsTerminator(str(env.dir / 'server.pem'), str(env.dir / 'server.key'), env.link_port)
+    try:
+        target = 'localhost:%d' % term.port
+        env.start_node('tlsnode', target=target, extra={
+            'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'good-ca.pem')})
+        check(env.wait_node('tlsnode', 15), 'TLS node never appeared in /n')
+        out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-tls'], 'timeout': 10})
+        check(out.get('ok') and out.get('stdout') == 'over-tls\n', out)
+
+        bad = env.start_node('tlsbad', target=target, extra={
+            'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'other-ca.pem')})
+        failed = wait_until(lambda: 'TLS handshake failed' in bad.logs(), 10, 0.1)
+        check(failed, 'untrusted CA was not rejected: ' + bad.logs()[-1000:])
+        time.sleep(1.5)
+        check('tlsbad' not in env.nodes(), env.nodes())
+        check(bad.alive(), 'node must keep retrying, not exit')
+    finally:
+        term.close()
+
+
 CASES = [
     ('hub + node connect, node listed in /n', case_connect_and_list),
     ('initialize, tools/list, sys_info, exec via /n/<name>/mcp', case_mcp_surface_via_hub),
@@ -408,6 +526,7 @@ CASES = [
     ('node restart under the same name takes over', case_node_restart_replaces_link),
     ('same name on a live link replaces it with GOAWAY', case_live_replacement),
     ('default listener mode unaffected', case_listen_mode_unaffected),
+    ('TLS link: trusted CA connects and serves exec, other CA never appears', case_tls_link),
 ]
 
 
@@ -428,6 +547,8 @@ def main():
         try:
             fn(env)
             print('PASS %s (%.1fs)' % (title, time.monotonic() - t0), flush=True)
+        except SkipCase as why:
+            print('SKIP %s: %s' % (title, why), flush=True)
         except Exception:
             failed += 1
             print('FAIL %s' % title, flush=True)

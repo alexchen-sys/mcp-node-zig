@@ -51,6 +51,12 @@ pub const Config = struct {
     /// node mode: hub address to dial and the shared secret for HELLO.
     connect: ?Endpoint = null,
     connect_secret: []const u8 = "",
+    /// node mode: wrap the link in TLS (MCP_NODE_CONNECT_TLS=1). The server
+    /// certificate is always verified against `connect_ca_file` (PEM bundle)
+    /// or, when null, the system bundle, for host `connect_server_name`.
+    connect_tls: bool = false,
+    connect_ca_file: ?[]const u8 = null,
+    connect_server_name: []const u8 = "",
     /// hub mode: node-link listener and the secrets nodes authenticate with.
     hub_listen: ?Endpoint = null,
     hub_secrets: ?link.SecretSet = null,
@@ -203,6 +209,21 @@ pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Confi
                 std.debug.print("MCP_NODE_CONNECT_SECRET_FILE is empty\n", .{});
                 return error.InvalidConfig;
             };
+            const tls_s = getEnv(arena, "MCP_NODE_CONNECT_TLS") orelse "";
+            if (std.mem.eql(u8, tls_s, "1")) {
+                cfg.connect_tls = true;
+            } else if (!(tls_s.len == 0 or std.mem.eql(u8, tls_s, "0"))) {
+                std.debug.print("MCP_NODE_CONNECT_TLS must be 0 or 1, got '{s}'\n", .{tls_s});
+                return error.InvalidConfig;
+            }
+            if (cfg.connect_tls) {
+                cfg.connect_ca_file = getEnv(arena, "MCP_NODE_CONNECT_CA_FILE");
+                cfg.connect_server_name = getEnv(arena, "MCP_NODE_CONNECT_SERVER_NAME") orelse cfg.connect.?.host;
+                if (cfg.connect_server_name.len == 0) {
+                    std.debug.print("MCP_NODE_CONNECT_SERVER_NAME must not be empty\n", .{});
+                    return error.InvalidConfig;
+                }
+            }
         },
         .hub => {
             cfg.hub_listen = parseEndpoint(arena, hub_s.?) catch {

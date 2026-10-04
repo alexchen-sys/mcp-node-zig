@@ -69,7 +69,12 @@ pub fn run(node: *Node) void {
 fn connectOnce(node: *Node, ep: config.Endpoint) !u64 {
     const stream = try dial(node.io, ep);
     std.debug.print("node link: connected to {s}:{d}\n", .{ ep.host, ep.port });
-    return session(node, stream);
+    if (!node.cfg.connect_tls) return session(node, stream);
+    const tls = TlsState.start(node, stream) catch |err| {
+        stream.close(node.io);
+        return err;
+    };
+    return sessionOn(node, stream, .{ .tls = tls });
 }
 
 fn dial(io: Io, ep: config.Endpoint) !Io.net.Stream {
@@ -83,18 +88,23 @@ fn dial(io: Io, ep: config.Endpoint) !Io.net.Stream {
 /// Run one link on a connected stream (takes ownership). Returns how long
 /// the link was up after WELCOME, in milliseconds.
 pub fn session(node: *Node, stream: Io.net.Stream) !u64 {
+    return sessionOn(node, stream, .{ .plain = .{ .fd = stream.socket.handle } });
+}
+
+fn sessionOn(node: *Node, stream: Io.net.Stream, conn: Conn) !u64 {
     const io = node.io;
     const ln = std.heap.page_allocator.create(Link) catch {
+        conn.deinit();
         stream.close(io);
         return error.OutOfMemory;
     };
-    ln.* = .{ .node = node, .stream = stream };
+    ln.* = .{ .node = node, .stream = stream, .conn = conn };
     defer ln.release();
     const fd = stream.socket.handle;
     const timeout_ms = @as(u64, node.cfg.socket_timeout_s) * 1000;
     os.net.setSocketTimeouts(fd, node.cfg.socket_timeout_s) catch return error.SocketOptionFailed;
 
-    try handshake(node, fd, timeout_ms);
+    try handshake(node, conn, timeout_ms);
     const up_since = std.Io.Clock.awake.now(io);
     std.debug.print("node link: welcome as '{s}'\n", .{node.cfg.name});
 
@@ -111,18 +121,18 @@ pub fn session(node: *Node, stream: Io.net.Stream) !u64 {
     return if (up > 0) @intCast(up) else 0;
 }
 
-fn handshake(node: *Node, fd: os.net.Handle, timeout_ms: u64) !void {
+fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const ch = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
+    const ch = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
     if (ch.kind != .challenge or ch.payload.len != link.NONCE_LEN) return error.BadChallenge;
     const nonce: *const [link.NONCE_LEN]u8 = ch.payload[0..link.NONCE_LEN];
     const hello = try link.buildHello(arena, node.cfg.connect_secret, nonce, node.cfg.name);
-    try link.writeFrame(fd, .hello, 0, hello, timeout_ms);
+    try link.writeFramePartsOn(conn, .hello, 0, &.{hello}, timeout_ms);
 
-    const reply = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
+    const reply = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
     switch (reply.kind) {
         .welcome => {},
         .goaway => {
@@ -133,9 +143,180 @@ fn handshake(node: *Node, fd: os.net.Handle, timeout_ms: u64) !void {
     }
 }
 
+/// Byte channel of one link: the plain socket, or TLS over it.
+const Conn = union(enum) {
+    plain: link.FdConn,
+    tls: *TlsState,
+
+    pub fn readSome(self: Conn, buf: []u8, timeout_ms: u64) !usize {
+        return switch (self) {
+            .plain => |c| c.readSome(buf, timeout_ms),
+            .tls => |t| t.readSome(buf, timeout_ms),
+        };
+    }
+
+    pub fn write(self: Conn, bytes: []const u8, timeout_ms: u64) !void {
+        return switch (self) {
+            .plain => |c| c.write(bytes, timeout_ms),
+            .tls => |t| t.write(bytes),
+        };
+    }
+
+    pub fn flush(self: Conn, timeout_ms: u64) !void {
+        return switch (self) {
+            .plain => |c| c.flush(timeout_ms),
+            .tls => |t| t.flush(),
+        };
+    }
+
+    fn deinit(self: Conn) void {
+        switch (self) {
+            .plain => {},
+            .tls => |t| t.destroy(),
+        }
+    }
+};
+
+/// TLS client state for one link (heap-pinned: the client keeps pointers
+/// to the socket reader/writer). Ciphertext moves through the os.net
+/// helpers, so read deadlines behave exactly like the plain path: every
+/// socket read is armed with SO_RCVTIMEO (software deadline on Windows)
+/// and a timeout surfaces as error.LinkTimeout. One thread reads, writers
+/// are serialized by the link mutex.
+const TlsState = struct {
+    const tls = std.crypto.tls;
+    const BUF = tls.Client.min_buffer_len;
+
+    fd: os.net.Handle,
+    /// Deadline for the next socket read and the error behind ReadFailed.
+    read_timeout_ms: u64 = HANDSHAKE_MS,
+    read_err: ?anyerror = null,
+    send_timeout_ms: u64,
+    sock_in: Io.Reader,
+    sock_out: Io.Writer,
+    client: tls.Client = undefined,
+    bundle: std.crypto.Certificate.Bundle = .empty,
+    bundle_lock: Io.RwLock = .init,
+    in_buf: [BUF]u8 = undefined,
+    out_buf: [BUF]u8 = undefined,
+    plain_in: [BUF]u8 = undefined,
+    plain_out: [BUF]u8 = undefined,
+
+    fn start(node: *Node, stream: Io.net.Stream) !*TlsState {
+        const io = node.io;
+        const cfg = node.cfg;
+        const gpa = std.heap.page_allocator;
+        const self = try gpa.create(TlsState);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .fd = stream.socket.handle,
+            .send_timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000,
+            .sock_in = .{ .vtable = &.{ .stream = sockStream }, .buffer = &.{}, .seek = 0, .end = 0 },
+            .sock_out = .{ .vtable = &.{ .drain = sockDrain }, .buffer = &.{} },
+        };
+        self.sock_in.buffer = &self.in_buf;
+        self.sock_out.buffer = &self.out_buf;
+        errdefer self.bundle.deinit(gpa);
+        os.net.setSocketTimeouts(self.fd, cfg.socket_timeout_s) catch return error.SocketOptionFailed;
+
+        const now = Io.Clock.real.now(io);
+        if (cfg.connect_ca_file) |path| {
+            const loaded = if (std.fs.path.isAbsolute(path))
+                self.bundle.addCertsFromFilePathAbsolute(gpa, io, now, path)
+            else
+                self.bundle.addCertsFromFilePath(gpa, io, now, Io.Dir.cwd(), path);
+            loaded catch |err| {
+                std.debug.print("node link: cannot load MCP_NODE_CONNECT_CA_FILE: {s}\n", .{@errorName(err)});
+                return error.CaFileUnusable;
+            };
+        } else {
+            self.bundle.rescan(gpa, io, now) catch |err| {
+                std.debug.print("node link: cannot load the system CA bundle: {s}\n", .{@errorName(err)});
+                return error.CaBundleUnusable;
+            };
+        }
+
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.randomSecure(&entropy) catch return error.EntropyUnavailable;
+        defer std.crypto.secureZero(u8, &entropy);
+        self.client = tls.Client.init(&self.sock_in, &self.sock_out, .{
+            .host = .{ .explicit = cfg.connect_server_name },
+            .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &self.bundle_lock, .bundle = &self.bundle } },
+            .write_buffer = &self.plain_out,
+            .read_buffer = &self.plain_in,
+            .entropy = &entropy,
+            .realtime_now = now,
+        }) catch |err| {
+            const cause: anyerror = switch (err) {
+                error.ReadFailed => self.read_err orelse err,
+                else => err,
+            };
+            std.debug.print("node link: TLS handshake failed: {s}\n", .{@errorName(cause)});
+            return error.TlsHandshakeFailed;
+        };
+        return self;
+    }
+
+    fn destroy(self: *TlsState) void {
+        self.bundle.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn readSome(self: *TlsState, buf: []u8, timeout_ms: u64) !usize {
+        self.read_timeout_ms = timeout_ms;
+        self.read_err = null;
+        return self.client.reader.readSliceShort(buf) catch {
+            if (self.read_err) |e| {
+                if (e == error.LinkTimeout) return error.LinkTimeout;
+            }
+            return error.LinkClosed;
+        };
+    }
+
+    fn write(self: *TlsState, bytes: []const u8) !void {
+        self.client.writer.writeAll(bytes) catch return error.WriteFailed;
+    }
+
+    fn flush(self: *TlsState) !void {
+        self.client.writer.flush() catch return error.WriteFailed;
+        self.sock_out.flush() catch return error.WriteFailed;
+    }
+
+    fn sockStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *TlsState = @alignCast(@fieldParentPtr("sock_in", r));
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = (link.FdConn{ .fd = self.fd }).readSome(dest, self.read_timeout_ms) catch |err| {
+            self.read_err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        w.advance(n);
+        return n;
+    }
+
+    fn sockDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *TlsState = @alignCast(@fieldParentPtr("sock_out", w));
+        const t = self.send_timeout_ms;
+        os.net.socketWriteAll(self.fd, w.buffer[0..w.end], t) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            os.net.socketWriteAll(self.fd, d, t) catch return error.WriteFailed;
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            os.net.socketWriteAll(self.fd, last, t) catch return error.WriteFailed;
+            n += last.len;
+        }
+        return n;
+    }
+};
+
 const Link = struct {
     node: *Node,
     stream: Io.net.Stream,
+    conn: Conn,
     write_mutex: std.Io.Mutex = .init,
     refs: std.atomic.Value(u32) = .init(1),
     dead: std.atomic.Value(bool) = .init(false),
@@ -146,6 +327,7 @@ const Link = struct {
 
     fn release(self: *Link) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.conn.deinit();
         self.stream.close(self.node.io);
         std.heap.page_allocator.destroy(self);
     }
@@ -162,7 +344,7 @@ const Link = struct {
         const timeout_ms = @as(u64, self.node.cfg.socket_timeout_s) * 1000;
         self.write_mutex.lockUncancelable(io);
         defer self.write_mutex.unlock(io);
-        link.writeFrameParts(self.stream.socket.handle, kind, sid, parts, timeout_ms) catch self.kill();
+        link.writeFramePartsOn(self.conn, kind, sid, parts, timeout_ms) catch self.kill();
     }
 
     fn writeResp(self: *Link, sid: u32, status: u16, body: []const u8) void {
@@ -174,9 +356,8 @@ const Link = struct {
 
 fn readLoop(ln: *Link) !void {
     const gpa = std.heap.page_allocator;
-    const fd = ln.stream.socket.handle;
     while (!ln.dead.load(.acquire)) {
-        const frame = try link.readFrame(gpa, fd, link.MAX_PAYLOAD, DEAD_AFTER_MS);
+        const frame = try link.readFrameOn(gpa, ln.conn, link.MAX_PAYLOAD, DEAD_AFTER_MS);
         switch (frame.kind) {
             .req => dispatch(ln, frame.stream_id, frame.payload), // takes payload
             .ping => {

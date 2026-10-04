@@ -192,15 +192,43 @@ pub fn splitResp(payload: []const u8) !struct { status: u16, body: []const u8 } 
 // Blocking frame I/O over a connected socket
 // ---------------------------------------------------------------------------
 
+/// The frame functions below work on any byte channel with
+///   readSome(buf, timeout_ms) !usize   (0 = EOF; error.LinkTimeout when
+///                                        nothing arrived in timeout_ms)
+///   write(bytes, timeout_ms) !void
+///   flush(timeout_ms) !void              (end of one frame)
+/// FdConn is the plain-socket channel; the node side adds a TLS one.
+pub const FdConn = struct {
+    fd: os.net.Handle,
+
+    pub fn readSome(self: FdConn, buf: []u8, timeout_ms: u64) !usize {
+        os.net.setSocketReadTimeoutMs(self.fd, timeout_ms) catch return error.SocketOptionFailed;
+        return os.net.socketReadSome(self.fd, buf, timeout_ms) catch |err| {
+            if (os.net.isReadTimeout(err)) return error.LinkTimeout;
+            return error.LinkClosed;
+        };
+    }
+
+    pub fn write(self: FdConn, bytes: []const u8, timeout_ms: u64) !void {
+        return os.net.socketWriteAll(self.fd, bytes, timeout_ms);
+    }
+
+    pub fn flush(_: FdConn, _: u64) !void {}
+};
+
 /// Write one frame. Callers serialize writers per link (one mutex per
 /// link): header and payload go out as separate writes, so two concurrent
 /// writers would interleave. Small frames are coalesced into one write.
 pub fn writeFrame(fd: os.net.Handle, kind: FrameType, stream_id: u32, payload: []const u8, timeout_ms: u64) !void {
-    try writeFrameParts(fd, kind, stream_id, &.{payload}, timeout_ms);
+    try writeFramePartsOn(FdConn{ .fd = fd }, kind, stream_id, &.{payload}, timeout_ms);
 }
 
 /// Write one frame whose payload is the concatenation of `parts`.
 pub fn writeFrameParts(fd: os.net.Handle, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
+    try writeFramePartsOn(FdConn{ .fd = fd }, kind, stream_id, parts, timeout_ms);
+}
+
+pub fn writeFramePartsOn(conn: anytype, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
     var total: usize = 0;
     for (parts) |p| total += p.len;
     if (total > MAX_PAYLOAD) return error.FrameTooLarge;
@@ -212,10 +240,12 @@ pub fn writeFrameParts(fd: os.net.Handle, kind: FrameType, stream_id: u32, parts
             @memcpy(small[off .. off + p.len], p);
             off += p.len;
         }
-        return os.net.socketWriteAll(fd, small[0..off], timeout_ms);
+        try conn.write(small[0..off], timeout_ms);
+        return conn.flush(timeout_ms);
     }
-    try os.net.socketWriteAll(fd, small[0..HEADER_LEN], timeout_ms);
-    for (parts) |p| try os.net.socketWriteAll(fd, p, timeout_ms);
+    try conn.write(small[0..HEADER_LEN], timeout_ms);
+    for (parts) |p| try conn.write(p, timeout_ms);
+    try conn.flush(timeout_ms);
 }
 
 pub const Frame = struct {
@@ -226,14 +256,10 @@ pub const Frame = struct {
 
 /// Fill `buf` completely. `idle_ms` bounds each read (no inbound byte for
 /// that long -> error.LinkTimeout); EOF mid-buffer -> error.LinkClosed.
-fn readExact(fd: os.net.Handle, buf: []u8, idle_ms: u64) !void {
+fn readExact(conn: anytype, buf: []u8, idle_ms: u64) !void {
     var filled: usize = 0;
     while (filled < buf.len) {
-        os.net.setSocketReadTimeoutMs(fd, idle_ms) catch return error.SocketOptionFailed;
-        const n = os.net.socketReadSome(fd, buf[filled..], idle_ms) catch |err| {
-            if (os.net.isReadTimeout(err)) return error.LinkTimeout;
-            return error.LinkClosed;
-        };
+        const n = try conn.readSome(buf[filled..], idle_ms);
         if (n == 0) return error.LinkClosed;
         filled += n;
     }
@@ -241,12 +267,16 @@ fn readExact(fd: os.net.Handle, buf: []u8, idle_ms: u64) !void {
 
 /// Read one frame; the payload is allocated from `gpa` (caller frees).
 pub fn readFrame(gpa: Allocator, fd: os.net.Handle, max_payload: u32, idle_ms: u64) !Frame {
+    return readFrameOn(gpa, FdConn{ .fd = fd }, max_payload, idle_ms);
+}
+
+pub fn readFrameOn(gpa: Allocator, conn: anytype, max_payload: u32, idle_ms: u64) !Frame {
     var hdr: [HEADER_LEN]u8 = undefined;
-    try readExact(fd, &hdr, idle_ms);
+    try readExact(conn, &hdr, idle_ms);
     const h = try decodeHeader(&hdr, max_payload);
     const payload = try gpa.alloc(u8, h.len);
     errdefer gpa.free(payload);
-    try readExact(fd, payload, idle_ms);
+    try readExact(conn, payload, idle_ms);
     return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
 }
 
@@ -254,16 +284,20 @@ pub fn readFrame(gpa: Allocator, fd: os.net.Handle, max_payload: u32, idle_ms: u
 /// `started`: a peer dribbling one byte per read cannot stretch it. Used
 /// for the handshake, where an unauthenticated peer must finish in time.
 pub fn readFrameWithin(gpa: Allocator, fd: os.net.Handle, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
+    return readFrameWithinOn(gpa, FdConn{ .fd = fd }, max_payload, io, started, budget_ms);
+}
+
+pub fn readFrameWithinOn(gpa: Allocator, conn: anytype, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
     var hdr: [HEADER_LEN]u8 = undefined;
-    try readExactWithin(fd, &hdr, io, started, budget_ms);
+    try readExactWithin(conn, &hdr, io, started, budget_ms);
     const h = try decodeHeader(&hdr, max_payload);
     const payload = try gpa.alloc(u8, h.len);
     errdefer gpa.free(payload);
-    try readExactWithin(fd, payload, io, started, budget_ms);
+    try readExactWithin(conn, payload, io, started, budget_ms);
     return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
 }
 
-fn readExactWithin(fd: os.net.Handle, buf: []u8, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !void {
+fn readExactWithin(conn: anytype, buf: []u8, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !void {
     var filled: usize = 0;
     while (filled < buf.len) {
         const elapsed_i = started.untilNow(io, .awake).toMilliseconds();
@@ -271,11 +305,7 @@ fn readExactWithin(fd: os.net.Handle, buf: []u8, io: std.Io, started: std.Io.Tim
         if (elapsed >= budget_ms) return error.LinkTimeout;
         const remaining = budget_ms - elapsed;
         // Every read is armed with what is left of the one deadline.
-        os.net.setSocketReadTimeoutMs(fd, remaining) catch return error.SocketOptionFailed;
-        const n = os.net.socketReadSome(fd, buf[filled..], remaining) catch |err| {
-            if (os.net.isReadTimeout(err)) return error.LinkTimeout;
-            return error.LinkClosed;
-        };
+        const n = try conn.readSome(buf[filled..], remaining);
         if (n == 0) return error.LinkClosed;
         filled += n;
     }
