@@ -11,6 +11,8 @@ node replacement, and that the default listener mode is unaffected.
 Run: python3 ci/test_reverse.py [path/to/mcp-node]
 Prints one PASS/FAIL line per case; exits nonzero on any failure.
 """
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -18,6 +20,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -266,6 +269,104 @@ def case_wrong_secret_refused(env):
     check('AuthFailed' in hub.logs(), 'hub log has no AuthFailed: ' + hub.logs()[-1000:])
     time.sleep(1.5)  # a retry or two later it still must not appear
     check('mallory' not in env.nodes(), env.nodes())
+
+
+FRAME_CHALLENGE, FRAME_HELLO, FRAME_WELCOME, FRAME_REQ, FRAME_RESP = 2, 1, 3, 4, 5
+AUTH_DOMAIN = b'mcp-node-reverse-v1'
+
+
+def _send_frame(sock, kind, stream_id, payload):
+    sock.sendall(struct.pack('>IBI', len(payload), kind, stream_id) + payload)
+
+
+def _recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError('peer closed')
+        buf += chunk
+    return buf
+
+
+def _recv_frame(sock):
+    length, kind, stream_id = struct.unpack('>IBI', _recv_exact(sock, 9))
+    return kind, stream_id, _recv_exact(sock, length)
+
+
+def _fake_hub_session(env, name, welcome_auth_secret, marker):
+    """Play the hub side of one link by hand on a raw socket.
+
+    Sends CHALLENGE, reads HELLO, answers WELCOME with a MAC made from
+    `welcome_auth_secret` (None = bogus bytes), then sends a REQ that would
+    create `marker` via exec. Returns (frames received after WELCOME, whether
+    the node closed the connection).
+    """
+    port = pick_port()
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', port))
+    srv.listen(4)
+    srv.settimeout(10)
+    node = env.start_node(name, target='127.0.0.1:%d' % port)
+    try:
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        with conn:
+            hub_nonce = os.urandom(32)
+            _send_frame(conn, FRAME_CHALLENGE, 0, hub_nonce)
+            kind, _, payload = _recv_frame(conn)
+            check(kind == FRAME_HELLO, ('expected HELLO', kind))
+            hello = json.loads(payload)
+            node_nonce = bytes.fromhex(hello['nonce'])
+            check(len(node_nonce) == 32, hello)
+            if welcome_auth_secret is None:
+                auth = secrets.token_hex(32)
+            else:
+                msg = AUTH_DOMAIN + b' hub' + hub_nonce + node_nonce + hello['name'].encode()
+                auth = hmac.new(welcome_auth_secret.encode(), msg, hashlib.sha256).hexdigest()
+            req = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                   'params': {'name': 'exec', 'arguments': {'argv': ['touch', str(marker)], 'timeout': 10}}}
+            try:
+                _send_frame(conn, FRAME_WELCOME, 0, json.dumps({'v': 1, 'auth': auth}).encode())
+                _send_frame(conn, FRAME_REQ, 1, json.dumps(req).encode())
+            except OSError:
+                pass  # the node may already have closed
+            got = []
+            closed = False
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    got.append(_recv_frame(conn)[0])
+                    if FRAME_RESP in got:
+                        break
+                except socket.timeout:
+                    continue
+                except (EOFError, OSError):
+                    closed = True
+                    break
+            return got, closed, node
+    finally:
+        srv.close()
+
+
+def case_fake_hub_without_secret_refused(env):
+    # Control: a hand-written hub that does know the secret is served, so
+    # the frames below are well formed and the REQ really runs exec.
+    control = env.dir / 'control'
+    got, _, node = _fake_hub_session(env, 'ctl', env.secret, control)
+    check(FRAME_RESP in got, ('control REQ got no RESP', got, node.logs()[-1000:]))
+    check(wait_until(control.exists, 3, 0.1), 'control exec did not run')
+    node.stop()
+
+    marker = env.dir / 'pwned'
+    got, closed, node = _fake_hub_session(env, 'victim', None, marker)
+    check(closed, ('node kept the link to a hub without the secret', got))
+    check(not got, ('node answered a hub without the secret', got))
+    time.sleep(3)
+    check(not marker.exists(), 'REQ from an unauthenticated hub ran exec')
+    check('hub authentication failed' in node.logs(), node.logs()[-1000:])
+    check(node.alive(), 'node must keep retrying, not exit')
 
 
 def case_concurrent_exec(env):
@@ -521,6 +622,7 @@ CASES = [
     ('401 without or with a wrong client token', case_401_without_token),
     ('unknown node -> 404 unknown_node', case_unknown_node_404),
     ('wrong link secret is refused and never listed', case_wrong_secret_refused),
+    ('fake hub without secret is refused', case_fake_hub_without_secret_refused),
     ('24 concurrent exec through the hub, answers match requests', case_concurrent_exec),
     ('hub kill -9 + restart: in-flight request fails, exec session survives', case_hub_restart_keeps_sessions),
     ('node restart under the same name takes over', case_node_restart_replaces_link),
