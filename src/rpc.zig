@@ -378,3 +378,549 @@ test "tool result text mirror flag" {
     try std.testing.expect(std.mem.indexOf(u8, unknown.body, "\"content\":[{\"type\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unknown.body, "\"isError\":true") != null);
 }
+
+// ---------------------------------------------------------------------------
+// Shape-validation matrix: envelope/id/params/method rules, the initialize
+// protocolVersion contract, the tools/list manifest shape, and the errHint
+// payload contract for tool-domain errors.
+// ---------------------------------------------------------------------------
+
+test "rpc request envelope validation matrix" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    // Every envelope-level rejection is a 400 with -32600; the id is echoed
+    // when its own type is legal and rendered as null otherwise.
+    const H = struct {
+        fn expectInvalidRequest(a: Allocator, i: Io, c: *const config.Config, req: []const u8) !Value {
+            const resp = try handleRpc(a, i, c, req);
+            try std.testing.expectEqual(@as(u16, 400), resp.status);
+            const parsed = try std.json.parseFromSliceLeaky(Value, a, resp.body, .{});
+            try std.testing.expect(parsed.object.get("error") != null);
+            try std.testing.expectEqual(@as(i32, -32600), parsed.object.get("error").?.object.get("code").?.integer);
+            return parsed;
+        }
+    };
+
+    {
+        // Wrong jsonrpc version.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // Missing jsonrpc member.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"id\":1,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // Non-string jsonrpc member (2.0 as a number).
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"jsonrpc\":2.0,\"id\":1,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // Non-object request bodies are invalid with a null id.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "[1,2,3]");
+        try std.testing.expect(parsed.object.get("id").? == .null);
+        const parsed_str = try H.expectInvalidRequest(arena, io, &cfg, "\"x\"");
+        try std.testing.expect(parsed_str.object.get("id").? == .null);
+    }
+    {
+        // Missing method member.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // Non-string method member.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":42}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // Scalar params make the whole message invalid, even for a known method.
+        const parsed = try H.expectInvalidRequest(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":42}");
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+    }
+    {
+        // params:null is tolerated as "omitted": ping still succeeds.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":null}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expect(parsed.object.get("result").? == .object);
+        try std.testing.expect(parsed.object.get("error") == null);
+    }
+    {
+        // An array params is shape-legal at the envelope level; ping ignores it.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":[]}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expect(parsed.object.get("result").? == .object);
+    }
+}
+
+test "rpc id typing rules" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    {
+        // An object id is illegal: the error envelope carries a null id.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i32, -32600), parsed.object.get("error").?.object.get("code").?.integer);
+        try std.testing.expect(parsed.object.get("id").? == .null);
+    }
+    {
+        // An array id is equally illegal.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":[],\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i32, -32600), parsed.object.get("error").?.object.get("code").?.integer);
+        try std.testing.expect(parsed.object.get("id").? == .null);
+    }
+    {
+        // A string id is echoed back.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"echo\",\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("echo", parsed.object.get("id").?.string);
+        try std.testing.expect(parsed.object.get("result").? == .object);
+    }
+    {
+        // An integer id is echoed back.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i64, 42), parsed.object.get("id").?.integer);
+        try std.testing.expect(parsed.object.get("result").? == .object);
+    }
+    {
+        // A present null id is a discouraged but legal id: answered with the
+        // echoed null, never treated as a notification.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expect(parsed.object.get("id") != null);
+        try std.testing.expect(parsed.object.get("id").? == .null);
+        try std.testing.expect(parsed.object.get("result").? == .object);
+    }
+    {
+        // An absent id is the notification marker: 202 with an empty body.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 202), resp.status);
+        try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    }
+}
+
+test "rpc notifications carrying an id are invalid requests" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    {
+        // notifications/* with an integer id must be answered 400/-32600,
+        // never silently dropped via 202.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"notifications/progress\"}");
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i32, -32600), parsed.object.get("error").?.object.get("code").?.integer);
+        try std.testing.expectEqual(@as(i64, 5), parsed.object.get("id").?.integer);
+    }
+    {
+        // Same rule with a string id, on a different notifications method.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"n\",\"method\":\"notifications/initialized\"}");
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i32, -32600), parsed.object.get("error").?.object.get("code").?.integer);
+        try std.testing.expectEqualStrings("n", parsed.object.get("id").?.string);
+    }
+    {
+        // Without an id the same method is a notification: 202, empty body.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+        try std.testing.expectEqual(@as(u16, 202), resp.status);
+        try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+    }
+}
+
+test "rpc unknown method and empty list results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    {
+        // Unknown method is a method-level error: HTTP 200, -32601, id echoed.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"no/such/method\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        const err_obj = parsed.object.get("error").?;
+        try std.testing.expectEqual(@as(i32, -32601), err_obj.object.get("code").?.integer);
+        try std.testing.expectEqualStrings("Method not found", err_obj.object.get("message").?.string);
+        try std.testing.expectEqual(@as(i64, 9), parsed.object.get("id").?.integer);
+    }
+    {
+        // ping answers with an empty result object.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        const result = parsed.object.get("result").?;
+        try std.testing.expect(result == .object);
+        try std.testing.expectEqual(@as(usize, 0), result.object.count());
+    }
+    {
+        // resources/list answers with an empty resources array.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        const resources = parsed.object.get("result").?.object.get("resources").?;
+        try std.testing.expect(resources == .array);
+        try std.testing.expectEqual(@as(usize, 0), resources.array.items.len);
+    }
+    {
+        // prompts/list answers with an empty prompts array.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        const prompts = parsed.object.get("result").?.object.get("prompts").?;
+        try std.testing.expect(prompts == .array);
+        try std.testing.expectEqual(@as(usize, 0), prompts.array.items.len);
+    }
+}
+
+test "rpc initialize protocol version matrix" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    {
+        // No params: the node answers with its default protocol version and
+        // the full result shape.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("2.0", parsed.object.get("jsonrpc").?.string);
+        try std.testing.expectEqual(@as(i64, 1), parsed.object.get("id").?.integer);
+        const result = parsed.object.get("result").?;
+        try std.testing.expectEqualStrings("2025-11-25", result.object.get("protocolVersion").?.string);
+        const capabilities = result.object.get("capabilities").?;
+        try std.testing.expect(capabilities == .object);
+        try std.testing.expect(capabilities.object.get("tools").? == .object);
+        const server_info = result.object.get("serverInfo").?;
+        try std.testing.expect(server_info == .object);
+        try std.testing.expectEqualStrings("test-node", server_info.object.get("name").?.string);
+        try std.testing.expect(server_info.object.get("version").? == .string);
+        const instructions = result.object.get("instructions").?;
+        try std.testing.expect(instructions == .string);
+        try std.testing.expect(instructions.string.len > 0);
+    }
+    {
+        // Each supported version is echoed back verbatim.
+        const supported = [_][]const u8{ "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25" };
+        for (supported) |ver| {
+            const req = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\"}}}}", .{ver});
+            const resp = try handleRpc(arena, io, &cfg, req);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+            try std.testing.expectEqualStrings(ver, parsed.object.get("result").?.object.get("protocolVersion").?.string);
+        }
+    }
+    {
+        // Unsupported versions fall back to the default instead of failing.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("2025-11-25", parsed.object.get("result").?.object.get("protocolVersion").?.string);
+    }
+    {
+        // A non-string protocolVersion is ignored: default.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":42}}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("2025-11-25", parsed.object.get("result").?.object.get("protocolVersion").?.string);
+    }
+    {
+        // params:null is tolerated and yields the default version.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":null}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("2025-11-25", parsed.object.get("result").?.object.get("protocolVersion").?.string);
+    }
+}
+
+test "rpc tools list manifest shape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    {
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqualStrings("t", parsed.object.get("id").?.string);
+        const tools_v = parsed.object.get("result").?.object.get("tools").?;
+        try std.testing.expect(tools_v == .array);
+        // The frozen v0 manifest carries 13 tools in a deterministic order.
+        try std.testing.expectEqual(@as(usize, 13), tools_v.array.items.len);
+        for (tools_v.array.items) |entry| {
+            try std.testing.expect(entry == .object);
+            const name = entry.object.get("name").?;
+            try std.testing.expect(name == .string);
+            try std.testing.expect(name.string.len > 0);
+            const schema = entry.object.get("inputSchema").?;
+            try std.testing.expect(schema == .object);
+        }
+    }
+}
+
+test "rpc tools call params shape validation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    const H = struct {
+        fn expectInvalidParams(a: Allocator, i: Io, c: *const config.Config, req: []const u8) !void {
+            const resp = try handleRpc(a, i, c, req);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            const parsed = try std.json.parseFromSliceLeaky(Value, a, resp.body, .{});
+            try std.testing.expect(parsed.object.get("error") != null);
+            try std.testing.expectEqual(@as(i32, -32602), parsed.object.get("error").?.object.get("code").?.integer);
+        }
+    };
+
+    // params missing / not an object / null.
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}");
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":[1]}");
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":null}");
+    // name missing / not a string.
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{}}");
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":7}}");
+    // arguments present but not an object.
+    try H.expectInvalidParams(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":5}}");
+    {
+        // One representative error: code, message and id echo.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"ip\",\"method\":\"tools/call\"}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        const err_obj = parsed.object.get("error").?;
+        try std.testing.expectEqual(@as(i32, -32602), err_obj.object.get("code").?.integer);
+        try std.testing.expectEqualStrings("Invalid params", err_obj.object.get("message").?.string);
+        try std.testing.expectEqualStrings("ip", parsed.object.get("id").?.string);
+    }
+    {
+        // Unknown tool: isError result with a self-recovery hint.
+        const resp = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}");
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, resp.body, .{});
+        try std.testing.expectEqual(@as(i64, 7), parsed.object.get("id").?.integer);
+        const result = parsed.object.get("result").?;
+        try std.testing.expect(result.object.get("isError") != null);
+        try std.testing.expect(result.object.get("isError").?.bool);
+        const text = result.object.get("content").?.array.items[0].object.get("text").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, text, "Unknown tool:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "tools/list") != null);
+    }
+}
+
+test "rpc tool error payload hints" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    const cfg = config.Config{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 4,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+
+    const H = struct {
+        // Run one tools/call and return the 200 response body.
+        fn call(a: Allocator, i: Io, c: *const config.Config, req: []const u8) ![]const u8 {
+            const resp = try handleRpc(a, i, c, req);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            return resp.body;
+        }
+
+        // A failed tool call carries a structuredContent payload with the
+        // error name and, for hint-listed names, a readable message.
+        fn expectErrorPayload(payload: Value, want_name: []const u8, want_hint: []const u8) !void {
+            try std.testing.expectEqualStrings(want_name, payload.object.get("error").?.string);
+            try std.testing.expect(payload.object.get("message") != null);
+            try std.testing.expectEqualStrings(want_hint, payload.object.get("message").?.string);
+            try std.testing.expect(!payload.object.get("ok").?.bool);
+        }
+
+        // Error names outside the hint set keep the bare payload shape: no
+        // "message" member is added (the hint map is additive-only).
+        fn expectNoHint(payload: Value, want_name: []const u8) !void {
+            try std.testing.expectEqualStrings(want_name, payload.object.get("error").?.string);
+            try std.testing.expect(payload.object.get("message") == null);
+            try std.testing.expect(!payload.object.get("ok").?.bool);
+        }
+    };
+
+    {
+        // BadArgv: argv present but not an array.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"argv\":42}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        const payload = parsed.object.get("result").?.object.get("structuredContent").?;
+        try H.expectErrorPayload(payload, "BadArgv", "argv must be a non-empty array of strings");
+        // The unescaped hint text reaches the raw body via structuredContent.
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"argv must be a non-empty array of strings\"") != null);
+        // Tool-domain errors ride a 200 result envelope with isError:false;
+        // the ok:false payload is the error channel.
+        try std.testing.expect(!parsed.object.get("result").?.object.get("isError").?.bool);
+    }
+    {
+        // BadArgv: an empty argv array.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"argv\":[]}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectErrorPayload(parsed.object.get("result").?.object.get("structuredContent").?, "BadArgv", "argv must be a non-empty array of strings");
+    }
+    {
+        // BadArgv: non-string argv items.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"argv\":[1]}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectErrorPayload(parsed.object.get("result").?.object.get("structuredContent").?, "BadArgv", "argv must be a non-empty array of strings");
+    }
+    {
+        // argv entirely absent: actual behavior is MissingArgv, which is not
+        // in the hint set - the hint covers argv shapes that fail validation,
+        // not the missing member itself.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"m\",\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectNoHint(parsed.object.get("result").?.object.get("structuredContent").?, "MissingArgv");
+    }
+    {
+        // write_file with an illegal base64 character: InvalidCharacter
+        // plus its matching hint.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"b\",\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"unused-probe\",\"content_b64\":\"!!!!\"}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectErrorPayload(parsed.object.get("result").?.object.get("structuredContent").?, "InvalidCharacter", "value is not valid standard base64 (illegal character)");
+    }
+    {
+        // write_file with a bad base64 length: InvalidPadding plus its
+        // matching hint.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"b\",\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"unused-probe\",\"content_b64\":\"ABCDE\"}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectErrorPayload(parsed.object.get("result").?.object.get("structuredContent").?, "InvalidPadding", "value is not valid standard base64 (bad length or padding)");
+    }
+    {
+        // FileNotFound is outside the hint set: bare payload shape.
+        const body = try H.call(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"id\":\"f\",\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"/nonexistent-mcpnz-hints\"}}}");
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        try H.expectNoHint(parsed.object.get("result").?.object.get("structuredContent").?, "FileNotFound");
+    }
+}
