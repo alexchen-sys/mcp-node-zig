@@ -158,4 +158,5 @@ test "discover module tests" {
     // any root test would have its test blocks silently skipped. Pull them in.
     std.testing.refAllDecls(@import("http.zig"));
     std.testing.refAllDecls(@import("rpc.zig"));
+    std.testing.refAllDecls(@import("link.zig"));
 }
