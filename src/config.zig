@@ -153,3 +153,412 @@ pub fn loadConfig(arena: Allocator, io: Io) !Config {
 fn getEnv(arena: Allocator, key: []const u8) ?[]const u8 {
     return os.environGet(arena, env_state.process_environ, key);
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// Every test drives loadConfig through a synthetic process environment: the
+// daemon reads env vars exclusively through env_state.process_environ, so
+// installing a hand-built snapshot with the same shape os/env.zig
+// loadEnviron produces on POSIX makes each call observe exactly the entries
+// below and nothing inherited from the test runner. Tests share one
+// process, so every test restores the global to the pristine empty
+// snapshot on exit.
+
+const builtin = @import("builtin");
+const testing = std.testing;
+
+/// One "KEY=VALUE" entry of a synthetic environment snapshot.
+const EnvVar = struct { key: []const u8, value: []const u8 };
+
+/// Build a synthetic snapshot the way os/env.zig loadEnviron does on POSIX:
+/// NUL-terminated "KEY=VALUE" strings behind a sentinel slice of pointers.
+/// Windows reads its environment from the PEB global block, where this
+/// shape is meaningless, so those targets skip the env-driven tests.
+fn makeEnviron(arena: Allocator, entries: []const EnvVar) !std.process.Environ {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        const slice = try arena.allocSentinel(?[*:0]const u8, entries.len, null);
+        for (entries, slice) |entry, *slot| {
+            const line = try std.fmt.allocPrint(arena, "{s}={s}", .{ entry.key, entry.value });
+            const line_z = try arena.dupeZ(u8, line);
+            slot.* = line_z.ptr;
+        }
+        return .{ .block = .{ .slice = slice } };
+    }
+}
+
+/// Relative path of `sub_path` inside a testing tmp dir. std.testing.tmpDir
+/// nests its fresh directory under .zig-cache/tmp relative to the test
+/// binary's cwd, and loadConfig resolves token paths against the same cwd,
+/// so this relative shape reaches the file.
+fn tmpRelPath(arena: Allocator, tmp: *const testing.TmpDir, sub_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, sub_path });
+}
+
+test "config defaults when env carries only the token file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "secret\n" });
+
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") },
+    });
+    defer env_state.process_environ = .empty;
+
+    const cfg = try loadConfig(arena, io);
+
+    try testing.expectEqualStrings("mcp-node", cfg.name);
+    try testing.expectEqualStrings("127.0.0.1", cfg.host);
+    try testing.expectEqual(@as(u16, 8341), cfg.port);
+    try testing.expectEqualStrings("secret", cfg.token);
+    try testing.expectEqual(@as(usize, 400000), cfg.max_out);
+    try testing.expectEqual(@as(u16, 60), cfg.socket_timeout_s);
+    try testing.expectEqual(@as(u16, 128), cfg.max_conn);
+    try testing.expectEqual(@as(u16, 64), cfg.max_sessions);
+    try testing.expectEqual(@as(u32, 600), cfg.session_ttl_s);
+    try testing.expectEqual(@as(u64, 67108864), cfg.max_inflight_bytes);
+    try testing.expect(cfg.text_mirror);
+    try testing.expectEqual(@as(usize, 3), cfg.allowed_hosts.len);
+    try testing.expectEqualStrings("127.0.0.1:*", cfg.allowed_hosts[0]);
+    try testing.expectEqualStrings("localhost:*", cfg.allowed_hosts[1]);
+    try testing.expectEqualStrings("[::1]:*", cfg.allowed_hosts[2]);
+    try testing.expectEqual(@as(usize, 3), cfg.allowed_origins.len);
+    try testing.expectEqualStrings("http://127.0.0.1:*", cfg.allowed_origins[0]);
+    try testing.expectEqualStrings("http://localhost:*", cfg.allowed_origins[1]);
+    try testing.expectEqualStrings("http://[::1]:*", cfg.allowed_origins[2]);
+}
+
+test "config env overrides land in the snapshot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "override-secret\n" });
+
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_NAME", .value = "zed-node" },
+        .{ .key = "MCP_NODE_HOST", .value = "0.0.0.0" },
+        .{ .key = "MCP_NODE_PORT", .value = "9399" },
+        .{ .key = "MCP_NODE_MAX_OUT", .value = "123456" },
+        .{ .key = "MCP_NODE_SOCKET_TIMEOUT_S", .value = "7" },
+        .{ .key = "MCP_NODE_MAX_CONN", .value = "9" },
+        .{ .key = "MCP_NODE_MAX_SESSIONS", .value = "17" },
+        .{ .key = "MCP_NODE_SESSION_TTL_S", .value = "77" },
+        .{ .key = "MCP_NODE_MAX_INFLIGHT_BYTES", .value = "1073741824" },
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") },
+    });
+    defer env_state.process_environ = .empty;
+
+    const cfg = try loadConfig(arena, io);
+
+    try testing.expectEqualStrings("zed-node", cfg.name);
+    try testing.expectEqualStrings("0.0.0.0", cfg.host);
+    try testing.expectEqual(@as(u16, 9399), cfg.port);
+    try testing.expectEqualStrings("override-secret", cfg.token);
+    try testing.expectEqual(@as(usize, 123456), cfg.max_out);
+    try testing.expectEqual(@as(u16, 7), cfg.socket_timeout_s);
+    try testing.expectEqual(@as(u16, 9), cfg.max_conn);
+    try testing.expectEqual(@as(u16, 17), cfg.max_sessions);
+    try testing.expectEqual(@as(u32, 77), cfg.session_ttl_s);
+    try testing.expectEqual(@as(u64, 1073741824), cfg.max_inflight_bytes);
+}
+
+test "config zero values are clamped to the documented defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "clamp-secret\n" });
+
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_SOCKET_TIMEOUT_S", .value = "0" },
+        .{ .key = "MCP_NODE_MAX_CONN", .value = "0" },
+        .{ .key = "MCP_NODE_MAX_SESSIONS", .value = "0" },
+        .{ .key = "MCP_NODE_SESSION_TTL_S", .value = "0" },
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") },
+    });
+    defer env_state.process_environ = .empty;
+
+    const cfg = try loadConfig(arena, io);
+
+    try testing.expectEqual(@as(u16, 60), cfg.socket_timeout_s);
+    try testing.expectEqual(@as(u16, 128), cfg.max_conn);
+    try testing.expectEqual(@as(u16, 64), cfg.max_sessions);
+    try testing.expectEqual(@as(u32, 600), cfg.session_ttl_s);
+}
+
+test "config max inflight bytes fails fast on invalid and below-floor values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "budget-secret\n" });
+    const token: EnvVar = .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") };
+    defer env_state.process_environ = .empty;
+
+    // Garbage is a startup error, not a silent fallback to the default.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_MAX_INFLIGHT_BYTES", .value = "abc" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    // A valid number below the 1 MiB floor is still unusable: reject.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_MAX_INFLIGHT_BYTES", .value = "100" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    // One byte below the floor stays rejected...
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_MAX_INFLIGHT_BYTES", .value = "1048575" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    // ...while exactly the floor is the smallest accepted value.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_MAX_INFLIGHT_BYTES", .value = "1048576" },
+    });
+    const cfg = try loadConfig(arena, io);
+    try testing.expectEqual(@as(u64, 1048576), cfg.max_inflight_bytes);
+}
+
+test "config token file matrix: missing, blank and the insecure escape hatch" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing = try tmpRelPath(arena, &tmp, "token");
+    defer env_state.process_environ = .empty;
+
+    // Missing token file, no escape hatch: fail closed at startup.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = missing },
+    });
+    try testing.expectError(error.TokenFileMissing, loadConfig(arena, io));
+
+    // Only the exact value "1" is the escape hatch; a typo keeps the
+    // fail-closed behavior.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = missing },
+        .{ .key = "MCP_NODE_INSECURE", .value = "yes" },
+    });
+    try testing.expectError(error.TokenFileMissing, loadConfig(arena, io));
+
+    // Missing file with the escape hatch: startup proceeds with an empty
+    // token (explicitly insecure mode).
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = missing },
+        .{ .key = "MCP_NODE_INSECURE", .value = "1" },
+    });
+    const insecure_cfg = try loadConfig(arena, io);
+    try testing.expectEqualStrings("", insecure_cfg.token);
+
+    // Present but empty: the same fail-closed rule applies after trimming.
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "empty") },
+    });
+    try testing.expectError(error.TokenFileMissing, loadConfig(arena, io));
+
+    // Whitespace-only content trims to empty; only the escape hatch
+    // admits it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "blank", .data = " \t\r\n" });
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "blank") },
+        .{ .key = "MCP_NODE_INSECURE", .value = "1" },
+    });
+    const blank_cfg = try loadConfig(arena, io);
+    try testing.expectEqualStrings("", blank_cfg.token);
+
+    // Real content: surrounding whitespace is trimmed away.
+    try tmp.dir.writeFile(io, .{ .sub_path = "padded", .data = "  padded-secret \r\n" });
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "padded") },
+    });
+    const padded_cfg = try loadConfig(arena, io);
+    try testing.expectEqualStrings("padded-secret", padded_cfg.token);
+}
+
+test "config token read errors other than FileNotFound stay fatal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer env_state.process_environ = .empty;
+
+    // A regular file used as a directory component: the open fails with
+    // NotDir, which the INSECURE escape hatch does not cover (only
+    // FileNotFound does).
+    try tmp.dir.writeFile(io, .{ .sub_path = "regular", .data = "x" });
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "regular/token") },
+        .{ .key = "MCP_NODE_INSECURE", .value = "1" },
+    });
+    try testing.expectError(error.NotDir, loadConfig(arena, io));
+
+    // A token file past the 4 KiB read cap is equally fatal: no escape
+    // hatch for oversized files.
+    const oversized: [5000]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "oversized", .data = &oversized });
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "oversized") },
+        .{ .key = "MCP_NODE_INSECURE", .value = "1" },
+    });
+    try testing.expectError(error.StreamTooLong, loadConfig(arena, io));
+}
+
+test "config text mirror flag is typo-safe" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "mirror-secret\n" });
+    const token: EnvVar = .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") };
+    defer env_state.process_environ = .empty;
+
+    // Only the exact "0" opts out of the text mirror.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_TEXT_MIRROR", .value = "0" },
+    });
+    const off_cfg = try loadConfig(arena, io);
+    try testing.expect(!off_cfg.text_mirror);
+
+    // "1" keeps it on...
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_TEXT_MIRROR", .value = "1" },
+    });
+    const on_cfg = try loadConfig(arena, io);
+    try testing.expect(on_cfg.text_mirror);
+
+    // ...and so does any other value: a typo must not silently strip the
+    // legacy text channel.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_TEXT_MIRROR", .value = "garbage" },
+    });
+    const typo_cfg = try loadConfig(arena, io);
+    try testing.expect(typo_cfg.text_mirror);
+
+    // Unset keeps the spec-recommended default.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+    });
+    const unset_cfg = try loadConfig(arena, io);
+    try testing.expect(unset_cfg.text_mirror);
+}
+
+test "config allowed hosts and origins override split and trim csv" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "csv-secret\n" });
+
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_ALLOWED_HOSTS", .value = "a.example:*, b.example:8443" },
+        .{ .key = "MCP_NODE_ALLOWED_ORIGINS", .value = " https://a.example , ,https://b.example:8443 " },
+        .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") },
+    });
+    defer env_state.process_environ = .empty;
+
+    const cfg = try loadConfig(arena, io);
+
+    // Hosts: comma split, whitespace trimmed, empty parts dropped.
+    try testing.expectEqual(@as(usize, 2), cfg.allowed_hosts.len);
+    try testing.expectEqualStrings("a.example:*", cfg.allowed_hosts[0]);
+    try testing.expectEqualStrings("b.example:8443", cfg.allowed_hosts[1]);
+
+    // Origins: same semantics, including the dropped empty middle part.
+    try testing.expectEqual(@as(usize, 2), cfg.allowed_origins.len);
+    try testing.expectEqualStrings("https://a.example", cfg.allowed_origins[0]);
+    try testing.expectEqualStrings("https://b.example:8443", cfg.allowed_origins[1]);
+
+    // Everything untouched by the override keeps its default.
+    try testing.expectEqual(@as(u16, 8341), cfg.port);
+}
+
+test "inflight gate tracks the global body budget" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var gate = InflightGate{ .io = io, .max = 100 };
+
+    // Zero-byte reservations are always free and never touch the counter.
+    try testing.expect(gate.tryReserve(0));
+    try testing.expectEqual(@as(u64, 0), gate.in_use);
+
+    // The budget is inclusive: the exact remaining amount fits, one byte
+    // more does not.
+    try testing.expect(gate.tryReserve(60));
+    try testing.expect(!gate.tryReserve(41));
+    try testing.expect(gate.tryReserve(40));
+    try testing.expect(!gate.tryReserve(1));
+    try testing.expectEqual(@as(u64, 100), gate.in_use);
+
+    // Release returns bytes to the budget.
+    gate.release(100);
+    gate.release(0);
+    try testing.expectEqual(@as(u64, 0), gate.in_use);
+    try testing.expect(gate.tryReserve(100));
+}
+
+test "config numeric env parsing rejects garbage with raw parse errors" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "port-secret\n" });
+    const token: EnvVar = .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") };
+    defer env_state.process_environ = .empty;
+
+    // Unlike the in-flight budget (wrapped as InvalidConfig with a
+    // message), plain numeric fields surface the raw parseInt error.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_PORT", .value = "not-a-port" },
+    });
+    try testing.expectError(error.InvalidCharacter, loadConfig(arena, io));
+
+    // Out-of-range values fail with Overflow instead.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        .{ .key = "MCP_NODE_PORT", .value = "70000" },
+    });
+    try testing.expectError(error.Overflow, loadConfig(arena, io));
+}
