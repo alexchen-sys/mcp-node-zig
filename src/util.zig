@@ -99,12 +99,12 @@ pub fn appendJsonString(out: *std.ArrayList(u8), arena: Allocator, s: []const u8
                     continue;
                 }
                 const seq_len = utf8SeqLen(s[i..]) orelse {
-                    try out.appendSlice(arena, "");
+                    try out.appendSlice(arena, "\xef\xbf\xbd"); // U+FFFD
                     i += 1;
                     continue;
                 };
                 if (i + seq_len > s.len or !validUtf8Seq(s[i .. i + seq_len])) {
-                    try out.appendSlice(arena, "");
+                    try out.appendSlice(arena, "\xef\xbf\xbd"); // U+FFFD
                     i += 1;
                     continue;
                 }
@@ -236,4 +236,58 @@ test "float to int rejects non finite and out of range values" {
     try std.testing.expect(floatToI64(std.math.nan(f64)) == null);
     try std.testing.expect(floatToI64(1e300) == null);
     try std.testing.expectEqual(@as(i64, 42), floatToI64(42.0).?);
+}
+
+test "json string encoder replaces invalid utf8 with replacement char" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A lone invalid byte: one U+FFFD per offending byte.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, "a\xffb");
+        try std.testing.expectEqualStrings("\"a\xef\xbf\xbdb\"", out.items);
+    }
+
+    // A truncated 3-byte sequence at end of input: each offending byte
+    // (lead and continuation) yields its own U+FFFD.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, "ok\xe4\xb8");
+        try std.testing.expectEqualStrings("\"ok\xef\xbf\xbd\xef\xbf\xbd\"", out.items);
+    }
+
+    // An invalid continuation after a lead byte: the lead becomes U+FFFD
+    // and the following ASCII bytes survive.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, "\xe4x");
+        try std.testing.expectEqualStrings("\"\xef\xbf\xbdx\"", out.items);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, "\xe4xy");
+        try std.testing.expectEqualStrings("\"\xef\xbf\xbdxy\"", out.items);
+    }
+
+    // Valid multi-byte input is preserved byte-for-byte.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, "h\xc3\xa9llo");
+        try std.testing.expectEqualStrings("\"h\xc3\xa9llo\"", out.items);
+    }
+
+    // The encoded output round-trips through the JSON parser to the lossy
+    // decoding of the same input.
+    const inputs = [_][]const u8{
+        "a\xffb", "ok\xe4\xb8", "\xe4x", "\xe4xy", "h\xc3\xa9llo", "mixed\xff\xc3\xa9\x80tail",
+    };
+    for (inputs) |input| {
+        var out: std.ArrayList(u8) = .empty;
+        try appendJsonString(&out, arena, input);
+        const parsed = try std.json.parseFromSliceLeaky(Value, arena, out.items, .{});
+        try std.testing.expect(parsed == .string);
+        try std.testing.expectEqualStrings(try utf8LossyAlloc(arena, input), parsed.string);
+    }
 }
