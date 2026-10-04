@@ -227,12 +227,22 @@ pub const Link = struct {
 
     /// Add a waiter; fails once the link is dead (checked under the same
     /// mutex `kill` uses, so a waiter is never added after the fail sweep).
-    fn addWaiter(self: *Link, sid: u32, w: *Waiter) !void {
+    /// Returns the stream id actually registered.
+    fn addWaiter(self: *Link, sid: u32, w: *Waiter) !u32 {
         const io = self.hub.io;
         self.waiters_mutex.lockUncancelable(io);
         defer self.waiters_mutex.unlock(io);
         if (self.dead.load(.acquire)) return error.LinkDead;
-        try self.waiters.put(gpa, sid, w);
+        // After u32 wrap-around a sid may still be held by a long request:
+        // never overwrite it, take the next free one instead.
+        var id = sid;
+        while (true) : (id = self.nextSid()) {
+            const gop = try self.waiters.getOrPut(gpa, id);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = w;
+                return id;
+            }
+        }
     }
 
     /// Complete the waiter for `sid` with a RESP payload (ownership moves),
@@ -301,8 +311,7 @@ fn forwardOn(ln: *Link, arena: Allocator, body: []const u8, deadline_ms: u64) !F
     defer _ = ln.inflight.fetchSub(1, .acq_rel);
 
     var w = Waiter{};
-    const sid = ln.nextSid();
-    ln.addWaiter(sid, &w) catch |err| switch (err) {
+    const sid = ln.addWaiter(ln.nextSid(), &w) catch |err| switch (err) {
         error.LinkDead => return .node_disconnected,
         else => return err,
     };
@@ -612,7 +621,7 @@ test "hub registry: a new link for a name replaces the old one" {
     a.release();
 
     var w = Waiter{};
-    try a.addWaiter(5, &w);
+    try testing.expectEqual(@as(u32, 5), try a.addWaiter(5, &w));
     try fx.hub.register(b);
     // The old link is dead, its waiter failed, and it got GOAWAY.
     try testing.expect(a.dead.load(.acquire));
