@@ -128,18 +128,31 @@ fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
 
     const ch = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
     if (ch.kind != .challenge or ch.payload.len != link.NONCE_LEN) return error.BadChallenge;
-    const nonce: *const [link.NONCE_LEN]u8 = ch.payload[0..link.NONCE_LEN];
-    const hello = try link.buildHello(arena, node.cfg.connect_secret, nonce, node.cfg.name);
+    const hub_nonce: *const [link.NONCE_LEN]u8 = ch.payload[0..link.NONCE_LEN];
+    var node_nonce: [link.NONCE_LEN]u8 = undefined;
+    node.io.randomSecure(&node_nonce) catch return error.EntropyUnavailable;
+    const secret = node.cfg.connect_secret;
+    const hello = try link.buildHello(arena, secret, hub_nonce, &node_nonce, node.cfg.name);
     try link.writeFramePartsOn(conn, .hello, 0, &.{hello}, timeout_ms);
 
+    // The hub must prove the secret before any other frame is accepted:
+    // nothing reaches the read loop (and so rpc.handleRpc) until then.
     const reply = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
     switch (reply.kind) {
-        .welcome => {},
+        .welcome => {
+            if (!link.verifyWelcome(arena, secret, hub_nonce, &node_nonce, node.cfg.name, reply.payload)) {
+                std.debug.print("node link: hub authentication failed\n", .{});
+                return error.HubAuthFailed;
+            }
+        },
         .goaway => {
             std.debug.print("node link: hub refused: {s}\n", .{reply.payload});
             return error.Refused;
         },
-        else => return error.BadWelcome,
+        else => {
+            std.debug.print("node link: hub authentication failed\n", .{});
+            return error.HubAuthFailed;
+        },
     }
 }
 
@@ -535,8 +548,9 @@ test "node link serves REQ and PING over an authenticated link" {
     try testing.expectEqual(link.FrameType.hello, hello_frame.kind);
     const hello = try link.parseHello(arena, hello_frame.payload);
     try testing.expectEqualStrings("pc", hello.name);
-    try testing.expect(link.verifyAuth("s3cret", &nonce, hello.name, hello.auth));
-    try link.writeFrame(fd, .welcome, 0, "{\"v\":1}", 5000);
+    try testing.expect(link.verifyAuth(.node, "s3cret", &nonce, &hello.nonce, hello.name, hello.auth));
+    const welcome = try link.buildWelcome(arena, "s3cret", &nonce, &hello.nonce, hello.name);
+    try link.writeFrame(fd, .welcome, 0, welcome, 5000);
 
     try link.writeFrame(fd, .req, 7, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000);
     const resp = try link.readFrame(arena, fd, link.MAX_PAYLOAD, 5000);
@@ -588,4 +602,52 @@ test "node link reports a hub refusal" {
     try link.writeFrame(fd, .goaway, 0, "bad auth", 5000);
     t.join();
     try testing.expectError(error.Refused, result);
+}
+
+test "node link refuses a hub that cannot prove the secret" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const Bad = enum { missing_auth, wrong_secret, zero_auth, req_first, reflected_hello };
+    for (std.enums.values(Bad)) |bad| {
+        const client = try server.socket.address.connect(io, .{ .mode = .stream });
+        var hub_side = try server.accept(io);
+        defer hub_side.close(io);
+        const fd = hub_side.socket.handle;
+        try os.net.setSocketTimeouts(fd, 5);
+
+        var result: anyerror!u64 = error.NotRun;
+        const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
+        var nonce: [link.NONCE_LEN]u8 = @splat(4);
+        try link.writeFrame(fd, .challenge, 0, &nonce, 5000);
+        const hello_frame = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+        const hello = try link.parseHello(arena, hello_frame.payload);
+        switch (bad) {
+            .missing_auth => try link.writeFrame(fd, .welcome, 0, "{\"v\":1}", 5000),
+            .wrong_secret => try link.writeFrame(fd, .welcome, 0, try link.buildWelcome(arena, "guess", &nonce, &hello.nonce, hello.name), 5000),
+            .zero_auth => try link.writeFrame(fd, .welcome, 0, "{\"v\":1,\"auth\":\"" ++ "0" ** 64 ++ "\"}", 5000),
+            .req_first => try link.writeFrame(fd, .req, 1, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000),
+            .reflected_hello => {
+                const w = try std.fmt.allocPrint(arena, "{{\"v\":1,\"auth\":\"{s}\"}}", .{hello.auth});
+                try link.writeFrame(fd, .welcome, 0, w, 5000);
+            },
+        }
+        t.join();
+        try testing.expectError(error.HubAuthFailed, result);
+        // The node closed without answering anything: the next read is EOF.
+        try testing.expectError(error.LinkClosed, link.readFrame(arena, fd, link.MAX_PAYLOAD, 5000));
+        try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+    }
 }

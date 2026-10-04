@@ -2,11 +2,15 @@
 //!
 //! Framing: a 9-byte big-endian header followed by the payload:
 //!   u32 len (payload bytes), u8 type, u32 stream_id.
-//! Handshake: the hub sends CHALLENGE (32 random bytes); the node answers
-//! HELLO {"v":1,"name":..,"auth":hex(HMAC-SHA256(secret, DOMAIN || nonce ||
-//! name))}; the hub recomputes the MAC, compares in constant time and
-//! answers WELCOME {"v":1} or GOAWAY. The secret never crosses the wire and
-//! the fresh nonce prevents replay of a captured HELLO.
+//! Handshake (mutual): the hub sends CHALLENGE (32 random bytes, hub_nonce);
+//! the node answers HELLO {"v":1,"name":..,"nonce":hex(node_nonce),
+//! "auth":hex(HMAC-SHA256(secret, "<DOMAIN> node" || hub_nonce ||
+//! node_nonce || name))}; the hub checks it in constant time and answers
+//! WELCOME {"v":1,"auth":hex(HMAC-SHA256(secret, "<DOMAIN> hub" ||
+//! hub_nonce || node_nonce || name))} or GOAWAY. The node verifies the
+//! WELCOME MAC before it accepts any other frame, so a peer without the
+//! secret can never issue REQs. The secret never crosses the wire and each
+//! side's fresh nonce prevents replay of a captured proof.
 //!
 //! This module holds only the codec, the MAC, name validation, secret-file
 //! parsing and blocking frame I/O over a connected socket; the dial loop
@@ -77,11 +81,29 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-pub fn computeAuth(secret: []const u8, nonce: *const [NONCE_LEN]u8, name: []const u8) [MAC_LEN]u8 {
+/// Which side a MAC proves. The two directions use distinct domain
+/// strings, so a node MAC can never be reflected back as a hub MAC.
+pub const Direction = enum {
+    node,
+    hub,
+
+    fn domain(self: Direction) []const u8 {
+        return switch (self) {
+            .node => AUTH_DOMAIN ++ " node",
+            .hub => AUTH_DOMAIN ++ " hub",
+        };
+    }
+};
+
+/// HMAC-SHA256(secret, domain || hub_nonce || node_nonce || name).
+/// The domain is fixed per direction and both nonces are fixed-length, so
+/// the variable-length name last makes the concatenation unambiguous.
+pub fn computeAuth(dir: Direction, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8) [MAC_LEN]u8 {
     var mac: [MAC_LEN]u8 = undefined;
     var h = HmacSha256.init(secret);
-    h.update(AUTH_DOMAIN);
-    h.update(nonce);
+    h.update(dir.domain());
+    h.update(hub_nonce);
+    h.update(node_nonce);
     h.update(name);
     h.final(&mac);
     return mac;
@@ -89,37 +111,68 @@ pub fn computeAuth(secret: []const u8, nonce: *const [NONCE_LEN]u8, name: []cons
 
 /// Constant-time check of a hex-encoded MAC against the expected value.
 /// Malformed hex is a mismatch, never an error the caller could leak.
-pub fn verifyAuth(secret: []const u8, nonce: *const [NONCE_LEN]u8, name: []const u8, auth_hex: []const u8) bool {
-    const expected = computeAuth(secret, nonce, name);
-    if (auth_hex.len != MAC_LEN * 2) return false;
-    var got: [MAC_LEN]u8 = undefined;
-    _ = std.fmt.hexToBytes(&got, auth_hex) catch return false;
-    return std.crypto.timing_safe.eql([MAC_LEN]u8, got, expected);
+pub fn verifyAuth(dir: Direction, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8, auth_hex: []const u8) bool {
+    const expected = computeAuth(dir, secret, hub_nonce, node_nonce, name);
+    var got: [MAC_LEN]u8 = @splat(0);
+    const well_formed = auth_hex.len == MAC_LEN * 2 and
+        if (std.fmt.hexToBytes(&got, auth_hex)) |_| true else |_| false;
+    const same = std.crypto.timing_safe.eql([MAC_LEN]u8, got, expected);
+    return well_formed and same;
 }
 
-pub fn buildHello(arena: Allocator, secret: []const u8, nonce: *const [NONCE_LEN]u8, name: []const u8) ![]const u8 {
-    const mac = computeAuth(secret, nonce, name);
+pub fn buildHello(arena: Allocator, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8) ![]const u8 {
+    const mac = computeAuth(.node, secret, hub_nonce, node_nonce, name);
     const hex = std.fmt.bytesToHex(mac, .lower);
+    const nonce_hex = std.fmt.bytesToHex(node_nonce.*, .lower);
     var out: std.ArrayList(u8) = .empty;
     try out.print(arena, "{{\"v\":{d},\"name\":", .{PROTOCOL_VERSION});
     try util.appendJsonString(&out, arena, name);
-    try out.appendSlice(arena, ",\"auth\":\"");
+    try out.appendSlice(arena, ",\"nonce\":\"");
+    try out.appendSlice(arena, &nonce_hex);
+    try out.appendSlice(arena, "\",\"auth\":\"");
     try out.appendSlice(arena, &hex);
     try out.appendSlice(arena, "\"}");
     return out.items;
 }
 
 pub const Hello = struct {
+    name: []const u8,
+    auth: []const u8,
+    /// The node's own fresh nonce, decoded.
+    nonce: [NONCE_LEN]u8,
+};
+
+const HelloWire = struct {
     v: u32,
     name: []const u8,
+    nonce: []const u8,
     auth: []const u8,
 };
 
 pub fn parseHello(arena: Allocator, payload: []const u8) !Hello {
-    const hello = std.json.parseFromSliceLeaky(Hello, arena, payload, .{}) catch return error.BadHello;
-    if (hello.v != PROTOCOL_VERSION) return error.UnsupportedVersion;
-    if (!validName(hello.name)) return error.BadName;
-    return hello;
+    const wire = std.json.parseFromSliceLeaky(HelloWire, arena, payload, .{}) catch return error.BadHello;
+    if (wire.v != PROTOCOL_VERSION) return error.UnsupportedVersion;
+    if (!validName(wire.name)) return error.BadName;
+    var nonce: [NONCE_LEN]u8 = undefined;
+    if (wire.nonce.len != NONCE_LEN * 2) return error.BadHello;
+    _ = std.fmt.hexToBytes(&nonce, wire.nonce) catch return error.BadHello;
+    return .{ .name = wire.name, .auth = wire.auth, .nonce = nonce };
+}
+
+/// WELCOME payload: the hub proves the secret back to the node.
+pub fn buildWelcome(arena: Allocator, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8) ![]const u8 {
+    const mac = computeAuth(.hub, secret, hub_nonce, node_nonce, name);
+    const hex = std.fmt.bytesToHex(mac, .lower);
+    return std.fmt.allocPrint(arena, "{{\"v\":{d},\"auth\":\"{s}\"}}", .{ PROTOCOL_VERSION, &hex });
+}
+
+/// Node-side check of a WELCOME payload. Anything other than a v1 object
+/// carrying the right hub MAC is a failure.
+pub fn verifyWelcome(arena: Allocator, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8, payload: []const u8) bool {
+    const Welcome = struct { v: u32, auth: []const u8 };
+    const w = std.json.parseFromSliceLeaky(Welcome, arena, payload, .{}) catch return false;
+    if (w.v != PROTOCOL_VERSION) return false;
+    return verifyAuth(.hub, secret, hub_nonce, node_nonce, name, w.auth);
 }
 
 /// Hub-side secrets. `single`: one secret, any valid name may connect.
@@ -349,26 +402,57 @@ test "link hello round-trip verifies, and any tampering fails" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var nonce: [NONCE_LEN]u8 = @splat(7);
-    const payload = try buildHello(arena, "s3cret", &nonce, "pc");
+    var node_nonce: [NONCE_LEN]u8 = @splat(0x5a);
+    const payload = try buildHello(arena, "s3cret", &nonce, &node_nonce, "pc");
     const hello = try parseHello(arena, payload);
     try testing.expectEqualStrings("pc", hello.name);
-    try testing.expect(verifyAuth("s3cret", &nonce, hello.name, hello.auth));
+    try testing.expectEqualSlices(u8, &node_nonce, &hello.nonce);
+    try testing.expect(verifyAuth(.node, "s3cret", &nonce, &hello.nonce, hello.name, hello.auth));
     // wrong secret, wrong name, fresh nonce (replay), malformed hex
-    try testing.expect(!verifyAuth("other", &nonce, hello.name, hello.auth));
-    try testing.expect(!verifyAuth("s3cret", &nonce, "pc2", hello.auth));
+    try testing.expect(!verifyAuth(.node, "other", &nonce, &hello.nonce, hello.name, hello.auth));
+    try testing.expect(!verifyAuth(.node, "s3cret", &nonce, &hello.nonce, "pc2", hello.auth));
     var nonce2 = nonce;
     nonce2[0] ^= 1;
-    try testing.expect(!verifyAuth("s3cret", &nonce2, hello.name, hello.auth));
-    try testing.expect(!verifyAuth("s3cret", &nonce, hello.name, "zz"));
-    try testing.expect(!verifyAuth("s3cret", &nonce, hello.name, "g" ** 64));
+    try testing.expect(!verifyAuth(.node, "s3cret", &nonce2, &hello.nonce, hello.name, hello.auth));
+    var node_nonce2 = node_nonce;
+    node_nonce2[31] ^= 1;
+    try testing.expect(!verifyAuth(.node, "s3cret", &nonce, &node_nonce2, hello.name, hello.auth));
+    try testing.expect(!verifyAuth(.node, "s3cret", &nonce, &hello.nonce, hello.name, "zz"));
+    try testing.expect(!verifyAuth(.node, "s3cret", &nonce, &hello.nonce, hello.name, "g" ** 64));
+    // A node MAC is not a hub MAC: reflecting HELLO's auth as WELCOME fails.
+    try testing.expect(!verifyAuth(.hub, "s3cret", &nonce, &hello.nonce, hello.name, hello.auth));
+}
+
+test "link welcome proves the hub, and a wrong or missing auth fails" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const hub_nonce: [NONCE_LEN]u8 = @splat(1);
+    const node_nonce: [NONCE_LEN]u8 = @splat(2);
+    const good = try buildWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc");
+    try testing.expect(verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc", good));
+    try testing.expect(!verifyWelcome(arena, "other", &hub_nonce, &node_nonce, "pc", good));
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc2", good));
+    // a WELCOME bound to another node nonce (relayed from a different link)
+    var other_nonce = node_nonce;
+    other_nonce[0] ^= 1;
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &other_nonce, "pc", good));
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc", "{\"v\":1}"));
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc", "{\"v\":1,\"auth\":\"\"}"));
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc", "{\"v\":1,\"auth\":\"" ++ "0" ** 64 ++ "\"}"));
+    try testing.expect(!verifyWelcome(arena, "s3cret", &hub_nonce, &node_nonce, "pc", "not json"));
 }
 
 test "link hello parser rejects bad versions, names and shapes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectError(error.UnsupportedVersion, parseHello(arena, "{\"v\":2,\"name\":\"a\",\"auth\":\"\"}"));
-    try testing.expectError(error.BadName, parseHello(arena, "{\"v\":1,\"name\":\"a/b\",\"auth\":\"\"}"));
+    const n64 = "ab" ** 32;
+    try testing.expectError(error.UnsupportedVersion, parseHello(arena, "{\"v\":2,\"name\":\"a\",\"nonce\":\"" ++ n64 ++ "\",\"auth\":\"\"}"));
+    try testing.expectError(error.BadName, parseHello(arena, "{\"v\":1,\"name\":\"a/b\",\"nonce\":\"" ++ n64 ++ "\",\"auth\":\"\"}"));
+    try testing.expectError(error.BadHello, parseHello(arena, "{\"v\":1,\"name\":\"a\",\"auth\":\"\"}"));
+    try testing.expectError(error.BadHello, parseHello(arena, "{\"v\":1,\"name\":\"a\",\"nonce\":\"abcd\",\"auth\":\"\"}"));
+    try testing.expectError(error.BadHello, parseHello(arena, "{\"v\":1,\"name\":\"a\",\"nonce\":\"" ++ "zz" ** 32 ++ "\",\"auth\":\"\"}"));
     try testing.expectError(error.BadHello, parseHello(arena, "{\"v\":1}"));
     try testing.expectError(error.BadHello, parseHello(arena, "not json"));
 }

@@ -340,9 +340,20 @@ fn forwardOn(ln: *Link, arena: Allocator, body: []const u8, deadline_ms: u64) !F
 // Link lifecycle: handshake, reader, pinger, accept loop
 // ---------------------------------------------------------------------------
 
-/// Authenticate a freshly accepted peer. Returns the node name (in `arena`)
-/// or an error after sending GOAWAY where that makes sense.
-fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) ![]const u8 {
+const Authenticated = struct {
+    name: []const u8,
+    /// WELCOME payload carrying the hub's own proof of the secret.
+    welcome: []const u8,
+};
+
+/// Key for the MAC computed when a pinned name is unknown, so that path
+/// costs the same HMAC as a bad MAC for a known name.
+const DUMMY_KEY = "mcp-node-reverse-unknown-name";
+
+/// Authenticate a freshly accepted peer. Returns the node name and the
+/// WELCOME payload (in `arena`) or an error after sending GOAWAY where that
+/// makes sense.
+fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) !Authenticated {
     const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
     var nonce: [link.NONCE_LEN]u8 = undefined;
     try hub.io.randomSecure(&nonce);
@@ -358,13 +369,15 @@ fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) ![]const u8 {
         return err;
     };
     const secret = hub.secrets.lookup(hello.name);
-    // Unknown pinned names and bad MACs get the same answer.
-    const ok = if (secret) |s| link.verifyAuth(s, &nonce, hello.name, hello.auth) else false;
-    if (!ok) {
+    // Unknown pinned names and bad MACs get the same answer and the same
+    // work: the unknown-name path still computes one HMAC, with a dummy key.
+    const mac_ok = link.verifyAuth(.node, secret orelse DUMMY_KEY, &nonce, &hello.nonce, hello.name, hello.auth);
+    if (!(mac_ok and secret != null)) {
         link.writeFrame(fd, .goaway, 0, "auth failed", timeout_ms) catch {};
         return error.AuthFailed;
     }
-    return hello.name;
+    const welcome = try link.buildWelcome(arena, secret.?, &nonce, &hello.nonce, hello.name);
+    return .{ .name = hello.name, .welcome = welcome };
 }
 
 const Accepted = struct { hub: *Hub, stream: Io.net.Stream };
@@ -394,16 +407,16 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream) ?*Link {
         stream.close(hub.io);
         return null;
     };
-    const name = handshake(hub, arena_state.allocator(), fd) catch |err| {
+    const auth = handshake(hub, arena_state.allocator(), fd) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
         stream.close(hub.io);
         return null;
     };
-    const ln = Link.create(hub, stream, name) catch {
+    const ln = Link.create(hub, stream, auth.name) catch {
         stream.close(hub.io);
         return null;
     };
-    ln.writeFrame(.welcome, 0, &.{"{\"v\":1}"});
+    ln.writeFrame(.welcome, 0, &.{auth.welcome});
     if (ln.dead.load(.acquire)) {
         ln.release();
         return null;
