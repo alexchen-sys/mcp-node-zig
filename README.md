@@ -86,6 +86,13 @@ mcp-node is an execution API for agents. Through SSH, an agent gets one string t
 
 Speed isn't the argument: on an open connection both are fast. mcp-node has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
 
+## Reverse connect (no inbound ports)
+
+For machines behind NAT or without sshd, run the node with
+`--connect hub:port`: it dials out to a hub (the same binary with
+`MCP_NODE_HUB_LISTEN`), and clients reach it at `/n/<name>/mcp` on the hub.
+See [docs/reverse-connect.md](docs/reverse-connect.md).
+
 ## Tools
 
 | Tool | Does |
@@ -177,6 +184,9 @@ Environment variables only.
 | `MCP_NODE_MAX_INFLIGHT_BYTES` | `67108864`, total in-flight request bodies |
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
+
+Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
+[docs/reverse-connect.md](docs/reverse-connect.md).
 
 ## Troubleshooting
 
