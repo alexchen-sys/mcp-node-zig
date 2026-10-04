@@ -153,3 +153,114 @@ fn readFileAlloc(gpa: Allocator, path: []const u8, limit: usize) ![]u8 {
     }
     return out.toOwnedSlice(gpa);
 }
+
+test "environ get finds key in synthetic block" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Same construction as loadEnviron: a sentinel-terminated array of
+    // pointers to NUL-terminated "KEY=VALUE" strings.
+    const slice = try arena.allocSentinel(?[*:0]const u8, 3, null);
+    slice[0] = "FIRST=alpha";
+    slice[1] = "HOME=/tmp/x";
+    slice[2] = "LAST=omega";
+    const environ = std.process.Environ{ .block = .{ .slice = slice } };
+    // Present keys resolve from the first, middle, and last slot alike
+    // (no off-by-one at the walk boundaries).
+    try std.testing.expectEqualStrings("alpha", environGet(arena, environ, "FIRST").?);
+    try std.testing.expectEqualStrings("/tmp/x", environGet(arena, environ, "HOME").?);
+    try std.testing.expectEqualStrings("omega", environGet(arena, environ, "LAST").?);
+    // Absent keys yield null.
+    try std.testing.expect(environGet(arena, environ, "MIDDLE") == null);
+    // A key that is a strict prefix or extension of a stored name must not
+    // match: comparison runs up to the '=' delimiter, not anywhere in the
+    // entry.
+    try std.testing.expect(environGet(arena, environ, "HOM") == null);
+    try std.testing.expect(environGet(arena, environ, "HOMEE") == null);
+}
+
+test "environ get returns null on empty environ block" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    // std's .empty block holds zero entries; the POSIX walk must degrade
+    // to null without touching memory.
+    try std.testing.expect(environGet(std.testing.allocator, std.process.Environ.empty, "HOME") == null);
+}
+
+test "environ get empty value returns empty string not null" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const slice = try arena.allocSentinel(?[*:0]const u8, 1, null);
+    slice[0] = "EMPTY=";
+    const environ = std.process.Environ{ .block = .{ .slice = slice } };
+    // A "KEY=" entry is a variable that is set to the empty value: the
+    // walk matches up to '=' and returns the zero-length remainder, so a
+    // caller can distinguish "unset" (null) from "set to empty" ("").
+    const value = environGet(arena, environ, "EMPTY");
+    try std.testing.expect(value != null);
+    try std.testing.expectEqual(@as(usize, 0), value.?.len);
+}
+
+test "home dir returns home value from snapshot" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const slice = try arena.allocSentinel(?[*:0]const u8, 1, null);
+    slice[0] = "HOME=/envhome/tester";
+    const environ = std.process.Environ{ .block = .{ .slice = slice } };
+    try std.testing.expectEqualStrings("/envhome/tester", homeDir(arena, environ).?);
+}
+
+test "home dir missing home yields null" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const slice = try arena.allocSentinel(?[*:0]const u8, 2, null);
+    slice[0] = "LANG=C";
+    slice[1] = "PATH=/usr/bin";
+    const environ = std.process.Environ{ .block = .{ .slice = slice } };
+    // The walk passes over both unrelated entries without a match.
+    try std.testing.expect(homeDir(arena, environ) == null);
+}
+
+test "home dir empty home value yields empty string" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const slice = try arena.allocSentinel(?[*:0]const u8, 1, null);
+    slice[0] = "HOME=";
+    const environ = std.process.Environ{ .block = .{ .slice = slice } };
+    // Actual POSIX behavior: $HOME comes back as-is, so an empty value is
+    // returned as an empty string, not null. The homeDir doc comment
+    // claims "an empty value yields null", which matches only the Windows
+    // branch (it checks profile.len > 0); the POSIX branch has no empty
+    // check. Doc/behavior mismatch noted for maintainers; this test pins
+    // the actual code.
+    const home = homeDir(arena, environ);
+    try std.testing.expect(home != null);
+    try std.testing.expectEqual(@as(usize, 0), home.?.len);
+}
+
+test "load environ snapshot supports lookups" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // /proc/self/environ loader
+    // loadEnviron intentionally never frees the snapshot (it lives for the
+    // whole process), so an arena owns it here to keep the test allocator
+    // leak-check clean while still exercising the real allocation paths.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const snapshot = try loadEnviron(arena);
+    // A key no sane runner sets must come back null; this also holds when
+    // the snapshot degraded to .empty after a read failure.
+    try std.testing.expect(environGet(arena, snapshot, "DEFINITELY_MISSING_VAR_XQZ") == null);
+    // PATH is expected in any normal test-runner environment; a bare
+    // environment must not fail the test, so assert only when present.
+    if (environGet(arena, snapshot, "PATH")) |path| {
+        try std.testing.expect(path.len > 0);
+    }
+}
