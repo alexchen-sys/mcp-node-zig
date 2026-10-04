@@ -1,5 +1,5 @@
 {
-  "description": "exec: fire-and-wait argv run. Payload keys: ok, exit_code, stdout, stderr, truncated, duration_ms, duration_us. Missing argv is a tool-domain error (ok=false + error name in structuredContent); a present argument with the wrong JSON type is a JSON-RPC -32602 Invalid params error.",
+  "description": "exec: fire-and-wait argv run. Payload keys: ok, exit_code, stdout, stderr, duration_ms, duration_us. Missing argv is a tool-domain error (ok=false + error name in structuredContent); a present argument with the wrong JSON type is a JSON-RPC -32602 Invalid params error.",
   "platforms": ["posix"],
   "platforms_reason": "golden argv use POSIX paths (/bin/echo, /bin/false); Windows goldens are future work",
   "cases": [
@@ -8,7 +8,7 @@
       "request": {"jsonrpc": "2.0", "id": 45, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/bin/echo", "hello"]}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 45, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "exit_code": 0, "stdout": "hello\n", "stderr": "", "truncated": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 45, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {
@@ -16,7 +16,7 @@
       "request": {"jsonrpc": "2.0", "id": 46, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/usr/bin/false"]}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 46, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "exit_code": 1, "stdout": "", "stderr": "", "truncated": false, "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 46, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "exit_code": 1, "stdout": "", "stderr": "", "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
       }
     },
     {

@@ -172,7 +172,7 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
     try util.appendJsonString(out, arena, stdout_text);
     try out.appendSlice(arena, ",\"stderr\":");
     try util.appendJsonString(out, arena, stderr_text);
-    try out.appendSlice(arena, ",\"truncated\":false,\"duration_ms\":");
+    try out.appendSlice(arena, ",\"duration_ms\":");
     try out.print(arena, "{d}", .{elapsed.toMilliseconds()});
     // Same measurement, microsecond resolution: sub-millisecond commands
     // would render duration_ms: 0 and look like a measurement failure.

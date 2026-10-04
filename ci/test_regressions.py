@@ -966,6 +966,16 @@ class SanityTests(unittest.TestCase):
         self.assertEqual(reply.get('stdout'), '\ufffd\ufffdabc', reply)
         self.assertEqual(reply.get('stderr'), '\ufffdxy', reply)
 
+    def test_exec_payload_has_no_dead_truncated_flag(self):
+        """exec never truncates output (StreamTooLong fails as OutputTooLong),
+        so the always-false `truncated` flag was dead weight and is gone."""
+        node = Node()
+        self.addCleanup(node.close)
+        reply = node.tool('exec', {'argv': [sys.executable, '-c', 'pass']})
+        self.assertTrue(reply.get('ok'), reply)
+        self.assertNotIn('truncated', reply,
+                         'exec carries a dead truncated flag that is always false')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
