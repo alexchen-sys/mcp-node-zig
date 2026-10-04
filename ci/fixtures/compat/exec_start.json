@@ -25,7 +25,7 @@
       "request": {"jsonrpc": "2.0", "id": 88, "method": "tools/call", "params": {"name": "exec_start", "arguments": {"argv": "/bin/echo"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 88, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "BadArgv"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 88, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "BadArgv", "message": "argv must be a non-empty array of strings"}, "isError": false}}
       }
     },
     {

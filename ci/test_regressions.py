@@ -976,6 +976,29 @@ class SanityTests(unittest.TestCase):
         self.assertNotIn('truncated', reply,
                          'exec carries a dead truncated flag that is always false')
 
+    def test_cryptic_error_names_carry_a_message(self):
+        """BadArgv and the base64 decode errors are cryptic as bare Zig names;
+        they carry a human-readable `message` next to `error`. Other error
+        payloads keep their historical two-key shape (additive, scoped)."""
+        node = Node()
+        self.addCleanup(node.close)
+        reply = node.tool('exec', {'argv': 'not-an-array'})
+        self.assertFalse(reply.get('ok'), reply)
+        self.assertEqual(reply.get('error'), 'BadArgv', reply)
+        self.assertEqual(reply.get('message'),
+                         'argv must be a non-empty array of strings', reply)
+        reply = node.tool('write_file', {'path': '/tmp/mcpnz-b64probe',
+                                         'content_b64': '!!!'})
+        self.assertFalse(reply.get('ok'), reply)
+        self.assertIn(reply.get('error'),
+                      ('InvalidPadding', 'InvalidCharacter', 'InvalidLength'), reply)
+        self.assertTrue(reply.get('message'), reply)
+        # Scope boundary: self-explanatory names stay message-less.
+        reply = node.tool('exec', {})
+        self.assertFalse(reply.get('ok'), reply)
+        self.assertEqual(reply.get('error'), 'MissingArgv', reply)
+        self.assertNotIn('message', reply)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

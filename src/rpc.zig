@@ -254,7 +254,24 @@ fn buildErrorPayload(out: *std.ArrayList(u8), arena: Allocator, msg: []const u8)
     out.clearRetainingCapacity();
     try out.appendSlice(arena, "{\"ok\":false,\"error\":");
     try util.appendJsonString(out, arena, msg);
+    if (errHint(msg)) |hint| {
+        try out.appendSlice(arena, ",\"message\":");
+        try util.appendJsonString(out, arena, hint);
+    }
     try out.appendSlice(arena, "}");
+}
+
+/// Human-readable hints for the few error names whose raw form is cryptic
+/// to a JSON client (Zig's base64 taxonomy, argv shape validation).
+/// Additive: the machine-readable name stays in "error"; "message" is
+/// only emitted for names listed here, so the payload shape of every
+/// other error is unchanged.
+fn errHint(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "BadArgv")) return "argv must be a non-empty array of strings";
+    if (std.mem.eql(u8, name, "InvalidPadding")) return "value is not valid standard base64 (bad length or padding)";
+    if (std.mem.eql(u8, name, "InvalidCharacter")) return "value is not valid standard base64 (illegal character)";
+    if (std.mem.eql(u8, name, "InvalidLength")) return "value is not valid standard base64 (bad length)";
+    return null;
 }
 
 /// Server-level usage notes returned as `instructions` in the initialize
