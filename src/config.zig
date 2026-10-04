@@ -134,9 +134,29 @@ pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Confi
         return error.InvalidConfig;
     }
 
-    // Node mode opens no client listener, so the client token is unused;
-    // the link is authenticated by its own secret instead.
-    const token = if (mode == .node) "" else try loadToken(arena, io);
+    const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
+    const token_raw = readTokenFile(arena, io, mode, token_path) catch |err| token_blk: {
+        // Fail-closed on Windows by design: a missing token
+        // file fails startup there instead of degrading to insecure mode;
+        // the FileNotFound recovery branch is compiled out with the read.
+        if (comptime os.gate_posix_file_io) {
+            return err;
+        } else {
+            break :token_blk switch (err) {
+                error.FileNotFound => insecure_blk: {
+                    const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
+                    if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
+                    break :insecure_blk try arena.dupe(u8, "");
+                },
+                else => return err,
+            };
+        }
+    };
+    const token = std.mem.trim(u8, token_raw, " \t\r\n");
+    if (token.len == 0 and mode != .node) {
+        const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
+        if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
+    }
 
     // Text-mirror gate for tool results. Only the exact value "0" turns
     // the mirror off; anything else (including unset) keeps the default
@@ -225,31 +245,11 @@ pub fn parseEndpoint(arena: Allocator, s: []const u8) !Endpoint {
     return .{ .host = try arena.dupe(u8, host), .port = port };
 }
 
-fn loadToken(arena: Allocator, io: Io) ![]const u8 {
-    const token_path = getEnv(arena, "MCP_NODE_TOKEN_FILE") orelse "./token";
-    const token_raw = os.fd.readFileAlloc(arena, io, token_path, TOKEN_FILE_MAX_BYTES) catch |err| token_blk: {
-        // Fail-closed on Windows by design: a missing token
-        // file fails startup there instead of degrading to insecure mode;
-        // the FileNotFound recovery branch is compiled out with the read.
-        if (comptime os.gate_posix_file_io) {
-            return err;
-        } else {
-            break :token_blk switch (err) {
-                error.FileNotFound => insecure_blk: {
-                    const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
-                    if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-                    break :insecure_blk try arena.dupe(u8, "");
-                },
-                else => return err,
-            };
-        }
-    };
-    const token = std.mem.trim(u8, token_raw, " \t\r\n");
-    if (token.len == 0) {
-        const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
-        if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
-    }
-    return token;
+/// Node mode opens no client listener, so the client token is unused and
+/// the token file is not read at all (the link has its own secret).
+fn readTokenFile(arena: Allocator, io: Io, mode: Mode, path: []const u8) ![]u8 {
+    if (mode == .node) return &.{};
+    return os.fd.readFileAlloc(arena, io, path, TOKEN_FILE_MAX_BYTES);
 }
 
 /// All environment reads go through the OS layer's snapshot lookup
