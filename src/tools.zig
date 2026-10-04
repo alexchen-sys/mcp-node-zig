@@ -766,3 +766,600 @@ fn expandPath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
     if (home.len == 0) return path;
     return std.mem.concat(arena, u8, &.{ home, path[1..] });
 }
+
+// --- tests ------------------------------------------------------------------
+//
+// Behavioral tests drive the public tool entry points with JSON arguments
+// and parse the JSON responses back — the same contract the RPC layer
+// exposes. Each test builds its own `Io.Threaded` instance (std's
+// `global_single_threaded` carries a failing allocator, which breaks
+// process spawning and directory creation) and, where HOME or PATH
+// semantics matter, a synthetic environment snapshot saved and restored
+// around the test.
+
+fn testConfig(arena: Allocator) !config.Config {
+    return .{
+        .name = "test-node",
+        .host = "127.0.0.1",
+        .port = 1,
+        .token = "",
+        .allowed_hosts = try util.splitCsv(arena, "127.0.0.1:*"),
+        .allowed_origins = try util.splitCsv(arena, "http://127.0.0.1:*"),
+        .max_out = 1024 * 1024,
+        .socket_timeout_s = 1,
+        .max_conn = 4,
+        .max_sessions = 8,
+        .session_ttl_s = 600,
+        .max_inflight_bytes = 64 * 1024 * 1024,
+    };
+}
+
+fn parseArgs(arena: Allocator, json: []const u8) !Value {
+    return std.json.parseFromSliceLeaky(Value, arena, json, .{});
+}
+
+fn runTool(
+    arena: Allocator,
+    io: Io,
+    cfg: *const config.Config,
+    comptime tool: anytype,
+    args_json: []const u8,
+    out: *std.ArrayList(u8),
+) !void {
+    const args = try parseArgs(arena, args_json);
+    try tool(arena, io, cfg, args, out);
+}
+
+fn b64Alloc(arena: Allocator, data: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const buf = try arena.alloc(u8, enc.calcSize(data.len));
+    return enc.encode(buf, data);
+}
+
+fn hexLowerAlloc(arena: Allocator, bytes: []const u8) ![]const u8 {
+    const digits = "0123456789abcdef";
+    const buf = try arena.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        buf[i * 2] = digits[b >> 4];
+        buf[i * 2 + 1] = digits[b & 0xf];
+    }
+    return buf;
+}
+
+fn getBool(v: Value, key: []const u8) bool {
+    return v.object.get(key).?.bool;
+}
+
+fn getInt(v: Value, key: []const u8) i64 {
+    return v.object.get(key).?.integer;
+}
+
+fn getStr(v: Value, key: []const u8) []const u8 {
+    return v.object.get(key).?.string;
+}
+
+test "expandPath expands tilde against HOME from the environ snapshot" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    const saved = env_state.process_environ;
+    defer env_state.process_environ = saved;
+    const slice = try arena.allocSentinel(?[*:0]const u8, 2, null);
+    slice[0] = "HOME=/envhome/tester";
+    slice[1] = "PATH=/usr/bin:/bin";
+    env_state.process_environ = .{ .block = .{ .slice = slice } };
+
+    try std.testing.expectEqualStrings("/envhome/tester", try expandPath(arena, io, "~"));
+    try std.testing.expectEqualStrings("/envhome/tester/", try expandPath(arena, io, "~/"));
+    try std.testing.expectEqualStrings("/envhome/tester/x", try expandPath(arena, io, "~/x"));
+    try std.testing.expectEqualStrings("/envhome/tester/a/b", try expandPath(arena, io, "~/a/b"));
+    // "~user" is unsupported and left untouched, as are empty, relative
+    // and absolute paths.
+    try std.testing.expectEqualStrings("~root", try expandPath(arena, io, "~root"));
+    try std.testing.expectEqualStrings("~root/x", try expandPath(arena, io, "~root/x"));
+    try std.testing.expectEqualStrings("", try expandPath(arena, io, ""));
+    try std.testing.expectEqualStrings("/abs", try expandPath(arena, io, "/abs"));
+    try std.testing.expectEqualStrings("rel/path", try expandPath(arena, io, "rel/path"));
+
+    // Without HOME the tilde is not expandable: the input comes back
+    // unchanged instead of failing.
+    env_state.process_environ = .empty;
+    try std.testing.expectEqualStrings("~", try expandPath(arena, io, "~"));
+    try std.testing.expectEqualStrings("~/x", try expandPath(arena, io, "~/x"));
+}
+
+test "tool exec runs commands and reports exit codes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var out: std.ArrayList(u8) = .empty;
+    try runTool(arena, io, &cfg, toolExec, "{\"argv\":[\"/bin/echo\",\"hello\",\"world\"]}", &out);
+    var v = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(v, "ok"));
+    try std.testing.expectEqual(@as(i64, 0), getInt(v, "exit_code"));
+    try std.testing.expectEqualStrings("hello world\n", getStr(v, "stdout"));
+    try std.testing.expectEqualStrings("", getStr(v, "stderr"));
+
+    // stderr and a nonzero exit code both surface (ok mirrors the code).
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExec, "{\"argv\":[\"/bin/cat\",\"/nonexistent-mcpnz-input\"]}", &out);
+    v = try parseArgs(arena, out.items);
+    try std.testing.expect(!getBool(v, "ok"));
+    try std.testing.expectEqual(@as(i64, 1), getInt(v, "exit_code"));
+    try std.testing.expect(std.mem.indexOf(u8, getStr(v, "stderr"), "No such file") != null);
+
+    // The spawn pre-flight rejects a missing program without forking.
+    out = .empty;
+    try std.testing.expectError(
+        error.FileNotFound,
+        runTool(arena, io, &cfg, toolExec, "{\"argv\":[\"/nonexistent/mcpnz-prog\"]}", &out),
+    );
+}
+
+test "tool exec timeout surfaces CommandTimeout payload" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var out: std.ArrayList(u8) = .empty;
+    try runTool(arena, io, &cfg, toolExec, "{\"argv\":[\"/bin/sleep\",\"30\"],\"timeout\":1}", &out);
+    const v = try parseArgs(arena, out.items);
+    try std.testing.expect(!getBool(v, "ok"));
+    try std.testing.expect(getBool(v, "timeout"));
+    try std.testing.expectEqualStrings("CommandTimeout", getStr(v, "error"));
+
+    // A timeout below the 1-second floor is clamped up to 1, never 0:
+    // the payload is the same machine-readable timeout fact.
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExec, "{\"argv\":[\"/bin/sleep\",\"30\"],\"timeout\":0}", &out);
+    const clamped = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(clamped, "timeout"));
+    try std.testing.expectEqualStrings("CommandTimeout", getStr(clamped, "error"));
+}
+
+test "tool exec shell runs bash pipelines and rejects unsupported shells" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // "bash" (no slash) resolves through PATH: both the pre-flight and
+    // the spawn layer read the process environment snapshot.
+    const saved = env_state.process_environ;
+    defer env_state.process_environ = saved;
+    const slice = try arena.allocSentinel(?[*:0]const u8, 2, null);
+    slice[0] = "PATH=/usr/bin:/bin";
+    slice[1] = "HOME=/envhome/tester";
+    env_state.process_environ = .{ .block = .{ .slice = slice } };
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var out: std.ArrayList(u8) = .empty;
+    try runTool(arena, io, &cfg, toolExecShell, "{\"script\":\"echo hi | tr a-z A-Z\",\"shell\":\"bash\"}", &out);
+    var v = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(v, "ok"));
+    try std.testing.expectEqual(@as(i64, 0), getInt(v, "exit_code"));
+    try std.testing.expectEqualStrings("HI\n", getStr(v, "stdout"));
+
+    // Omitting the shell defaults to bash on POSIX.
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExecShell, "{\"script\":\"echo default\"}", &out);
+    v = try parseArgs(arena, out.items);
+    try std.testing.expectEqualStrings("default\n", getStr(v, "stdout"));
+
+    // A shell outside the platform allowlist is refused before spawning.
+    out = .empty;
+    try std.testing.expectError(
+        error.UnsupportedShell,
+        runTool(arena, io, &cfg, toolExecShell, "{\"script\":\"true\",\"shell\":\"powershell\"}", &out),
+    );
+}
+
+test "write file and read file roundtrip with sha256 and mode" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = try arena.dupe(u8, path_buf[0..root_len]);
+    const content = "hello world";
+
+    var out: std.ArrayList(u8) = .empty;
+    const file_path = try std.fmt.allocPrint(arena, "{s}/roundtrip.txt", .{root});
+    var args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content_b64\":\"{s}\",\"mode\":{d}}}", .{
+        file_path, try b64Alloc(arena, content), @as(i64, 0o600),
+    });
+    try runTool(arena, io, &cfg, toolWriteFile, args, &out);
+    var v = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(v, "ok"));
+    try std.testing.expectEqualStrings(file_path, getStr(v, "path"));
+    try std.testing.expectEqual(@as(i64, @intCast(content.len)), getInt(v, "size"));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    try std.testing.expectEqualStrings(try hexLowerAlloc(arena, &digest), getStr(v, "sha256"));
+
+    // The permission bits reach the filesystem on POSIX (0o600 has no
+    // group/other bits, so no sane umask can strip it).
+    const st = try std.Io.Dir.statFile(.cwd(), io, file_path, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+
+    // Reading the file back through the tool.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{file_path});
+    try runTool(arena, io, &cfg, toolReadFile, args, &out);
+    v = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(v, "ok"));
+    try std.testing.expectEqualStrings(file_path, getStr(v, "path"));
+    try std.testing.expectEqual(@as(i64, @intCast(content.len)), getInt(v, "size"));
+    try std.testing.expectEqual(@as(i64, 0), getInt(v, "offset"));
+    try std.testing.expectEqualStrings(content, getStr(v, "content"));
+    try std.testing.expect(!getBool(v, "has_more"));
+
+    // offset/limit are character positions: slice "cde" out of "abcdef".
+    const slice_path = try std.fmt.allocPrint(arena, "{s}/slice.txt", .{root});
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content_b64\":\"{s}\"}}", .{
+        slice_path, try b64Alloc(arena, "abcdef"),
+    });
+    try runTool(arena, io, &cfg, toolWriteFile, args, &out);
+
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"offset\":2,\"limit\":3}}", .{slice_path});
+    try runTool(arena, io, &cfg, toolReadFile, args, &out);
+    v = try parseArgs(arena, out.items);
+    try std.testing.expectEqualStrings("cde", getStr(v, "content"));
+    try std.testing.expect(getBool(v, "has_more"));
+    try std.testing.expectEqual(@as(i64, 2), getInt(v, "offset"));
+    try std.testing.expectEqual(@as(i64, 6), getInt(v, "size"));
+
+    // Negative offset/limit are rejected before any read happens.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"offset\":-1}}", .{slice_path});
+    try std.testing.expectError(error.BadOffset, runTool(arena, io, &cfg, toolReadFile, args, &out));
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"limit\":-1}}", .{slice_path});
+    try std.testing.expectError(error.BadOffset, runTool(arena, io, &cfg, toolReadFile, args, &out));
+
+    // Missing files and directories map to distinct errors.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/missing.txt\"}}", .{root});
+    try std.testing.expectError(error.FileNotFound, runTool(arena, io, &cfg, toolReadFile, args, &out));
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{root});
+    try std.testing.expectError(error.IsDirectory, runTool(arena, io, &cfg, toolReadFile, args, &out));
+}
+
+test "write file validates mode base64 and parent creation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = try arena.dupe(u8, path_buf[0..root_len]);
+
+    // mode is bounded to 0..0o7777.
+    var out: std.ArrayList(u8) = .empty;
+    var args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/mode.txt\",\"content_b64\":\"eA==\",\"mode\":{d}}}", .{
+        root, @as(i64, 0o10000),
+    });
+    try std.testing.expectError(error.BadMode, runTool(arena, io, &cfg, toolWriteFile, args, &out));
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/mode.txt\",\"content_b64\":\"eA==\",\"mode\":-1}}", .{root});
+    try std.testing.expectError(error.BadMode, runTool(arena, io, &cfg, toolWriteFile, args, &out));
+
+    // Invalid base64 fails with the decoder's own errors before any file
+    // is touched: an illegal character and a bad length are distinct.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/b64.txt\",\"content_b64\":\"!!!!\"}}", .{root});
+    try std.testing.expectError(error.InvalidCharacter, runTool(arena, io, &cfg, toolWriteFile, args, &out));
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/b64.txt\",\"content_b64\":\"ABCDE\"}}", .{root});
+    try std.testing.expectError(error.InvalidPadding, runTool(arena, io, &cfg, toolWriteFile, args, &out));
+
+    // mkdirs=false keeps a missing parent an error.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/no_parent/f.txt\",\"content_b64\":\"eA==\",\"mkdirs\":false}}", .{root});
+    try std.testing.expectError(error.FileNotFound, runTool(arena, io, &cfg, toolWriteFile, args, &out));
+
+    // The default mkdirs=true creates every missing parent.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/deep/nested/f.txt\",\"content_b64\":\"{s}\"}}", .{
+        root, try b64Alloc(arena, "nested"),
+    });
+    try runTool(arena, io, &cfg, toolWriteFile, args, &out);
+    const nested = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(nested, "ok"));
+    try std.testing.expectEqual(@as(i64, 6), getInt(nested, "size"));
+
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/deep/nested/f.txt\"}}", .{root});
+    try runTool(arena, io, &cfg, toolReadFile, args, &out);
+    const read = try parseArgs(arena, out.items);
+    try std.testing.expectEqualStrings("nested", getStr(read, "content"));
+}
+
+test "list dir sorts entries and reports types" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cfg = try testConfig(arena);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = try arena.dupe(u8, path_buf[0..root_len]);
+
+    // Fixtures: two files written through the write tool plus one plain
+    // subdirectory, deliberately created out of sorted order.
+    var out: std.ArrayList(u8) = .empty;
+    var args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/b.txt\",\"content_b64\":\"{s}\"}}", .{
+        root, try b64Alloc(arena, "bbb"),
+    });
+    try runTool(arena, io, &cfg, toolWriteFile, args, &out);
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\",\"content_b64\":\"{s}\"}}", .{
+        root, try b64Alloc(arena, "a"),
+    });
+    try runTool(arena, io, &cfg, toolWriteFile, args, &out);
+    const sub = try std.fmt.allocPrint(arena, "{s}/sub", .{root});
+    try std.Io.Dir.createDirPath(.cwd(), io, sub);
+
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{root});
+    try runTool(arena, io, &cfg, toolListDir, args, &out);
+    const v = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(v, "ok"));
+    const items = v.object.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings("a.txt", getStr(items[0], "name"));
+    try std.testing.expectEqualStrings("f", getStr(items[0], "type"));
+    try std.testing.expectEqual(@as(i64, 1), getInt(items[0], "size"));
+    try std.testing.expectEqualStrings("b.txt", getStr(items[1], "name"));
+    try std.testing.expectEqualStrings("f", getStr(items[1], "type"));
+    try std.testing.expectEqual(@as(i64, 3), getInt(items[1], "size"));
+    try std.testing.expectEqualStrings("sub", getStr(items[2], "name"));
+    try std.testing.expectEqualStrings("d", getStr(items[2], "type"));
+    try std.testing.expectEqual(@as(i64, 3), getInt(v, "count"));
+    try std.testing.expect(!getBool(v, "has_more"));
+    try std.testing.expect(!getBool(v, "truncated"));
+
+    // A missing directory and a plain file are distinct errors.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/missing-dir\"}}", .{root});
+    try std.testing.expectError(error.FileNotFound, runTool(arena, io, &cfg, toolListDir, args, &out));
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\"}}", .{root});
+    try std.testing.expectError(error.NotDirectory, runTool(arena, io, &cfg, toolListDir, args, &out));
+}
+
+test "exec session lifecycle start write wait poll close" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const saved = env_state.process_environ;
+    defer env_state.process_environ = saved;
+    const slice = try arena.allocSentinel(?[*:0]const u8, 2, null);
+    slice[0] = "PATH=/usr/bin:/bin";
+    slice[1] = "HOME=/envhome/tester";
+    env_state.process_environ = .{ .block = .{ .slice = slice } };
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    const store = try std.heap.page_allocator.create(session_mod.SessionStore);
+    store.* = session_mod.SessionStore.init(io, 8);
+    cfg.sessions = store;
+
+    // exec_start publishes the session before returning.
+    var out: std.ArrayList(u8) = .empty;
+    try runTool(arena, io, &cfg, toolExecStart, "{\"argv\":[\"/bin/cat\"]}", &out);
+    const start = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(start, "ok"));
+    const sid = getInt(start, "session_id");
+    try std.testing.expect(sid > 0);
+    try std.testing.expect(getInt(start, "pid") > 0);
+
+    // exec_list shows the live session with its argv.
+    out = .empty;
+    try toolExecList(arena, io, &cfg, &out);
+    const list = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(list, "ok"));
+    var listed = false;
+    for (list.object.get("sessions").?.array.items) |item| {
+        if (getInt(item, "session_id") == sid) {
+            listed = true;
+            try std.testing.expect(!getBool(item, "done"));
+            try std.testing.expectEqualStrings("/bin/cat", item.object.get("argv").?.array.items[0].string);
+        }
+    }
+    try std.testing.expect(listed);
+
+    // exec_write feeds stdin; eof closes it, which lets cat exit.
+    out = .empty;
+    var args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d},\"data_b64\":\"aGVsbG8=\",\"eof\":true}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecWrite, args, &out);
+    const write = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(write, "ok"));
+    try std.testing.expectEqual(@as(i64, 5), getInt(write, "bytes"));
+    try std.testing.expect(getBool(write, "eof"));
+
+    // exec_wait blocks until the session finishes.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d},\"timeout\":5}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecWait, args, &out);
+    const wait = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(wait, "ok"));
+    try std.testing.expect(getBool(wait, "done"));
+    try std.testing.expectEqual(@as(i64, 0), getInt(wait, "exit_code"));
+    try std.testing.expectEqualStrings("hello", getStr(wait, "stdout"));
+    try std.testing.expectEqual(@as(i64, 5), getInt(wait, "stdout_offset"));
+
+    // exec_poll replays deltas from the requested byte offset.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d},\"stdout_offset\":0}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecPoll, args, &out);
+    var poll = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(poll, "done"));
+    try std.testing.expectEqualStrings("hello", getStr(poll, "stdout"));
+    try std.testing.expectEqual(@as(i64, 5), getInt(poll, "stdout_offset"));
+
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d},\"stdout_offset\":3}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecPoll, args, &out);
+    poll = try parseArgs(arena, out.items);
+    try std.testing.expectEqualStrings("lo", getStr(poll, "stdout"));
+    try std.testing.expectEqual(@as(i64, 5), getInt(poll, "stdout_offset"));
+
+    // exec_close frees the session; the second close is idempotent and a
+    // later poll reports the session as unknown.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d}}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecClose, args, &out);
+    const first_close = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(first_close, "ok"));
+    try std.testing.expect(first_close.object.get("already_closed") == null);
+
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExecClose, args, &out);
+    const second_close = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(second_close, "ok"));
+    try std.testing.expect(getBool(second_close, "already_closed"));
+
+    out = .empty;
+    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, args, &out));
+}
+
+test "exec close kills a running session and frees it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const saved = env_state.process_environ;
+    defer env_state.process_environ = saved;
+    const slice = try arena.allocSentinel(?[*:0]const u8, 2, null);
+    slice[0] = "PATH=/usr/bin:/bin";
+    slice[1] = "HOME=/envhome/tester";
+    env_state.process_environ = .{ .block = .{ .slice = slice } };
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    const store = try std.heap.page_allocator.create(session_mod.SessionStore);
+    store.* = session_mod.SessionStore.init(io, 8);
+    cfg.sessions = store;
+
+    var out: std.ArrayList(u8) = .empty;
+    try runTool(arena, io, &cfg, toolExecStart, "{\"argv\":[\"/bin/sleep\",\"30\"]}", &out);
+    const start = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(start, "ok"));
+    const sid = getInt(start, "session_id");
+
+    // While the process runs, exec_wait times out with done=false and a
+    // null exit code.
+    out = .empty;
+    var args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d},\"timeout\":1}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecWait, args, &out);
+    const wait = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(wait, "ok"));
+    try std.testing.expect(!getBool(wait, "done"));
+    try std.testing.expect(wait.object.get("exit_code").? == .null);
+
+    // Closing a live session kills the tree, joins the session threads
+    // and frees the state.
+    out = .empty;
+    args = try std.fmt.allocPrint(arena, "{{\"session_id\":{d}}}", .{sid});
+    try runTool(arena, io, &cfg, toolExecClose, args, &out);
+    const closed = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(closed, "ok"));
+
+    // Idempotent: the second close reports already_closed, and polling
+    // the freed id fails with UnknownSession.
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExecClose, args, &out);
+    const again = try parseArgs(arena, out.items);
+    try std.testing.expect(getBool(again, "ok"));
+    try std.testing.expect(getBool(again, "already_closed"));
+    out = .empty;
+    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, args, &out));
+}
+
+test "tool argument validation errors" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cfg = try testConfig(arena);
+
+    var out: std.ArrayList(u8) = .empty;
+    // argv validation: missing, wrong type, empty, non-string element.
+    try std.testing.expectError(error.MissingArgv, runTool(arena, io, &cfg, toolExec, "{}", &out));
+    try std.testing.expectError(error.BadArgv, runTool(arena, io, &cfg, toolExec, "{\"argv\":\"not-an-array\"}", &out));
+    try std.testing.expectError(error.BadArgv, runTool(arena, io, &cfg, toolExec, "{\"argv\":[]}", &out));
+    try std.testing.expectError(error.BadArgv, runTool(arena, io, &cfg, toolExec, "{\"argv\":[7]}", &out));
+    try std.testing.expectError(error.MissingScript, runTool(arena, io, &cfg, toolExecShell, "{}", &out));
+
+    // Session tools require a configured store.
+    try std.testing.expectError(error.SessionsDisabled, runTool(arena, io, &cfg, toolExecStart, "{\"argv\":[\"/bin/cat\"]}", &out));
+    try std.testing.expectError(error.SessionsDisabled, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":1}", &out));
+
+    // With a store: malformed and unknown session ids.
+    const store = try std.heap.page_allocator.create(session_mod.SessionStore);
+    store.* = session_mod.SessionStore.init(io, 8);
+    cfg.sessions = store;
+    try std.testing.expectError(error.BadSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":0}", &out));
+    try std.testing.expectError(error.BadSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":-2}", &out));
+    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":424242}", &out));
+
+    // exec_write validates the protocol types before resolving the session.
+    try std.testing.expectError(error.InvalidParams, runTool(arena, io, &cfg, toolExecWrite, "{\"session_id\":1,\"data_b64\":7}", &out));
+
+    // File tools require their payload arguments.
+    try std.testing.expectError(error.MissingPath, runTool(arena, io, &cfg, toolReadFile, "{}", &out));
+    try std.testing.expectError(error.MissingPath, runTool(arena, io, &cfg, toolWriteFile, "{}", &out));
+    try std.testing.expectError(error.MissingContent, runTool(arena, io, &cfg, toolWriteFile, "{\"path\":\"unused.txt\"}", &out));
+}
