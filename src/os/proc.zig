@@ -40,6 +40,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 const os_layer = @import("../os.zig");
+const Io = std.Io;
 
 /// Real integer process id on every supported OS.
 pub const ProcessId = switch (native_os) {
@@ -300,6 +301,236 @@ pub fn waitChildExitNoReap(pid: ProcessId) error{WaitFailed}!void {
 // Referenced only from the macOS branch of waitChildExitNoReap, so on other
 // targets it is never codegen'd or linked.
 extern "c" fn waitid(idtype: c_uint, id: c_int, infop: *std.c.siginfo_t, options: c_int) c_int;
+
+// ---------------------------------------------------------------------------
+// Failed-spawn hygiene (POSIX only).
+//
+// std 0.16 processSpawnPosix reads the exec failure from the child's error
+// pipe and returns the error WITHOUT waitpid: the fork succeeded, the child
+// reported the execve failure and exited, and nobody ever reaps it, so every
+// failed spawn leaks a defunct child for the daemon's lifetime. Two layers
+// close this:
+//   * preflightExec — resolve argv[0] and cwd exactly the way the child's
+//     execvpe will, BEFORE forking, so the common failures (missing program,
+//     missing execute permission, missing cwd) never fork at all and keep
+//     their std error names (FileNotFound, AccessDenied, NotDir).
+//   * reapStrayChildren — a backstop sweep for residual execve errors no
+//     pre-flight can see (ENOEXEC/E2BIG/ENOMEM/...): reaps zombie children
+//     that no session owns, never touching pids the session machinery is
+//     still responsible for (the tools layer passes the protected set).
+// Everything below is referenced only from comptime-gated POSIX call sites,
+// so Windows builds never codegen it.
+// ---------------------------------------------------------------------------
+
+/// Mirror of std.Io.Threaded.default_PATH: the PATH fallback used by the
+/// spawn layer when the environment carries no PATH.
+const default_path_env = "/usr/local/bin:/bin/:/usr/bin";
+
+/// Resolve `rel` the way the child would after its pre-exec chdir: relative
+/// to the requested cwd (which is itself relative to the daemon's cwd when
+/// not absolute). An empty cwd means the child inherits the daemon's cwd, so
+/// `rel` stays daemon-cwd-relative — identical resolution, no getcwd needed.
+fn childRelative(arena: std.mem.Allocator, cwd: []const u8, rel: []const u8) ![]const u8 {
+    if (cwd.len == 0) return rel;
+    return try std.mem.concat(arena, u8, &.{ cwd, "/", rel });
+}
+
+/// stat + access(X_OK) one resolved path. `eacces` set true when the path
+/// exists but is not executable (or not a regular file): execve would fail
+/// with EACCES there, which std's PATH loop remembers and continues past.
+fn probeCandidate(io: Io, path: []const u8, eacces: *bool) !bool {
+    const st = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        error.AccessDenied, error.PermissionDenied => {
+            eacces.* = true;
+            return false;
+        },
+        else => return err,
+    };
+    if (st.kind != .file) {
+        // A directory (or device/fifo) passes access(X_OK) but execve
+        // refuses it with EACCES.
+        eacces.* = true;
+        return false;
+    }
+    std.Io.Dir.access(.cwd(), io, path, .{ .execute = true }) catch |err| switch (err) {
+        error.FileNotFound => return false, // raced away between stat and access
+        error.AccessDenied, error.PermissionDenied => {
+            eacces.* = true;
+            return false;
+        },
+        else => return err,
+    };
+    return true;
+}
+
+/// Pre-flight the exec layer's process creation: resolve argv[0] against the
+/// child's future cwd exactly like the child's execvpe will, and verify the
+/// result is an executable regular file. Mirrors std's posixExecv loop
+/// (tokenize drops empty PATH entries; EACCES candidates are remembered,
+/// ENOENT/ENOTDIR skipped; a final failure reports EACCES if any candidate
+/// denied access, FileNotFound otherwise). Also verifies the requested cwd
+/// is an existing directory (a failed child-side chdir would otherwise leak
+/// a zombie with a confusing error). Error names match what std's spawn
+/// would have surfaced (FileNotFound, AccessDenied, NotDir, ...), so
+/// callers and fixtures see no taxonomy drift.
+///
+/// `path_env` is the daemon's PATH (the child inherits it); null mirrors
+/// std's default_PATH fallback. Format-level failures (ENOEXEC etc.) are
+/// NOT pre-flighted: those still fork, fail, and are reaped by
+/// reapStrayChildren.
+pub fn preflightExec(arena: std.mem.Allocator, io: Io, argv0: []const u8, cwd: []const u8, path_env: ?[]const u8) !void {
+    if (cwd.len != 0) {
+        const st = std.Io.Dir.statFile(.cwd(), io, cwd, .{}) catch |err| return err;
+        if (st.kind != .directory) return error.NotDir;
+    }
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        const path = if (std.fs.path.isAbsolute(argv0))
+            argv0
+        else
+            try childRelative(arena, cwd, argv0);
+        var eacces = false;
+        if (try probeCandidate(io, path, &eacces)) return;
+        if (eacces) return error.AccessDenied;
+        return error.FileNotFound;
+    }
+    var eacces = false;
+    const path_value = path_env orelse default_path_env;
+    var it = std.mem.tokenizeScalar(u8, path_value, ':');
+    while (it.next()) |entry| {
+        const joined = try std.mem.concat(arena, u8, &.{ entry, "/", argv0 });
+        // A relative PATH entry resolves against the child's post-chdir cwd,
+        // same as every other relative path here.
+        const candidate = if (entry.len != 0 and entry[0] == '/')
+            joined
+        else
+            try childRelative(arena, cwd, joined);
+        if (try probeCandidate(io, candidate, &eacces)) return;
+    }
+    if (eacces) return error.AccessDenied;
+    return error.FileNotFound;
+}
+
+fn protectedPid(protected: []const std.posix.pid_t, pid: std.posix.pid_t) bool {
+    for (protected) |p| {
+        if (p == pid) return true;
+    }
+    return false;
+}
+
+/// Enumerate one pending (exited, unreaped) child WITHOUT reaping it.
+/// Returns 0 when nothing is pending; null when there is nothing to report
+/// at all (no children / transient error).
+fn enumeratePendingChild() ?std.posix.pid_t {
+    if (comptime native_os == .linux) {
+        while (true) {
+            var info: std.os.linux.siginfo_t = undefined;
+            const rc = std.os.linux.waitid(
+                .ALL,
+                0,
+                &info,
+                std.os.linux.W.EXITED | std.os.linux.W.NOWAIT | std.os.linux.W.NOHANG,
+                null,
+            );
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return info.fields.common.first.piduid.pid,
+                .INTR => continue,
+                else => return null,
+            }
+        }
+    } else {
+        // Darwin: the extern waitid declared above; WNOHANG=1, WEXITED=4,
+        // WNOWAIT=0x20 (see darwin_wexited_nowait).
+        while (true) {
+            var info: std.c.siginfo_t = std.mem.zeroes(std.c.siginfo_t);
+            const rc = waitid(@intFromEnum(DarwinIdType.all), 0, &info, 0x1 | 0x4 | 0x20);
+            if (rc == 0) return info.pid;
+            if (comptime @hasDecl(std.c, "_errno")) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return null;
+            } else {
+                return null;
+            }
+        }
+    }
+}
+
+/// Reap one specific child, non-blocking. True when this call consumed the
+/// zombie; false when it was already gone (ECHILD) — both outcomes leave no
+/// zombie behind.
+fn reapChild(pid: std.posix.pid_t) bool {
+    if (comptime native_os == .linux) {
+        while (true) {
+            var info: std.os.linux.siginfo_t = undefined;
+            const rc = std.os.linux.waitid(.PID, pid, &info, std.os.linux.W.EXITED | std.os.linux.W.NOHANG, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return info.fields.common.first.piduid.pid != 0,
+                .INTR => continue,
+                else => return false,
+            }
+        }
+    } else {
+        while (true) {
+            var info: std.c.siginfo_t = std.mem.zeroes(std.c.siginfo_t);
+            const rc = waitid(@intFromEnum(DarwinIdType.pid), pid, &info, 0x1 | 0x4);
+            if (rc == 0) return info.pid != 0;
+            if (comptime @hasDecl(std.c, "_errno")) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return false;
+            } else {
+                return false;
+            }
+        }
+    }
+}
+
+/// Reap zombie children that no session machinery owns. `protected` holds
+/// pids somebody else is responsible for reaping (session children from fork
+/// until their waiter's wait); the sweep stops at the first protected pid —
+/// waitid(WNOWAIT) would keep re-reporting it — and leaves the rest for the
+/// next round. Returns the number of strays reaped.
+pub fn reapStrayChildren(protected: []const std.posix.pid_t) usize {
+    var reaped: usize = 0;
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        const pid = enumeratePendingChild() orelse break;
+        if (pid == 0) break;
+        if (protectedPid(protected, pid)) break;
+        if (reapChild(pid)) reaped += 1;
+    }
+    return reaped;
+}
+
+/// True while `pid` is still a child of this process (running, or a zombie
+/// pending its owner's reap). Once the owner reaps it, waitid answers ECHILD
+/// and the entry can be dropped from the protected set. Pid recycling is
+/// safe in the other direction too: a recycled pid belongs to somebody else
+/// (ECHILD, dropped) until a fresh registration re-adds it.
+pub fn childStillTracked(pid: std.posix.pid_t) bool {
+    if (comptime native_os == .linux) {
+        while (true) {
+            var info: std.os.linux.siginfo_t = undefined;
+            const rc = std.os.linux.waitid(.PID, pid, &info, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT | std.os.linux.W.NOHANG, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return true, // pending zombie, or running (0 would mean "no event" — still ours)
+                .INTR => continue,
+                else => return false, // ECHILD: fully reaped (or recycled away)
+            }
+        }
+    } else {
+        while (true) {
+            var info: std.c.siginfo_t = std.mem.zeroes(std.c.siginfo_t);
+            const rc = waitid(@intFromEnum(DarwinIdType.pid), pid, &info, 0x1 | 0x4 | 0x20);
+            if (rc == 0) return true;
+            if (comptime @hasDecl(std.c, "_errno")) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return false;
+            } else {
+                return false;
+            }
+        }
+    }
+}
 
 /// Blocking read from an asynchronous pipe handle (the std-created child
 /// stdout/stderr ends are opened with MODE.IO.ASYNCHRONOUS). Issues

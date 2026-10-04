@@ -11,6 +11,7 @@ Covers, black-box over raw sockets and JSON-RPC:
   * global in-flight body budget (MCP_NODE_MAX_INFLIGHT_BYTES)
   * strict JSON-RPC envelope (jsonrpc=="2.0", id typing, notification rules,
     params/arguments typing)
+  * failed-spawn hygiene (missing/invalid argv[0] never leaks zombies)
   * list_dir truncation contract (truncated + has_more + count)
 
 Run: python3 ci/test_regressions.py [path/to/mcp-node]
@@ -211,6 +212,87 @@ def kill_pid(pid):
         os.kill(pid, 9)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+def zombie_direct_children(pid):
+    """Direct children of `pid` that are zombies, via /proc (Linux only)."""
+    zombies = []
+    proc = Path('/proc')
+    if not proc.is_dir():
+        return None
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            data = (entry / 'stat').read_bytes()
+        except OSError:
+            continue
+        # The comm field may contain spaces and parens; state and ppid sit
+        # after the final ')'.
+        rest = data.rsplit(b')', 1)[1].split()
+        if len(rest) < 2:
+            continue
+        if int(rest[1]) == pid and rest[0] in (b'Z', b'X'):
+            zombies.append((int(entry.name), rest[0].decode()))
+    return zombies
+
+
+class ExecSpawnHygieneTests(unittest.TestCase):
+    """Failed spawns must never leak zombie children.
+
+    std's POSIX spawn returns execve failures without reaping the forked
+    child; the node pre-flights argv[0]/cwd so the common failures never
+    fork, and sweeps strays for residual execve errors (ENOEXEC etc.)."""
+
+    def setUp(self):
+        self.node = Node()
+        self.addCleanup(self.node.close)
+
+    def test_failed_spawns_leave_no_zombies(self):
+        if zombie_direct_children(1) is None:
+            self.skipTest('/proc not available (Linux-only contract)')
+        missing = '/nonexistent/mcpnz-zombie-probe'
+        for ident in range(5):
+            reply = self.node.tool('exec', {'argv': [missing], 'timeout': 5})
+            self.assertFalse(reply.get('ok'), reply)
+            self.assertEqual(reply.get('error'), 'FileNotFound', reply)
+        for ident in range(3):
+            reply = self.node.tool('exec_start', {'argv': [missing]})
+            self.assertFalse(reply.get('ok'), reply)
+            self.assertEqual(reply.get('error'), 'FileNotFound', reply)
+        # ENOEXEC: an executable file with an invalid format passes the
+        # pre-flight, fails the real execve, and must be reaped by the sweep.
+        garbage = self.node.root / 'garbage-probe'
+        garbage.write_text('not a program\n')
+        garbage.chmod(0o755)
+        for ident in range(3):
+            reply = self.node.tool('exec', {'argv': [str(garbage)], 'timeout': 5})
+            self.assertFalse(reply.get('ok'), reply)
+            self.assertEqual(reply.get('error'), 'InvalidExe', reply)
+        reply = self.node.tool('exec_start', {'argv': [str(garbage)]})
+        self.assertFalse(reply.get('ok'), reply)
+        self.assertEqual(reply.get('error'), 'InvalidExe', reply)
+        # A missing cwd is pre-flighted the same way (child-side chdir would
+        # otherwise fail post-fork).
+        reply = self.node.tool('exec', {'argv': [sys.executable, '-c', 'pass'],
+                                        'cwd': '/nonexistent/mcpnz-dir'})
+        self.assertFalse(reply.get('ok'), reply)
+        self.assertEqual(reply.get('error'), 'FileNotFound', reply)
+        # Sanity: successful execs still work on the same daemon.
+        ok = self.node.tool('exec', {'argv': [sys.executable, '-c', 'print("z")']})
+        self.assertTrue(ok.get('ok'), ok)
+        self.assertEqual(ok.get('exit_code'), 0, ok)
+        # Bounded drain: sweeps run on exec-family call exit, so any stray
+        # still dying at check time is gone after one more call.
+        deadline = time.monotonic() + 5
+        while True:
+            zombies = zombie_direct_children(self.node.process.pid)
+            if not zombies:
+                break
+            if time.monotonic() >= deadline:
+                self.fail('failed spawns leaked zombie children: %r' % zombies)
+            self.node.tool('exec', {'argv': [sys.executable, '-c', 'pass']})
+            time.sleep(0.05)
 
 
 def pid_alive_posix(pid):

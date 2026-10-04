@@ -27,6 +27,85 @@ const WAIT_MAX_TIMEOUT_S: i64 = 300;
 const READ_FILE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const READ_FILE_DEFAULT_LIMIT_CHARS: i64 = 200_000; // chars, not bytes
 
+// --- exec spawn hygiene (see os/proc.zig) -----------------------------------
+//
+// std's POSIX spawn error path never reaps the child (processSpawnPosix
+// returns the execve failure without waitpid), so every failed exec/exec_start
+// leaks a defunct child. The pre-flight resolves argv[0]/cwd BEFORE forking
+// (deterministic no-fork path for missing programs/permissions/cwd); the
+// stray sweep below is the backstop for residual execve errors (ENOEXEC,
+// E2BIG, ...). Concurrency contract of the three globals:
+//
+//   * exec_gate serializes (a) exec-family tool entry/exit bookkeeping,
+//     (b) exec_start's fork+publish section, and (c) sweeps, so a sweep can
+//     never observe a child before it is registered as protected.
+//   * exec_inflight counts exec-family tool calls (exec, exec_shell,
+//     exec_start). A sweep runs only on the exit that brings the count to
+//     zero: by then no std.process.run child can be inside its
+//     exit-but-not-yet-waited window (run() reaps synchronously inside the
+//     call), so a sweep can never steal a wait std itself owns.
+//   * pending_pids (under exec_gate) tracks session children from fork until
+//     their waiter's reap is confirmed (compaction drops entries whose pid
+//     no longer answers waitid). It covers the whole publish/drain/close
+//     lifecycle, so the sweep never reaps a pid a session waiter will wait
+//     for — stealing that wait would surface as ECHILD inside std's
+//     childWait and degrade the session's exit_code.
+
+var exec_gate: std.Io.Mutex = .init;
+var exec_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+/// Set (under exec_gate) whenever a fork actually failed. The failed child
+/// writes the exec error to the pipe BEFORE _exit, so the parent can observe
+/// the error while the child is still dying; the exit sweep settles briefly
+/// to let it land before reaping.
+var spawn_error_pending: bool = false;
+
+/// PID type of the pending registry: POSIX pid_t; on Windows the registry is
+/// never written (comptime-gated call sites) and pid_t is not meaningful
+/// there, so u32 stands in purely to keep the declaration portable.
+const SpawnPid = if (builtin.os.tag == .windows) u32 else std.posix.pid_t;
+var pending_pids: std.ArrayList(SpawnPid) = .empty;
+
+fn execCallEnter(io: Io) void {
+    exec_gate.lockUncancelable(io);
+    _ = exec_inflight.fetchAdd(1, .acq_rel);
+    exec_gate.unlock(io);
+}
+
+/// Exit half of the exec-family gate: the LAST call to leave sweeps strays.
+/// Runs as a defer, i.e. after the tool's own resource errdefers.
+fn execCallExit(io: Io) void {
+    exec_gate.lockUncancelable(io);
+    defer exec_gate.unlock(io);
+    if (exec_inflight.fetchSub(1, .acq_rel) != 1) return;
+    if (comptime builtin.os.tag == .windows) return;
+    if (spawn_error_pending) {
+        spawn_error_pending = false;
+        // The failed child reports the exec error through the pipe before
+        // _exit; give it a moment to land so this sweep reaps it now instead
+        // of on the next exec call's exit.
+        os.sleepMs(2);
+    }
+    // Compaction first: drop entries whose child is fully reaped and gone
+    // (waitid answers ECHILD once the owner's wait has consumed the zombie).
+    var kept: usize = 0;
+    for (pending_pids.items) |pid| {
+        if (proc.childStillTracked(pid)) {
+            pending_pids.items[kept] = pid;
+            kept += 1;
+        }
+    }
+    pending_pids.shrinkRetainingCapacity(kept);
+    _ = proc.reapStrayChildren(pending_pids.items);
+}
+
+/// Pre-flight the spawn POSIX-side. Windows needs no pre-flight: spawn
+/// failure there never leaves a half-forked child (CreateProcess is atomic).
+fn preflightSpawn(arena: Allocator, io: Io, argv0: []const u8, cwd: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    const path_env = os.env.environGet(arena, env_state.process_environ, "PATH");
+    return proc.preflightExec(arena, io, argv0, cwd, path_env);
+}
+
 pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     const argv_v = util.objGet(args, "argv") orelse return error.MissingArgv;
     if (argv_v != .array) return error.BadArgv;
@@ -40,6 +119,12 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
     var timeout_s = (try util.optIntArg(args, "timeout")) orelse EXEC_DEFAULT_TIMEOUT_S;
     if (timeout_s < 1) timeout_s = 1;
     if (timeout_s > EXEC_MAX_TIMEOUT_S) timeout_s = EXEC_MAX_TIMEOUT_S;
+    // Failed-spawn hygiene: enter the exec-family gate and pre-flight the
+    // spawn so the common failures never fork at all (os/proc.zig explains
+    // why both layers exist).
+    execCallEnter(io);
+    defer execCallExit(io);
+    try preflightSpawn(arena, io, argv[0], cwd);
     const started = std.Io.Clock.awake.now(io);
     const result = std.process.run(arena, io, .{
         .argv = argv,
@@ -56,7 +141,15 @@ pub fn toolExec(arena: Allocator, io: Io, cfg: *const config.Config, args: Value
             return;
         },
         error.StreamTooLong => return error.OutputTooLong,
-        else => return err,
+        else => {
+            // A real spawn-side failure (the pre-flight already rejected the
+            // no-fork cases): a forked child is dying somewhere — mark it so
+            // the exit sweep settles before reaping.
+            exec_gate.lockUncancelable(io);
+            spawn_error_pending = true;
+            exec_gate.unlock(io);
+            return err;
+        },
     };
     const elapsed = started.untilNow(io, .awake);
     const exit_code: i32 = switch (result.term) {
@@ -160,6 +253,11 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
         if (!cwd_owned) std.heap.page_allocator.free(cwd);
     }
 
+    // Failed-spawn hygiene: gate + pre-flight (see the exec globals above).
+    execCallEnter(io);
+    defer execCallExit(io);
+    try preflightSpawn(arena, io, argv[0], cwd);
+
     // Stdin wiring splits by platform (see the src/os/proc.zig header).
     // POSIX — parent-owned pipe: the read end goes to the child as `.file`
     // stdio (std dups it in), the write end becomes session_mod.Session.stdin_fd, and
@@ -201,7 +299,12 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
         }
     }
 
-    var child = try std.process.spawn(io, .{
+    // Fork + publish under the exec gate: a concurrent stray sweep (which
+    // holds the same gate) can never observe this child before its pid is
+    // registered as protected. On spawn error there is no pid to register —
+    // the forked child is an unowned stray, and the exit sweep reaps it.
+    exec_gate.lockUncancelable(io);
+    var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd.len == 0) .inherit else .{ .path = cwd },
         .stdin = if (is_windows) .pipe else .{ .file = proc.stdinFile(&stdin_pipe) },
@@ -214,7 +317,19 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
         // Windows only: CREATE_SUSPENDED so the child lands in the job before
         // it can spawn anything. POSIX keeps running-start semantics.
         .start_suspended = proc.spawn_suspended,
-    });
+    }) catch |err| {
+        spawn_error_pending = true; // under exec_gate (see the exit sweep)
+        exec_gate.unlock(io);
+        return err;
+    };
+    if (comptime builtin.os.tag != .windows) {
+        // A page-allocator miss here would leave the child unprotected; the
+        // sweep would then race the waiter's reap. Degradation is bounded
+        // (one session may report exit_code null), never a crash, and a
+        // single pid append does not realistically fail.
+        pending_pids.append(std.heap.page_allocator, child.id.?) catch {};
+    }
+    exec_gate.unlock(io);
     // Never leak a running child if session allocation fails after spawn.
     // Declared before the stdin takeover: its failure return runs this
     // errdefer too.
