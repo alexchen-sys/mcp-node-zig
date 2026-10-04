@@ -27,7 +27,7 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret \
 ```
 
 Clients point at `http://127.0.0.1:8341/n/laptop/mcp` with the usual token.
-`POST /n` lists connected nodes (`name`, `connected_s`).
+`POST /n` lists connected nodes (`name`, `connected_s`, `inflight`).
 
 ## Configuration
 
@@ -48,7 +48,9 @@ behaves exactly as before and serves only `/mcp`.
 
 A single-line secret file without `:` is a shared secret for any node name.
 With `name:secret` lines, only listed names may connect, each with its own
-secret; prefer this.
+secret; prefer this. In single-secret mode every holder of the secret can
+connect under any name, and a new link under a live name replaces the old
+one, so use `name:secret` lines as soon as there is more than one node.
 
 ## Protocol
 
@@ -56,12 +58,25 @@ One long-lived TCP (or TLS) connection per node carries length-prefixed frames:
 `u32 length (big endian) | u8 type | u32 stream id | payload`. Types:
 CHALLENGE, HELLO, WELCOME, REQ, RESP, PING, PONG, GOAWAY.
 
-1. The hub sends CHALLENGE with a 32-byte random nonce.
-2. The node answers HELLO with its name and
-   `HMAC-SHA256(secret, "mcp-node-reverse-v1" | nonce | name)`.
-3. The hub compares in constant time and replies WELCOME or GOAWAY. An unknown
-   name and a wrong MAC get the same answer. HELLO must arrive within 10 s;
-   at most 16 handshakes run at once.
+The handshake is mutual: each side proves it holds the secret, over both
+sides' fresh nonces.
+
+1. The hub sends CHALLENGE with a 32-byte random `hub_nonce`.
+2. The node draws its own 32-byte `node_nonce` and answers HELLO
+   `{"v":1,"name":..,"nonce":hex(node_nonce),"auth":..}` with
+   `HMAC-SHA256(secret, "mcp-node-reverse-v1 node" | hub_nonce | node_nonce | name)`.
+3. The hub checks the MAC in constant time and replies GOAWAY, or WELCOME
+   `{"v":1,"auth":..}` with
+   `HMAC-SHA256(secret, "mcp-node-reverse-v1 hub" | hub_nonce | node_nonce | name)`.
+   An unknown name and a wrong MAC get the same answer and the same work.
+   HELLO must arrive within 10 s; at most 16 handshakes run at once.
+4. The node checks the WELCOME MAC in constant time before it accepts any
+   other frame. A missing or wrong MAC, or any other frame first, ends the
+   link with "hub authentication failed" and the node backs off and redials.
+
+Nonces are fixed-length and the name comes last, so the MAC input is
+unambiguous; the distinct `node`/`hub` labels stop a proof from being
+reflected back as the other side's.
 
 Each client request becomes a REQ with a fresh stream id; the node runs it
 through the same JSON-RPC handler as `/mcp` and answers RESP with that id, so
@@ -94,15 +109,22 @@ do not survive a node restart.
 - The hub client surface is unchanged: token, Host and Origin checks, loopback
   by default. Keep `MCP_NODE_HOST` on loopback or behind your own access
   control; anyone with the client token reaches every connected node.
-- Node authentication is a keyed MAC over a fresh nonce: a recorded handshake
-  cannot be replayed. It does **not** encrypt or integrity-protect the frames
-  that follow. Over plain TCP, an on-path attacker can read and alter traffic.
+- Node and hub prove the secret to each other with keyed MACs over fresh
+  nonces from both sides: a recorded handshake cannot be replayed, and a hub
+  without the secret (a spoofed address, a hijacked DNS name) is refused
+  before it can send a single request.
+- The handshake does **not** encrypt or integrity-protect the frames that
+  follow. Over plain TCP, an active relay on the path can pass the handshake
+  through between two genuine endpoints and then read and alter traffic.
+  Mutual authentication stops impersonation without the secret, not that
+  relay. Across untrusted networks use TLS (`MCP_NODE_CONNECT_TLS=1`).
 - `MCP_NODE_CONNECT_TLS=1` makes the node a TLS client (Zig std TLS 1.2/1.3)
   that always verifies the certificate chain and server name; there is no
   insecure switch. The hub has no TLS server of its own: terminate TLS in front
   of the link port, for example with stunnel, HAProxy or nginx `stream`.
-- Node and hub do not verify each other beyond the secret. A secret is a shell
-  on that node; store it with `0600` permissions.
+- Beyond the secret (and the certificate, with TLS) there is no further
+  identity check. A secret is a shell on that node; store it with `0600`
+  permissions.
 
 ## What it deliberately does not do
 
