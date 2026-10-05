@@ -104,6 +104,7 @@ Expand-Archive mcp-node.zip
 | `MCP_NODE_MAX_SESSIONS` | `64` |
 | `MCP_NODE_SESSION_TTL_S` | `600` |
 | `MCP_NODE_MAX_OUT` | `400000` байт на поток |
+| `MCP_NODE_STDIO` | не задано; `1` — обслуживать одного клиента через stdin/stdout, без слушателя (то же, что `--stdio`) |
 
 Остальные (`MCP_NODE_NAME`, `MCP_NODE_ALLOWED_ORIGINS`, `MCP_NODE_SOCKET_TIMEOUT_S`, `MCP_NODE_TEXT_MIRROR`) описаны в [README.md](README.md#configuration).
 

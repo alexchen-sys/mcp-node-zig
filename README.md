@@ -206,6 +206,7 @@ Environment variables only.
 | `MCP_NODE_MAX_INFLIGHT_BYTES` | `67108864`, total in-flight request bodies |
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
+| `MCP_NODE_STDIO` | unset; `1` serves one client over stdin/stdout, no listener (same as `--stdio`) |
 
 `mcp-node --version` prints the version, `--help` the flags; any other
 argument than these, `--connect` and `--stdio` is an error.
