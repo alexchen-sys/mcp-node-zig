@@ -8,9 +8,9 @@ English | [Русский](README.ru.md)
 
 Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
 
-![mcp-node-zig: 1.86 ms cold start, 0.98 MiB idle, one 4.30 MiB binary](assets/demo.gif)
+![mcp-node-zig: 1.9 ms cold start, 0.62 MiB idle, one 8.70 MiB binary](assets/demo.gif)
 
-**1.86 ms** cold start · **0.98 MiB** idle RSS · **4.30 MiB** on disk · **0.66 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
+**1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
 
 mcp-node-zig is an MCP server for remote machines. Drop it on a build box, a homelab server, a Windows host or a VPS, and any MCP client can run commands, drive long-running processes and read and write files there over one authenticated HTTP endpoint.
 
@@ -65,7 +65,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 
 - **Nothing to provision.** No Node, no Python, no OpenSSH, no keys to distribute. Copy one file and run it.
 - **Processes outlive requests.** Start a build, disconnect, come back and read the output by offset.
-- **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 576 KiB, not a second ~195 MiB server process.
+- **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 288 KiB, not a second ~190 MiB server process.
 - **No shell unless you ask.** `exec` passes argv verbatim. `exec_shell` is the one explicit shell layer.
 - **Kills the whole tree.** Process groups on POSIX, Job Objects on Windows. No orphaned children holding pipes.
 - **Linux, macOS, Windows.** All three are built and smoke-tested in CI on every push.

@@ -155,15 +155,15 @@ do not survive a node restart.
 
 Measured on x86_64 Linux, ReleaseSafe:
 
-- binary: 4.62 MB before this feature, 8.63 MB with the link, hub and TLS
-  client (+4.0 MB, almost all of it std TLS and X.509 parsing; the link and
-  hub alone added about 0.6 MB);
+- binary: 4.30 MiB before this feature, 8.70 MiB with the link, hub and TLS
+  client (x86_64 baseline ReleaseSafe; +4.4 MiB, almost all of it std TLS
+  and X.509 parsing; the link and hub alone added about 0.6 MiB);
 - idle memory after 6 s, each mode started from its own copy of the binary
   so that no file pages are shared:
 
   | mode | Rss | Private_Dirty | threads |
   |---|---|---|---|
-  | plain listen | 1.0–1.1 MB | 0.34 MB | 1 |
+  | plain listen | 1.0-1.1 MB | 0.34 MB | 1 |
   | node with a link | 1.5 MB | 0.6 MB | 2 |
   | hub with one node | 2.0 MB | 1.15 MB | 4 |
 
@@ -173,7 +173,7 @@ Measured on x86_64 Linux, ReleaseSafe:
   anonymous memory; the rest of Rss is pages of the binary file. A second
   node started from the same file shares those pages, so each extra node
   costs about its Private_Dirty (0.6 MB). Pss splits the shared file pages
-  between the two, which shows as 1.04–1.1 MB per node.
+  between the two, which shows as 1.04-1.1 MB per node.
 
   Use `smaps_rollup`, not the VmRSS line of `/proc/<pid>/status`: those
   counters are approximate and drift more with more CPUs. On the 64-CPU
