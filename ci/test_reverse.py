@@ -511,6 +511,26 @@ def case_listen_mode_unaffected(env):
     check(status == 404, 'listen mode must not expose /n: %d' % status)
 
 
+def case_second_listener_refused(env):
+    """A second process on a taken client or link port must fail with
+    AddressInUse instead of co-binding it and taking half of the traffic."""
+    hub = env.start_hub()
+    for port, tag in ((env.hub_port, 'dup-client'), (env.link_port, 'dup-link')):
+        e = base_env()
+        e.update(MCP_NODE_HOST='127.0.0.1', MCP_NODE_PORT=str(port if tag == 'dup-client' else pick_port()),
+                 MCP_NODE_NAME=tag, MCP_NODE_HUB_LISTEN='127.0.0.1:%d' % (
+                     env.link_port if tag == 'dup-link' else pick_port()),
+                 MCP_NODE_HUB_SECRET_FILE=str(env.dir / 'hub-secrets'))
+        e['MCP_NODE_TOKEN_' + 'FILE'] = str(env.dir / 'client-token')
+        dup = env.spawn(tag, e)
+        check(wait_until(lambda: not dup.alive(), 10), tag + ' co-bound a taken port: ' + dup.logs()[-800:])
+        check(dup.process.returncode != 0, (tag, dup.process.returncode))
+        check('AddressInUse' in dup.logs(), dup.logs()[-800:])
+    check(hub.alive(), 'first hub died')
+    env.start_node('alpha')
+    check(env.wait_node('alpha'), 'first hub stopped serving links')
+
+
 class SkipCase(Exception):
     pass
 
@@ -660,6 +680,7 @@ CASES = [
     ('node restart under the same name takes over', case_node_restart_replaces_link),
     ('a live name is kept, a second node is refused', case_live_name_is_kept),
     ('default listener mode unaffected', case_listen_mode_unaffected),
+    ('a second listener on a taken port fails with AddressInUse', case_second_listener_refused),
     ('TLS link: trusted CA connects and serves exec, other CA never appears', case_tls_link),
 ]
 
