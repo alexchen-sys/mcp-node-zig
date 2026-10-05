@@ -49,8 +49,8 @@ behaves exactly as before and serves only `/mcp`.
 A single-line secret file without `:` is a shared secret for any node name.
 With `name:secret` lines, only listed names may connect, each with its own
 secret; prefer this. In single-secret mode every holder of the secret can
-connect under any name, and a new link under a live name replaces the old
-one, so use `name:secret` lines as soon as there is more than one node.
+connect under any name, and can hold a name before its owner does, so use
+`name:secret` lines as soon as there is more than one node.
 
 ## Protocol
 
@@ -85,8 +85,10 @@ many requests share one link concurrently. The node bounds parallel work by
 
 Both sides PING every 15 s; 45 s of silence drops the link. The node
 reconnects with full-jitter backoff from 0.5 s up to 30 s, reset after 60 s of
-healthy link. A new HELLO with an already connected name replaces the old link
-(GOAWAY to the old one).
+healthy link. A new HELLO with an already connected name first probes the old
+link with a PING. If it answers within 3 s, the newcomer gets GOAWAY `name in
+use by a live link` and retries at its backoff; both sides log it. If it stays
+silent (crashed node, half-open TCP), the new link replaces it at once.
 
 ## Failure behaviour
 
@@ -96,7 +98,8 @@ healthy link. A new HELLO with an already connected name replaces the old link
 | Link drops while a request is in flight | 502 `node_disconnected` |
 | No response before the deadline | 504 `node_timeout` |
 | Hub restart | requests fail until the node redials (seconds) |
-| Node restart | link is replaced; sessions on the node are gone |
+| Node restart | the dead link is replaced; sessions on the node are gone |
+| Second live node under one name | it is refused, the first keeps the name |
 
 `exec_start` sessions live in the node, not the hub. They survive a hub
 restart or link drop and can be polled with the same `session_id` once the

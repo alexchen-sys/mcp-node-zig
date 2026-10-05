@@ -459,19 +459,32 @@ def case_node_restart_replaces_link(env):
     check(list(env.nodes()) == ['alpha'], env.nodes())
 
 
-def case_live_replacement(env):
-    """A second node with the same name replaces a live link; the old one
-    gets GOAWAY. (It then retries and may take the name back, which is the
-    documented behaviour for two holders of one secret.)"""
-    env.start_hub()
+def case_live_name_is_kept(env):
+    """A second node under a name held by a live link is refused; the live
+    link keeps the name and is never evicted. Once the holder dies, the
+    second node takes the name at its next retry."""
+    hub = env.start_hub()
     first = env.start_node('alpha', tag='node-alpha-1')
     check(env.wait_node('alpha'), 'node never connected')
-    env.start_node('alpha', tag='node-alpha-2')
-    check(wait_until(lambda: 'replaced by a new link' in first.logs(), 10, 0.1),
-          'old link got no GOAWAY: ' + first.logs()[-1000:])
+    ppid_code = 'import os; print(os.getppid())'
+    second = env.start_node('alpha', tag='node-alpha-2')
+    check(wait_until(lambda: 'name in use by a live link' in second.logs(), 15, 0.1),
+          'second node was not refused: ' + second.logs()[-1000:])
+    check('name in use by a live link' in hub.logs(), 'hub did not log the refusal')
+    # Several retry rounds: the holder must not lose the name even once.
+    time.sleep(6)
+    check('replaced by a new link' not in first.logs(), first.logs()[-1000:])
+    out = env.tool('alpha', 'exec', {'argv': [PY, '-c', ppid_code]})
+    check(out.get('stdout', '').strip() == str(first.pid), (out, first.pid))
     first.kill9()
-    out = wait_until(lambda: _try_exec(env, 'alpha'), 15, 0.2)
-    check(out, 'no answer after replacement')
+
+    def served_by_second():
+        try:
+            reply = env.tool('alpha', 'exec', {'argv': [PY, '-c', ppid_code]})
+            return reply.get('stdout', '').strip() == str(second.pid)
+        except AssertionError:
+            return False
+    check(wait_until(served_by_second, 60, 0.3), 'second node never took over the name')
 
 
 def _try_exec(env, name):
@@ -645,7 +658,7 @@ CASES = [
     ('24 concurrent exec through the hub, answers match requests', case_concurrent_exec),
     ('hub kill -9 + restart: in-flight request fails, exec session survives', case_hub_restart_keeps_sessions),
     ('node restart under the same name takes over', case_node_restart_replaces_link),
-    ('same name on a live link replaces it with GOAWAY', case_live_replacement),
+    ('a live name is kept, a second node is refused', case_live_name_is_kept),
     ('default listener mode unaffected', case_listen_mode_unaffected),
     ('TLS link: trusted CA connects and serves exec, other CA never appears', case_tls_link),
 ]

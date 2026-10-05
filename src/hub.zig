@@ -28,6 +28,12 @@ pub const PING_INTERVAL_MS: u64 = 15 * 1000;
 pub const DEAD_AFTER_MS: u64 = 45 * 1000;
 pub const HANDSHAKE_MS: u64 = 10 * 1000;
 pub const MAX_PENDING_HANDSHAKES: u32 = 16;
+/// How long a registered link has to answer a PING before a new HELLO
+/// under the same name may take the name over.
+pub const PROBE_MS: u64 = 3 * 1000;
+const PROBE_STEP_MS: u64 = 50;
+/// GOAWAY text for a node whose name is held by a live link.
+pub const NAME_IN_USE = "name in use by a live link";
 /// Floor for the relay deadline: a long tool call holds the line as long
 /// as the client allows, like on a direct node.
 pub const MIN_FORWARD_MS: u64 = 3600 * 1000;
@@ -54,6 +60,7 @@ pub const Hub = struct {
 
     /// Insert an authenticated link. An existing link with the same name is
     /// replaced: it gets GOAWAY, is killed (its waiters fail) and released.
+    /// `authenticate` only gets here when that link failed the probe.
     fn register(self: *Hub, ln: *Link) !void {
         ln.retain();
         var old: ?*Link = null;
@@ -75,6 +82,14 @@ pub const Hub = struct {
             o.kill();
             o.release();
         }
+    }
+
+    /// True when `name` is registered and its link answers within PROBE_MS.
+    /// A silent link (crashed node, half-open TCP) does not hold the name.
+    fn nameHeldByLiveLink(self: *Hub, name: []const u8) bool {
+        const cur = self.acquire(name) orelse return false;
+        defer cur.release();
+        return cur.answersProbe();
     }
 
     /// Remove `ln` if it is still the registered link for its name.
@@ -169,6 +184,8 @@ pub const Link = struct {
     refs: std.atomic.Value(u32) = .init(1),
     dead: std.atomic.Value(bool) = .init(false),
     inflight: std.atomic.Value(u32) = .init(0),
+    /// Frames received so far; the liveness probe watches it move.
+    rx_frames: std.atomic.Value(u64) = .init(0),
     next_sid: std.atomic.Value(u32) = .init(1),
     waiters_mutex: Io.Mutex = .init,
     waiters: std.AutoHashMapUnmanaged(u32, *Waiter) = .empty,
@@ -216,6 +233,19 @@ pub const Link = struct {
         defer self.write_mutex.unlock(io);
         // kill() never takes the write mutex, so calling it here is safe.
         link.writeFrameParts(self.stream.socket.handle, kind, sid, parts, timeout_ms) catch self.kill();
+    }
+
+    /// PING the peer and wait up to PROBE_MS for any inbound frame.
+    fn answersProbe(self: *Link) bool {
+        const seen = self.rx_frames.load(.acquire);
+        self.writeFrame(.ping, 0, &.{"probe"});
+        var waited: u64 = 0;
+        while (waited < PROBE_MS) : (waited += PROBE_STEP_MS) {
+            if (self.dead.load(.acquire)) return false;
+            if (self.rx_frames.load(.acquire) != seen) return true;
+            os.sleepMs(PROBE_STEP_MS);
+        }
+        return false;
     }
 
     fn nextSid(self: *Link) u32 {
@@ -421,6 +451,17 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream) ?*Link {
         stream.close(hub.io);
         return null;
     };
+    // Two live processes under one name would otherwise evict each other
+    // forever. Keep the link that still answers; refuse the newcomer before
+    // WELCOME, so it learns why and retries only at its backoff. Only an
+    // authenticated peer gets this answer.
+    if (hub.nameHeldByLiveLink(auth.name)) {
+        std.debug.print("hub: refused a second link for '{s}': " ++ NAME_IN_USE ++ "\n", .{auth.name});
+        const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
+        link.writeFrame(fd, .goaway, 0, NAME_IN_USE, timeout_ms) catch {};
+        stream.close(hub.io);
+        return null;
+    }
     const ln = Link.create(hub, stream, auth.name) catch {
         stream.close(hub.io);
         return null;
@@ -444,6 +485,7 @@ fn readLoop(ln: *Link) !void {
         // Any inbound frame refreshes liveness: the per-read idle bound is
         // the 45 s silence limit.
         const frame = try link.readFrame(gpa, fd, link.MAX_PAYLOAD, DEAD_AFTER_MS);
+        _ = ln.rx_frames.fetchAdd(1, .acq_rel);
         switch (frame.kind) {
             .resp => ln.fulfil(frame.stream_id, frame.payload), // takes payload
             .ping => {
