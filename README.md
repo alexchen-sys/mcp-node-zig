@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/alexchen-sys/mcp-node-zig)](https://github.com/alexchen-sys/mcp-node-zig/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-English | [Русский](README.ru.md)
+English | [Русский](README.ru.md) | [中文](README.zh.md)
 
 Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
 
