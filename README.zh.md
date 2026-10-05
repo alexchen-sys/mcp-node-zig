@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/inst
 手动安装（Linux x86_64）：
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-linux.tar.gz | tar xz
 ```
 
 其他平台见 [Releases 页面](https://github.com/alexchen-sys/mcp-node-zig/releases)：`aarch64-linux`、`aarch64-macos`、`x86_64-windows`。每个版本都附带 `SHA256SUMS.txt`。
@@ -34,7 +34,7 @@ curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mc
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.2.0-x86_64-linux/mcp-node &
+./mcp-node-v0.2.1-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows（PowerShell）</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.2.0-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.2.1-x86_64-windows\mcp-node.exe
 ```
 
 在另一个窗口中执行：
