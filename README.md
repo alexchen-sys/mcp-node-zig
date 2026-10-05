@@ -8,16 +8,16 @@ English | [Русский](README.ru.md)
 
 Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
 
-![mcp-node-zig: 1.86 ms cold start, 0.98 MiB idle, one 4.30 MiB binary](assets/demo.gif)
+![mcp-node-zig: a node behind NAT dials out to a hub, the hub runs a command on it](assets/demo.gif)
 
-**1.86 ms** cold start · **0.98 MiB** idle RSS · **4.30 MiB** on disk · **0.66 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
+**1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
 
-mcp-node-zig is an MCP server for remote machines. Drop it on a build box, a homelab server, a Windows host or a VPS, and any MCP client can run commands, drive long-running processes and read and write files there over one authenticated HTTP endpoint.
+mcp-node-zig is a remote execution node that speaks MCP: put one static binary on a machine and your agent can run commands, drive long-running sessions and read or write files there. Since v0.2.0 the node can dial out to a hub instead of listening, so a box behind NAT or someone else's firewall is reachable with no inbound ports and no SSH. It answers its first MCP request 1.9 ms after start and idles at 0.62 MiB, which makes leaving one on every machine basically free.
 
 ## Install
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`.
@@ -26,7 +26,7 @@ Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zi
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.1.2-x86_64-linux/mcp-node &
+./mcp-node-v0.2.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -45,10 +45,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.1.2-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.2.0-x86_64-windows\mcp-node.exe
 ```
 
 From a second window:
@@ -65,7 +65,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 
 - **Nothing to provision.** No Node, no Python, no OpenSSH, no keys to distribute. Copy one file and run it.
 - **Processes outlive requests.** Start a build, disconnect, come back and read the output by offset.
-- **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 576 KiB, not a second ~195 MiB server process.
+- **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 288 KiB, not a second ~190 MiB server process.
 - **No shell unless you ask.** `exec` passes argv verbatim. `exec_shell` is the one explicit shell layer.
 - **Kills the whole tree.** Process groups on POSIX, Job Objects on Windows. No orphaned children holding pipes.
 - **Linux, macOS, Windows.** All three are built and smoke-tested in CI on every push.
@@ -85,6 +85,13 @@ mcp-node is an execution API for agents. Through SSH, an agent gets one string t
 - **A self-describing interface.** Any MCP client discovers the tools from `tools/list`; nothing to teach the agent.
 
 Speed isn't the argument: on an open connection both are fast. mcp-node has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
+
+## Reverse connect (no inbound ports)
+
+For machines behind NAT or without sshd, run the node with
+`--connect hub:port`: it dials out to a hub (the same binary with
+`MCP_NODE_HUB_LISTEN`), and clients reach it at `/n/<name>/mcp` on the hub.
+See [docs/reverse-connect.md](docs/reverse-connect.md).
 
 ## Tools
 
@@ -177,6 +184,12 @@ Environment variables only.
 | `MCP_NODE_MAX_INFLIGHT_BYTES` | `67108864`, total in-flight request bodies |
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
+
+`mcp-node --version` prints the version, `--help` the flags; any other
+argument than these and `--connect` is an error.
+
+Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
+[docs/reverse-connect.md](docs/reverse-connect.md).
 
 ## Troubleshooting
 

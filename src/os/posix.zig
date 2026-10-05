@@ -44,6 +44,11 @@ pub fn sleepMs(ms: u64) void {
     }
 }
 
+/// File descriptor of the process standard output stream.
+pub fn stdoutFd() fd_t {
+    return std.posix.STDOUT_FILENO;
+}
+
 /// File descriptor of the process standard error stream.
 /// POSIX guarantees STDERR_FILENO == 2 on every POSIX target.
 pub fn stderrFd() fd_t {

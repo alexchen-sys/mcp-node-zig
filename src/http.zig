@@ -10,6 +10,7 @@ const os = @import("os.zig");
 const util = @import("util.zig");
 const config = @import("config.zig");
 const rpc_mod = @import("rpc.zig");
+const hub_mod = @import("hub.zig");
 
 const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
@@ -274,6 +275,7 @@ pub fn sendHttpRawMode(arena: Allocator, fd: std.posix.fd_t, status: u16, conten
         415 => "Unsupported Media Type",
         421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         else => "Unknown",
     };
@@ -293,6 +295,28 @@ pub fn sendHttpError(arena: Allocator, fd: std.posix.fd_t, status: u16, code: []
     try util.appendJsonString(&body, arena, message);
     try body.appendSlice(arena, "}");
     try sendHttpRaw(arena, fd, status, "application/json", body.items, timeout_ms);
+}
+
+/// What a request path addresses. Outside hub mode only the literal
+/// "/mcp" is routable, exactly as before hub mode existed.
+pub const Route = union(enum) {
+    local,
+    /// hub: `/n`, the node listing
+    list,
+    /// hub: `/n/<name>/mcp`; the name is validated after the body is read
+    node: []const u8,
+};
+
+pub fn routeFor(mode: config.Mode, path: []const u8) ?Route {
+    if (std.mem.eql(u8, path, "/mcp")) return .local;
+    if (mode != .hub) return null;
+    if (std.mem.eql(u8, path, "/n")) return .list;
+    const prefix = "/n/";
+    const suffix = "/mcp";
+    if (path.len > prefix.len + suffix.len and std.mem.startsWith(u8, path, prefix) and std.mem.endsWith(u8, path, suffix)) {
+        return .{ .node = path[prefix.len .. path.len - suffix.len] };
+    }
+    return null;
 }
 
 /// Serve one HTTP request on an accepted stream. Returns true while the
@@ -412,10 +436,10 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
             return false;
         }
     }
-    if (!std.mem.eql(u8, info.path, "/mcp")) {
+    const route = routeFor(cfg.mode, info.path) orelse {
         try sendHttpError(ra, fd, 404, "not_found", "not found", timeout_ms);
         return false;
-    }
+    };
     if (!std.mem.eql(u8, info.method, "POST")) {
         try sendHttpError(ra, fd, 405, "method_not_allowed", "method not allowed", timeout_ms);
         return false;
@@ -492,9 +516,42 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
         }
     }
 
+    switch (route) {
+        .local => {},
+        .list, .node => return serveHubRoute(ra, cfg, fd, route, body, keep_alive, timeout_ms),
+    }
     const rpc = try rpc_mod.handleRpc(ra, io, cfg, body);
     try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive, timeout_ms);
     return keep_alive;
+}
+
+/// Hub routes, reached only after every check passed and the body was read.
+fn serveHubRoute(ra: Allocator, cfg: *const config.Config, fd: std.posix.fd_t, route: Route, body: []const u8, keep_alive: bool, timeout_ms: u64) !bool {
+    const hub: *hub_mod.Hub = @ptrCast(@alignCast(cfg.hub orelse {
+        try sendHttpError(ra, fd, 503, "busy", "hub not ready", timeout_ms);
+        return false;
+    }));
+    switch (route) {
+        .local => unreachable,
+        .list => {
+            const out = try hub.listJson(ra);
+            try sendHttpRawMode(ra, fd, 200, "application/json", out, keep_alive, timeout_ms);
+            return keep_alive;
+        },
+        .node => |name| {
+            const res = try hub_mod.forward(hub, ra, name, body, hub_mod.forwardDeadlineMs(cfg));
+            switch (res) {
+                .unknown_node => try sendHttpError(ra, fd, 404, "unknown_node", "no node connected under this name", timeout_ms),
+                .node_disconnected => try sendHttpError(ra, fd, 502, "node_disconnected", "node link lost before the answer", timeout_ms),
+                .node_timeout => try sendHttpError(ra, fd, 504, "node_timeout", "node did not answer in time", timeout_ms),
+                .resp => |r| {
+                    try sendHttpRawMode(ra, fd, r.status, "application/json", r.body, keep_alive, timeout_ms);
+                    return keep_alive;
+                },
+            }
+            return false;
+        },
+    }
 }
 
 test "host allowlist supports exact and wildcard-port patterns" {
@@ -626,4 +683,20 @@ test "connection close header parsing" {
     try std.testing.expect(connectionCloseRequested("keep-alive, close"));
     try std.testing.expect(!connectionCloseRequested(null));
     try std.testing.expect(!connectionCloseRequested("keep-alive"));
+}
+
+test "routes: listen mode keeps only /mcp; hub adds /n and /n/<name>/mcp" {
+    try std.testing.expect(routeFor(.listen, "/mcp").? == .local);
+    try std.testing.expect(routeFor(.listen, "/n") == null);
+    try std.testing.expect(routeFor(.listen, "/n/pc/mcp") == null);
+    try std.testing.expect(routeFor(.node, "/n") == null);
+    try std.testing.expect(routeFor(.hub, "/mcp").? == .local);
+    try std.testing.expect(routeFor(.hub, "/n").? == .list);
+    try std.testing.expectEqualStrings("pc", routeFor(.hub, "/n/pc/mcp").?.node);
+    // invalid names reach the relay, which answers unknown_node
+    try std.testing.expectEqualStrings("a/b", routeFor(.hub, "/n/a/b/mcp").?.node);
+    try std.testing.expect(routeFor(.hub, "/n//mcp") == null);
+    try std.testing.expect(routeFor(.hub, "/n/") == null);
+    try std.testing.expect(routeFor(.hub, "/n/pc") == null);
+    try std.testing.expect(routeFor(.hub, "/mcp/") == null);
 }

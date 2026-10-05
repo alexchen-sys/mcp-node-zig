@@ -192,6 +192,58 @@ pub fn socketWriteAll(handle: Handle, bytes: []const u8, timeout_ms: u64) posix_
     }
 }
 
+pub const ListenError = error{ AddressInUse, ListenFailed };
+
+/// Listening TCP socket for a long-lived server port.
+///
+/// POSIX sets SO_REUSEADDR but never SO_REUSEPORT. std's `reuse_address`
+/// sets both, and SO_REUSEPORT lets a second process co-bind the same port
+/// and steal half of its connections. SO_REUSEADDR alone still lets a
+/// restarted process bind over TIME_WAIT leftovers of its predecessor, while
+/// a second live listener fails with `AddressInUse`. Windows uses std
+/// without reuse: there SO_REUSEADDR would allow hijacking, and TIME_WAIT
+/// does not block a fresh listener.
+pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.Server {
+    if (comptime builtin.os.tag == .windows) {
+        return addr.listen(io, .{}) catch |err| switch (err) {
+            error.AddressInUse => error.AddressInUse,
+            else => error.ListenFailed,
+        };
+    }
+    const posix = std.posix;
+    const Threaded = std.Io.Threaded;
+    const sys = posix.system;
+    const family: u32 = switch (addr) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const cloexec: u32 = if (comptime builtin.os.tag.isDarwin()) 0 else posix.SOCK.CLOEXEC;
+    const rc = sys.socket(family, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.ListenFailed;
+    const fd: posix.fd_t = @intCast(rc);
+    errdefer posix_impl.closeFd(fd);
+    if (comptime builtin.os.tag.isDarwin()) {
+        if (posix.errno(sys.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC))) != .SUCCESS)
+            return error.ListenFailed;
+    }
+    const one = std.mem.asBytes(&@as(c_int, 1));
+    if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, one.ptr, @intCast(one.len))) != .SUCCESS)
+        return error.ListenFailed;
+    var storage: Threaded.PosixAddress = undefined;
+    var len = Threaded.addressToPosix(&addr, &storage);
+    switch (posix.errno(sys.bind(fd, &storage.any, len))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.ListenFailed,
+    }
+    if (posix.errno(sys.listen(fd, std.Io.net.default_kernel_backlog)) != .SUCCESS) return error.ListenFailed;
+    if (posix.errno(sys.getsockname(fd, &storage.any, &len)) != .SUCCESS) return error.ListenFailed;
+    return .{
+        .socket = .{ .handle = fd, .address = Threaded.addressFromPosix(&storage) },
+        .options = {},
+    };
+}
+
 /// Half-close the send side (FIN after any queued response bytes) while the
 /// receive side stays open. Best effort: a peer that already vanished makes
 /// this fail, and the caller closes the socket either way.

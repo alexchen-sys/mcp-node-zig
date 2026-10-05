@@ -8,16 +8,18 @@
 
 MCP-сервер, через который ИИ-агент выполняет команды и работает с файлами на вашей машине. Один статический бинарь: без Node, Python и SSH.
 
-![mcp-node-zig: старт 1.86 мс, 0.98 МиБ в простое, один бинарь 4.30 МиБ](assets/demo.gif)
+![mcp-node-zig: узел за NAT дозванивается до хаба, хаб выполняет на нём команду](assets/demo.gif)
 
-Старт за 1.86 мс, 0.98 МиБ RSS в простое, 4.30 МиБ на диске, exec p50 0.66 мс / p99 1.81 мс, +576 КиБ на соединение. [Как мерили](BENCHMARKS.md).
+Старт за 1.9 мс, 0.62 МиБ RSS в простое, 8.70 МиБ на диске, exec p50 0.7 мс / p99 1.5 мс, +288 КиБ на соединение. [Как мерили](BENCHMARKS.md).
+
+mcp-node-zig — узел удалённого исполнения, который говорит на MCP: положите один статический бинарь на машину, и ваш агент сможет запускать там команды, вести долгие сессии и читать или писать файлы. С v0.2.0 узел умеет сам звонить на хаб вместо того, чтобы слушать порт, поэтому до машины за NAT или за чужим файрволом можно достучаться без входящих портов и без SSH. Первый MCP-ответ он отдаёт через 1.9 мс после старта, в простое занимает 0.62 МиБ, так что держать его на каждой машине почти ничего не стоит.
 
 ## Установка
 
 Linux x86_64:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Для Linux ARM64, macOS (Apple Silicon) и Windows замените имя архива: `aarch64-linux.tar.gz`, `aarch64-macos.tar.gz`, `x86_64-windows.zip`. Все архивы и `SHA256SUMS.txt` лежат на [странице релиза](https://github.com/alexchen-sys/mcp-node-zig/releases).
@@ -26,7 +28,7 @@ curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mc
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.1.2-x86_64-linux/mcp-node &
+./mcp-node-v0.2.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -47,10 +49,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.1.2-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.2.0-x86_64-windows\mcp-node.exe
 ```
 
 </details>

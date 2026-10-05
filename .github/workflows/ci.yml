@@ -95,6 +95,14 @@ jobs:
           command -v "$PY" >/dev/null 2>&1 || PY=python
           "$PY" ci/test_lifecycle_edge.py
 
+      - name: Python reverse connect suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_reverse.py
+
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v6
         with:
