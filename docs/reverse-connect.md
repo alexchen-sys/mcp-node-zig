@@ -158,6 +158,22 @@ Measured on x86_64 Linux, ReleaseSafe:
 - binary: 4.62 MB before this feature, 8.62 MB with the link, hub and TLS
   client (+4.0 MB, almost all of it std TLS and X.509 parsing; the link and
   hub alone added about 0.6 MB);
-- idle RSS after 6 s: plain node 0.5 MB, hub with one node 1.0 MB, plain
-  listen mode 0.5 MB (512 kB before this feature, 520 kB after); threads:
-  hub 4, node 2, listen 1.
+- idle memory after 6 s, one process per mode, nothing else running from
+  the same binary:
+
+  | mode | Pss | Private_Dirty | VmRSS | threads |
+  |---|---|---|---|---|
+  | plain listen | 0.6 MB | 0.34 MB | 0.55–1.0 MB | 1 |
+  | node with a link | 0.9–0.95 MB | 0.6 MB | 0.55–1.4 MB | 2 |
+  | hub with one node | 1.5 MB | 1.15 MB | 1.05–1.9 MB | 4 |
+
+  Pss and Private_Dirty come from `/proc/<pid>/smaps_rollup`, VmRSS from
+  `/proc/<pid>/status`. Pss is the stable figure: it matched within 5% on
+  two different Linux hosts. VmRSS is not. Most of it is pages of the
+  binary file (RssFile), and how many of those the kernel maps in depends on
+  the host: 556 kB on one, 768–896 kB on the other. A second process from
+  the same binary shares those pages, so adding a node costs about its
+  Private_Dirty, not its VmRSS. The low ends of the VmRSS ranges and the Pss
+  column come from 5 rounds on a 6.8 kernel sandbox; the high ends come
+  from a field host. The older figures here (0.5 / 1.0 / 0.5 MB) were
+  VmRSS on a host like the first one and understated the cost on others.
