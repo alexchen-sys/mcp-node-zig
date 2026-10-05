@@ -42,7 +42,7 @@ curl -sS http://127.0.0.1:8341/mcp \
   --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sys_info","arguments":{}}}'
 ```
 
-返回的 JSON 包含主机名、操作系统、负载、内存和运行时长。接下来接入你的智能体：
+返回的 JSON 包含主机名、操作系统、负载、内存和运行时间。接下来接入你的智能体：
 
 ```sh
 claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
@@ -71,8 +71,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 
 ## 为什么用它
 
-- **无需任何准备。** 不需要 Node、Python、OpenSSH，也不用分发密钥。复制一个文件，运行即可。
-- **进程比请求活得久。** 启动一次构建，断开连接，回来后按偏移量读取输出。
+- **无需部署任何依赖。** 不需要 Node、Python、OpenSSH，也不用分发密钥。复制一个文件，运行即可。
+- **进程不随请求结束。** 启动一次构建，断开连接，回来后按偏移量读取输出。
 - **常驻成本很低。** 空闲时不到 1 MiB。每多连接一个智能体，只增加约 288 KiB，而不是再起一个约 190 MiB 的服务器进程。
 - **除非你要求，否则不用 shell。** `exec` 原样传递 argv。`exec_shell` 是唯一显式的 shell 层。
 - **终止整棵进程树。** POSIX 上用进程组，Windows 上用 Job Object。不会留下占着管道的孤儿子进程。
@@ -88,7 +88,7 @@ mcp-node 是面向智能体的执行 API。通过 SSH，智能体拿到的是一
 
 - **不经过 shell 的 argv。** 不用为远程 shell 的二次解析再做一轮转义。只有在你调用 `exec_shell` 时才会用到 shell。
 - **结构化结果。** `stdout`、`stderr`、`exit_code`、`truncated_*` 和耗时以 JSON 返回，每次调用可单独设置超时。
-- **比请求活得久的会话。** 用 `exec_start` 启动，用 `exec_poll` 按字节偏移读取，用 `exec_write` 写入 stdin，用 `exec_wait` 最多等待 300 s，用 `exec_kill` 终止整棵进程树。连接断了，构建也不会中断。
+- **会话独立于请求存在。** 用 `exec_start` 启动，用 `exec_poll` 按字节偏移读取，用 `exec_write` 写入 stdin，用 `exec_wait` 最多等待 300 s，用 `exec_kill` 终止整棵进程树。连接断了，构建也不会中断。
 - **可校验的文件写入。** `write_file` 接收 base64，并返回实际落盘内容的 SHA-256。
 - **自描述的接口。** 任何 MCP 客户端都能通过 `tools/list` 发现工具，无需额外教智能体。
 
@@ -96,16 +96,13 @@ mcp-node 是面向智能体的执行 API。通过 SSH，智能体拿到的是一
 
 ## 反向连接（无需入站端口）
 
-对于位于 NAT 后面或没有 sshd 的机器，用
-`--connect hub:port` 启动节点：它会主动连接枢纽（即设置了
-`MCP_NODE_HUB_LISTEN` 的同一个二进制文件），客户端通过枢纽上的 `/n/<name>/mcp` 访问它。
-详见 [docs/reverse-connect.md](docs/reverse-connect.md)。
+对于位于 NAT 后面或没有 sshd 的机器，用 `--connect hub:port` 启动节点：它会主动连接枢纽（即设置了 `MCP_NODE_HUB_LISTEN` 的同一个二进制文件），客户端通过枢纽上的 `/n/<name>/mcp` 访问它。详见 [docs/reverse-connect.md](docs/reverse-connect.md)。
 
 ## 工具
 
 | 工具 | 作用 |
 | --- | --- |
-| `sys_info` | 主机名、操作系统、负载、内存、运行时长 |
+| `sys_info` | 主机名、操作系统、负载、内存、运行时间 |
 | `exec` | 执行 argv 直到结束，不经过 shell |
 | `exec_shell` | 通过 `bash`/`sh`/`fish`/`zsh` 执行脚本，Windows 上用 `cmd`/`powershell` |
 | `exec_start` | 以会话形式启动长时间运行的进程 |
@@ -195,8 +192,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 
 `mcp-node --version` 输出版本号，`--help` 输出参数说明；除这两个和 `--connect` 之外，传入其他参数都会报错。
 
-反向连接相关变量（`MCP_NODE_CONNECT*`、`MCP_NODE_HUB_*`）见
-[docs/reverse-connect.md](docs/reverse-connect.md)。
+反向连接相关变量（`MCP_NODE_CONNECT*`、`MCP_NODE_HUB_*`）见 [docs/reverse-connect.md](docs/reverse-connect.md)。
 
 ## 故障排查
 
