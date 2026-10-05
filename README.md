@@ -185,6 +185,9 @@ Environment variables only.
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
 
+`mcp-node --version` prints the version, `--help` the flags; any other
+argument than these and `--connect` is an error.
+
 Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 [docs/reverse-connect.md](docs/reverse-connect.md).
 

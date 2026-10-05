@@ -17,11 +17,17 @@ extern "kernel32" fn WriteFile(
     lpOverlapped: ?*anyopaque,
 ) callconv(.winapi) i32;
 
+/// Win32 STD_OUTPUT_HANDLE constant: (DWORD)-11.
+const STD_OUTPUT_HANDLE: u32 = 0xffff_fff5;
 /// Win32 STD_ERROR_HANDLE constant: (DWORD)-12.
 const STD_ERROR_HANDLE: u32 = 0xffff_fff4;
 
 /// Handle of the process standard error stream via kernel32
 /// GetStdHandle; std 0.16 does not wrap it.
+pub fn stdoutFd() fd_t {
+    return GetStdHandle(STD_OUTPUT_HANDLE) orelse std.os.windows.INVALID_HANDLE_VALUE;
+}
+
 pub fn stderrFd() fd_t {
     return GetStdHandle(STD_ERROR_HANDLE) orelse std.os.windows.INVALID_HANDLE_VALUE;
 }

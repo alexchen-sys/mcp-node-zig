@@ -11,5 +11,6 @@ pub const fd_t = posix.fd_t;
 pub const closeFd = posix.closeFd;
 pub const sleepMs = posix.sleepMs;
 pub const stderrFd = posix.stderrFd;
+pub const stdoutFd = posix.stdoutFd;
 pub const writeAllFd = posix.writeAllFd;
 pub const WriteAllError = posix.WriteAllError;

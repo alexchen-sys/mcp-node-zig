@@ -49,6 +49,7 @@ pub const sleepMs = impl.sleepMs;
 pub const writeAllFd = impl.writeAllFd;
 pub const WriteAllError = impl.WriteAllError;
 pub const stderrFd = impl.stderrFd;
+pub const stdoutFd = impl.stdoutFd;
 
 // env: cross-platform process environment. The module does
 // its own comptime platform selection (its data source is per-OS, not

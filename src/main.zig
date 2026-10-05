@@ -57,7 +57,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cli_connect = try parseArgs(try init.args.toSlice(arena));
+    const cli_connect = switch (try parseArgs(try init.args.toSlice(arena))) {
+        .run => |c| c,
+        .version => return printOut("mcp-node " ++ VERSION ++ "\n"),
+        .help => return printOut(USAGE),
+    };
     var cfg = try config.loadConfigMode(arena, io, cli_connect);
     var sessions = session_mod.SessionStore.init(io, cfg.max_sessions);
     sessions.ttl_ms = @as(i64, cfg.session_ttl_s) * 1000;
@@ -179,12 +183,45 @@ fn logLine(msg: []const u8, host: []const u8, port: u16) void {
 
 /// Command line: `--connect host:port` (or `--connect=host:port`). Other
 /// arguments are ignored, exactly as before this flag existed.
-fn parseArgs(argv: []const [:0]const u8) !?[]const u8 {
+const VERSION: []const u8 = @import("build_options").version;
+
+const USAGE =
+    \\Usage: mcp-node [--connect host:port]
+    \\
+    \\MCP server that gives an agent a shell on this machine.
+    \\Configuration comes from MCP_NODE_* environment variables.
+    \\
+    \\  --connect host:port  dial out to a hub instead of listening
+    \\                       (same as MCP_NODE_CONNECT)
+    \\  -h, --help           show this help and exit
+    \\  -V, --version        print the version and exit
+    \\
+    \\Docs: https://github.com/alexchen-sys/mcp-node-zig
+    \\
+;
+
+const Args = union(enum) {
+    run: ?[]const u8, // the --connect value, if any
+    version,
+    help,
+};
+
+fn printOut(text: []const u8) void {
+    os.writeAllFd(os.stdoutFd(), text) catch {};
+}
+
+/// Unknown arguments are an error: a typo such as `--conect` must not start
+/// a listener the user did not ask for.
+fn parseArgs(argv: []const [:0]const u8) !Args {
     var connect: ?[]const u8 = null;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a: []const u8 = argv[i];
-        if (std.mem.eql(u8, a, "--connect")) {
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            return .help;
+        } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
+            return .version;
+        } else if (std.mem.eql(u8, a, "--connect")) {
             if (i + 1 >= argv.len) {
                 std.debug.print("--connect needs host:port\n", .{});
                 return error.InvalidConfig;
@@ -193,17 +230,25 @@ fn parseArgs(argv: []const [:0]const u8) !?[]const u8 {
             connect = argv[i];
         } else if (std.mem.startsWith(u8, a, "--connect=")) {
             connect = a["--connect=".len..];
+        } else {
+            std.debug.print("unknown argument '{s}' (see --help)\n", .{a});
+            return error.InvalidConfig;
         }
     }
-    return connect;
+    return .{ .run = connect };
 }
 
-test "command line picks up --connect and ignores the rest" {
-    try std.testing.expect((try parseArgs(&.{"mcp-node"})) == null);
-    try std.testing.expectEqualStrings("h:1", (try parseArgs(&.{ "mcp-node", "--connect", "h:1" })).?);
-    try std.testing.expectEqualStrings("h:2", (try parseArgs(&.{ "mcp-node", "--connect=h:2" })).?);
+test "command line: --connect, --help, --version, unknown arguments" {
+    try std.testing.expect((try parseArgs(&.{"mcp-node"})).run == null);
+    try std.testing.expectEqualStrings("h:1", (try parseArgs(&.{ "mcp-node", "--connect", "h:1" })).run.?);
+    try std.testing.expectEqualStrings("h:2", (try parseArgs(&.{ "mcp-node", "--connect=h:2" })).run.?);
     try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--connect" }));
-    try std.testing.expect((try parseArgs(&.{ "mcp-node", "-x" })) == null);
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "-x" }));
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--conect", "h:1" }));
+    try std.testing.expect((try parseArgs(&.{ "mcp-node", "--version" })) == .version);
+    try std.testing.expect((try parseArgs(&.{ "mcp-node", "-V" })) == .version);
+    try std.testing.expect((try parseArgs(&.{ "mcp-node", "--help" })) == .help);
+    try std.testing.expect((try parseArgs(&.{ "mcp-node", "-h", "--bogus" })) == .help);
 }
 
 test "discover module tests" {
