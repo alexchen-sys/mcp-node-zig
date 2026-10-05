@@ -63,9 +63,26 @@ Expand-Archive mcp-node.zip
 - Долгие задачи не обрываются вместе с запросом. `exec_start` запускает процесс как сессию, агент читает вывод через `exec_poll` и `exec_wait`, пишет в stdin через `exec_write`. `exec_kill` убивает всё дерево процессов.
 - Команды без сюрпризов от shell. `exec` передаёт argv напрямую, метасимволы остаются данными. Для пайпов и редиректов есть отдельный `exec_shell`.
 - Файлы с проверкой. `read_file`, `list_dir`, а `write_file` возвращает SHA-256 записанного.
-- Работает с любым MCP-клиентом по HTTP: Claude Code, Cursor, VS Code, Codex, Claude Desktop. Для stdio-клиентов есть мост [mcp-remote](https://github.com/geelen/mcp-remote).
+- Работает с любым MCP-клиентом по HTTP: Claude Code, Cursor, VS Code, Codex, Claude Desktop. stdio-клиенты запускают ноду напрямую через `--stdio`, см. ниже.
 
 Всего 13 инструментов, схемы отдаёт `tools/list`.
+
+## Режим stdio
+
+Клиенты, которые сами запускают сервер подпроцессом, могут звать ноду напрямую с флагом `--stdio` (или `MCP_NODE_STDIO=1`). Сообщения идут построчно в формате JSON-RPC: один запрос на строку в stdin, один ответ на строку в stdout. Порт не слушается и токен не нужен: пайпы держит тот, кто запустил процесс. Логи пишутся только в stderr. Когда stdin закрывается, нода убивает оставшиеся сессии и выходит с кодом 0.
+
+```json
+{
+  "mcpServers": {
+    "mcp-node": {
+      "command": "mcp-node",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+`--stdio` нельзя совмещать с `--connect` и `MCP_NODE_HUB_LISTEN`.
 
 ## Чем это отличается от SSH?
 
