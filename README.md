@@ -101,6 +101,28 @@ For machines behind NAT or without sshd, run the node with
 `MCP_NODE_HUB_LISTEN`), and clients reach it at `/n/<name>/mcp` on the hub.
 See [docs/reverse-connect.md](docs/reverse-connect.md).
 
+## stdio mode
+
+Clients that spawn their servers as subprocesses can run the node directly
+with `--stdio` (or `MCP_NODE_STDIO=1`). Messages are newline-delimited
+JSON-RPC: one request per line on stdin, one response per line on stdout.
+There is no listener and no token, since whoever holds the pipes started the
+process. Logs go to stderr only; the node exits 0 when stdin closes and kills
+any sessions still running.
+
+```json
+{
+  "mcpServers": {
+    "mcp-node": {
+      "command": "mcp-node",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+`--stdio` can't be combined with `--connect` or `MCP_NODE_HUB_LISTEN`.
+
 ## Tools
 
 | Tool | Does |
@@ -162,7 +184,7 @@ http_headers = { "Authorization" = "Bearer <token>" }
 
 Claude Desktop and other JSON clients: same as Cursor, plus `"type": "http"`.
 
-stdio-only clients: `npx mcp-remote http://127.0.0.1:8341/mcp --header "Authorization: Bearer <token>"`
+Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mode](#stdio-mode)), or bridge to a remote node over HTTP with `npx mcp-remote http://127.0.0.1:8341/mcp --header "Authorization: Bearer <token>"`
 
 ## Security
 
@@ -192,9 +214,10 @@ Environment variables only.
 | `MCP_NODE_MAX_INFLIGHT_BYTES` | `67108864`, total in-flight request bodies |
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
+| `MCP_NODE_STDIO` | unset; `1` serves one client over stdin/stdout, no listener (same as `--stdio`) |
 
 `mcp-node --version` prints the version, `--help` the flags; any other
-argument than these and `--connect` is an error.
+argument than these, `--connect` and `--stdio` is an error.
 
 Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 [docs/reverse-connect.md](docs/reverse-connect.md).

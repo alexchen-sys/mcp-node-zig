@@ -9,6 +9,7 @@ const config = @import("config.zig");
 const env_state = @import("env_state.zig");
 const node_link = @import("node_link.zig");
 const hub_mod = @import("hub.zig");
+const stdio = @import("stdio.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -57,18 +58,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cli_connect = switch (try parseArgs(try init.args.toSlice(arena))) {
+    const cli = switch (try parseArgs(try init.args.toSlice(arena))) {
         .run => |c| c,
         .version => return printOut("mcp-node " ++ VERSION ++ "\n"),
         .help => return printOut(USAGE),
     };
-    var cfg = try config.loadConfigMode(arena, io, cli_connect);
+    var cfg = try config.loadConfigCli(arena, io, cli);
     var sessions = session_mod.SessionStore.init(io, cfg.max_sessions);
     sessions.ttl_ms = @as(i64, cfg.session_ttl_s) * 1000;
     cfg.sessions = &sessions;
     var gate = ConnGate{ .io = io, .max = cfg.max_conn };
     var inflight = config.InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
     cfg.inflight = &inflight;
+
+    if (cfg.mode == .stdio) {
+        // stdio mode: no listener and no token; stdout carries only
+        // JSON-RPC response lines, every log line goes to stderr.
+        stdio.run(io, &cfg);
+        return;
+    }
 
     if (cfg.mode == .node) {
         // Node mode opens no listener: every request arrives over the link.
@@ -181,18 +189,21 @@ fn logLine(msg: []const u8, host: []const u8, port: u16) void {
     os.writeAllFd(os.stderrFd(), line) catch {};
 }
 
-/// Command line: `--connect host:port` (or `--connect=host:port`). Other
-/// arguments are ignored, exactly as before this flag existed.
+/// Command line: `--connect host:port` (or `--connect=host:port`) and
+/// `--stdio`. Anything else is rejected (see parseArgs).
 const VERSION: []const u8 = @import("build_options").version;
 
 const USAGE =
-    \\Usage: mcp-node [--connect host:port]
+    \\Usage: mcp-node [--connect host:port | --stdio]
     \\
     \\MCP server that gives an agent a shell on this machine.
     \\Configuration comes from MCP_NODE_* environment variables.
     \\
     \\  --connect host:port  dial out to a hub instead of listening
     \\                       (same as MCP_NODE_CONNECT)
+    \\  --stdio              serve one client over stdin/stdout instead of
+    \\                       HTTP; no listener, no token (same as
+    \\                       MCP_NODE_STDIO=1)
     \\  -h, --help           show this help and exit
     \\  -V, --version        print the version and exit
     \\
@@ -201,7 +212,7 @@ const USAGE =
 ;
 
 const Args = union(enum) {
-    run: ?[]const u8, // the --connect value, if any
+    run: config.Cli,
     version,
     help,
 };
@@ -213,7 +224,7 @@ fn printOut(text: []const u8) void {
 /// Unknown arguments are an error: a typo such as `--conect` must not start
 /// a listener the user did not ask for.
 fn parseArgs(argv: []const [:0]const u8) !Args {
-    var connect: ?[]const u8 = null;
+    var cli: config.Cli = .{};
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a: []const u8 = argv[i];
@@ -221,27 +232,33 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             return .help;
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
             return .version;
+        } else if (std.mem.eql(u8, a, "--stdio")) {
+            cli.stdio = true;
         } else if (std.mem.eql(u8, a, "--connect")) {
             if (i + 1 >= argv.len) {
                 std.debug.print("--connect needs host:port\n", .{});
                 return error.InvalidConfig;
             }
             i += 1;
-            connect = argv[i];
+            cli.connect = argv[i];
         } else if (std.mem.startsWith(u8, a, "--connect=")) {
-            connect = a["--connect=".len..];
+            cli.connect = a["--connect=".len..];
         } else {
             std.debug.print("unknown argument '{s}' (see --help)\n", .{a});
             return error.InvalidConfig;
         }
     }
-    return .{ .run = connect };
+    return .{ .run = cli };
 }
 
-test "command line: --connect, --help, --version, unknown arguments" {
-    try std.testing.expect((try parseArgs(&.{"mcp-node"})).run == null);
-    try std.testing.expectEqualStrings("h:1", (try parseArgs(&.{ "mcp-node", "--connect", "h:1" })).run.?);
-    try std.testing.expectEqualStrings("h:2", (try parseArgs(&.{ "mcp-node", "--connect=h:2" })).run.?);
+test "command line: --connect, --stdio, --help, --version, unknown arguments" {
+    const plain = (try parseArgs(&.{"mcp-node"})).run;
+    try std.testing.expect(plain.connect == null and !plain.stdio);
+    try std.testing.expectEqualStrings("h:1", (try parseArgs(&.{ "mcp-node", "--connect", "h:1" })).run.connect.?);
+    try std.testing.expectEqualStrings("h:2", (try parseArgs(&.{ "mcp-node", "--connect=h:2" })).run.connect.?);
+    const st = (try parseArgs(&.{ "mcp-node", "--stdio" })).run;
+    try std.testing.expect(st.stdio and st.connect == null);
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--stdio=1" }));
     try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--connect" }));
     try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "-x" }));
     try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--conect", "h:1" }));
@@ -259,4 +276,5 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("link.zig"));
     std.testing.refAllDecls(@import("node_link.zig"));
     std.testing.refAllDecls(@import("hub.zig"));
+    std.testing.refAllDecls(@import("stdio.zig"));
 }

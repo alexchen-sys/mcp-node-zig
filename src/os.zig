@@ -50,6 +50,9 @@ pub const writeAllFd = impl.writeAllFd;
 pub const WriteAllError = impl.WriteAllError;
 pub const stderrFd = impl.stderrFd;
 pub const stdoutFd = impl.stdoutFd;
+pub const stdinFd = impl.stdinFd;
+pub const readFd = impl.readFd;
+pub const ReadError = impl.ReadError;
 
 // env: cross-platform process environment. The module does
 // its own comptime platform selection (its data source is per-OS, not
