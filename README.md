@@ -17,6 +17,14 @@ mcp-node-zig is a remote execution node that speaks MCP: put one static binary o
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
+```
+
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). Pin a version with `MCP_NODE_VERSION=0.2.0`, change the target directory with `PREFIX=/some/dir`.
+
+Manual install, Linux x86_64:
+
+```sh
 curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
 ```
 

@@ -16,7 +16,13 @@ mcp-node-zig — узел удалённого исполнения, котор�
 
 ## Установка
 
-Linux x86_64:
+```sh
+curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
+```
+
+Скрипт сам определяет платформу, скачивает свежий релиз, сверяет его с `SHA256SUMS.txt` и ставит в `/usr/local/bin` (или `~/.local/bin`). Зафиксировать версию: `MCP_NODE_VERSION=0.2.0`, другой каталог: `PREFIX=/some/dir`.
+
+Ручная установка, Linux x86_64:
 
 ```sh
 curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
