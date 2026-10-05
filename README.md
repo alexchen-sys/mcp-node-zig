@@ -8,16 +8,16 @@ English | [Русский](README.ru.md)
 
 Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
 
-![mcp-node-zig: 1.9 ms cold start, 0.62 MiB idle, one 8.70 MiB binary](assets/demo.gif)
+![mcp-node-zig: a node behind NAT dials out to a hub, the hub runs a command on it](assets/demo.gif)
 
 **1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
 
-mcp-node-zig is an MCP server for remote machines. Drop it on a build box, a homelab server, a Windows host or a VPS, and any MCP client can run commands, drive long-running processes and read and write files there over one authenticated HTTP endpoint.
+mcp-node-zig is a remote execution node that speaks MCP: put one static binary on a machine and your agent can run commands, drive long-running sessions and read or write files there. Since v0.2.0 the node can dial out to a hub instead of listening, so a box behind NAT or someone else's firewall is reachable with no inbound ports and no SSH. It answers its first MCP request 1.9 ms after start and idles at 0.62 MiB, which makes leaving one on every machine basically free.
 
 ## Install
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`.
@@ -26,7 +26,7 @@ Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zi
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.1.2-x86_64-linux/mcp-node &
+./mcp-node-v0.2.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -45,10 +45,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.1.2/mcp-node-v0.1.2-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.0/mcp-node-v0.2.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.1.2-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.2.0-x86_64-windows\mcp-node.exe
 ```
 
 From a second window:

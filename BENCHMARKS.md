@@ -1,6 +1,6 @@
 # Benchmarks
 
-mcp-node-zig serves its first MCP response in **1.9 ms** and idles at **0.62 MiB**: 251× and 452× faster to first response than the uvx and npx command servers, from one 8.70 MiB static binary with no runtime.
+mcp-node-zig serves its first MCP response in **1.9 ms** and idles at **0.62 MiB**, from one 8.70 MiB static binary with no runtime. The uvx and npx command servers need 477.0 ms and 858.4 ms to first response — 251× and 452× slower, launcher resolution included.
 
 | | mcp-node-zig 0.2.0 | tumf/mcp-shell-server 1.30.0 | g0t4/mcp-server-commands 0.8.2 |
 | --- | --- | --- | --- |
