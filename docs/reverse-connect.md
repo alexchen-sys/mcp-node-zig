@@ -155,7 +155,7 @@ do not survive a node restart.
 
 Measured on x86_64 Linux, ReleaseSafe:
 
-- binary: 4.62 MB before this feature, 8.62 MB with the link, hub and TLS
+- binary: 4.62 MB before this feature, 8.63 MB with the link, hub and TLS
   client (+4.0 MB, almost all of it std TLS and X.509 parsing; the link and
   hub alone added about 0.6 MB);
 - idle memory after 6 s, each mode started from its own copy of the binary
@@ -169,14 +169,15 @@ Measured on x86_64 Linux, ReleaseSafe:
 
   All figures come from `/proc/<pid>/smaps_rollup`, 5 rounds on a 6.8
   kernel sandbox. On a field host Private_Dirty matched within 2% and
-  VmRSS read 1.0 / 1.4 / 1.9 MB. Private_Dirty is
-  the process's own anonymous memory; the rest of Rss is pages of the
-  binary file. A second node started from the same file shares those
-  pages, so each extra node costs about its Private_Dirty (0.6 MB) plus a
-  share of the file pages (Pss about 1.07 MB per node with two nodes).
+  VmRSS read 1.0 / 1.4 / 1.9 MB. In these runs Private_Dirty was all
+  anonymous memory; the rest of Rss is pages of the binary file. A second
+  node started from the same file shares those pages, so each extra node
+  costs about its Private_Dirty (0.6 MB). Pss splits the shared file pages
+  between the two, which shows as 1.04–1.1 MB per node.
 
   Use `smaps_rollup`, not the VmRSS line of `/proc/<pid>/status`: those
-  counters are approximate on recent kernels, and on the 64-CPU sandbox
-  they were off by up to 512 kB (0.5 MB reported for a 1.06 MB listener).
+  counters are approximate and drift more with more CPUs. On the 64-CPU
+  sandbox they were off by up to about 1 MB (0.5 MB reported for a 1.5 MB
+  node).
   The older figures here (0.5 / 1.0 / 0.5 MB) were taken that way and
   understated the cost.
