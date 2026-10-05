@@ -158,22 +158,25 @@ Measured on x86_64 Linux, ReleaseSafe:
 - binary: 4.62 MB before this feature, 8.62 MB with the link, hub and TLS
   client (+4.0 MB, almost all of it std TLS and X.509 parsing; the link and
   hub alone added about 0.6 MB);
-- idle memory after 6 s, one process per mode, nothing else running from
-  the same binary:
+- idle memory after 6 s, each mode started from its own copy of the binary
+  so that no file pages are shared:
 
-  | mode | Pss | Private_Dirty | VmRSS | threads |
-  |---|---|---|---|---|
-  | plain listen | 0.6 MB | 0.34 MB | 0.55–1.0 MB | 1 |
-  | node with a link | 0.9–0.95 MB | 0.6 MB | 0.55–1.4 MB | 2 |
-  | hub with one node | 1.5 MB | 1.15 MB | 1.05–1.9 MB | 4 |
+  | mode | Rss | Private_Dirty | threads |
+  |---|---|---|---|
+  | plain listen | 1.0–1.1 MB | 0.34 MB | 1 |
+  | node with a link | 1.5 MB | 0.6 MB | 2 |
+  | hub with one node | 2.0 MB | 1.15 MB | 4 |
 
-  Pss and Private_Dirty come from `/proc/<pid>/smaps_rollup`, VmRSS from
-  `/proc/<pid>/status`. Pss is the stable figure: it matched within 5% on
-  two different Linux hosts. VmRSS is not. Most of it is pages of the
-  binary file (RssFile), and how many of those the kernel maps in depends on
-  the host: 556 kB on one, 768–896 kB on the other. A second process from
-  the same binary shares those pages, so adding a node costs about its
-  Private_Dirty, not its VmRSS. The low ends of the VmRSS ranges and the Pss
-  column come from 5 rounds on a 6.8 kernel sandbox; the high ends come
-  from a field host. The older figures here (0.5 / 1.0 / 0.5 MB) were
-  VmRSS on a host like the first one and understated the cost on others.
+  All figures come from `/proc/<pid>/smaps_rollup`, 5 rounds on a 6.8
+  kernel sandbox. On a field host Private_Dirty matched within 2% and
+  VmRSS read 1.0 / 1.4 / 1.9 MB. Private_Dirty is
+  the process's own anonymous memory; the rest of Rss is pages of the
+  binary file. A second node started from the same file shares those
+  pages, so each extra node costs about its Private_Dirty (0.6 MB) plus a
+  share of the file pages (Pss about 1.07 MB per node with two nodes).
+
+  Use `smaps_rollup`, not the VmRSS line of `/proc/<pid>/status`: those
+  counters are approximate on recent kernels, and on the 64-CPU sandbox
+  they were off by up to 512 kB (0.5 MB reported for a 1.06 MB listener).
+  The older figures here (0.5 / 1.0 / 0.5 MB) were taken that way and
+  understated the cost.
