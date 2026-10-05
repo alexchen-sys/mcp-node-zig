@@ -526,7 +526,7 @@ fn acceptLoop(hub: *Hub, server: *Io.net.Server) void {
 pub fn start(hub: *Hub, server: *Io.net.Server) !void {
     const ep = hub.cfg.hub_listen orelse return error.NoHubListen;
     const addr = try Io.net.IpAddress.parse(ep.host, ep.port);
-    server.* = try addr.listen(hub.io, .{ .reuse_address = true });
+    server.* = try os.net.listenTcp(hub.io, addr); // no SO_REUSEPORT, see os.net
     const a = try std.Thread.spawn(.{}, acceptLoop, .{ hub, server });
     a.detach();
     const p = try std.Thread.spawn(.{}, pinger, .{hub});

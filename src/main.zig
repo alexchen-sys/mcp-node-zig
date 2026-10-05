@@ -86,7 +86,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const addr = try Io.net.IpAddress.parse(cfg.host, cfg.port);
-    var server = try addr.listen(io, .{ .reuse_address = true });
+    // Not std's reuse_address: it also sets SO_REUSEPORT, which lets a
+    // second instance co-bind this port instead of failing (see os.net).
+    var server = try os.net.listenTcp(io, addr);
     defer server.deinit(io);
 
     logLine("mcp-node listening", cfg.host, cfg.port);
