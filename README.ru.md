@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/alexchen-sys/mcp-node-zig)](https://github.com/alexchen-sys/mcp-node-zig/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[English](README.md) | Русский
+[English](README.md) | Русский | [中文](README.zh.md)
 
 MCP-сервер, через который ИИ-агент выполняет команды и работает с файлами на вашей машине. Один статический бинарь: без Node, Python и SSH.
 
