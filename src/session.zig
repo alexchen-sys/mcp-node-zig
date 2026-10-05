@@ -190,6 +190,17 @@ pub const SessionStore = struct {
         self.next_id += 1;
         return id;
     }
+
+    /// Kill the process tree of every session still in the store. Used at
+    /// shutdown by transports that end (stdio EOF): sessions run in their
+    /// own process group, so without this they would outlive the server.
+    /// Nothing is freed; the process is about to exit.
+    pub fn killAll(self: *SessionStore) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.map.iterator();
+        while (it.next()) |kv| killTreeGuarded(kv.value_ptr.*, self.io);
+    }
 };
 
 pub fn nowUs(io: Io) i64 {

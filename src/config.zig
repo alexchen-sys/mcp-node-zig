@@ -23,8 +23,9 @@ pub const Endpoint = struct {
 };
 
 /// Process role. `listen` is the historical default and the only mode that
-/// existed before node links; the other two are opt-in via env/CLI.
-pub const Mode = enum { listen, node, hub };
+/// existed before node links; the others are opt-in via env/CLI. `stdio`
+/// serves one client over stdin/stdout and opens no socket at all.
+pub const Mode = enum { listen, node, hub, stdio };
 
 pub const Config = struct {
     name: []const u8,
@@ -94,21 +95,48 @@ pub const InflightGate = struct {
 };
 
 pub fn loadConfig(arena: Allocator, io: Io) !Config {
-    return loadConfigMode(arena, io, null);
+    return loadConfigCli(arena, io, .{});
 }
 
-/// Full loader. `cli_connect` is the value of `--connect` (it wins over
-/// MCP_NODE_CONNECT). With neither MCP_NODE_CONNECT, `--connect` nor
-/// MCP_NODE_HUB_LISTEN set, the result is exactly what loadConfig always
-/// returned: mode `.listen` and no link fields.
+/// Command-line overrides. Each one wins over its environment variable.
+pub const Cli = struct {
+    /// `--connect host:port` (MCP_NODE_CONNECT).
+    connect: ?[]const u8 = null,
+    /// `--stdio` (MCP_NODE_STDIO=1).
+    stdio: bool = false,
+};
+
 pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Config {
-    const connect_s: ?[]const u8 = cli_connect orelse getEnv(arena, "MCP_NODE_CONNECT");
+    return loadConfigCli(arena, io, .{ .connect = cli_connect });
+}
+
+/// Full loader. `cli` carries the command-line overrides (`--connect` wins
+/// over MCP_NODE_CONNECT, `--stdio` enables stdio regardless of
+/// MCP_NODE_STDIO). With none of MCP_NODE_CONNECT, MCP_NODE_HUB_LISTEN,
+/// MCP_NODE_STDIO or the flags set, the result is exactly what loadConfig
+/// always returned: mode `.listen` and no link fields.
+pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
+    const connect_s: ?[]const u8 = cli.connect orelse getEnv(arena, "MCP_NODE_CONNECT");
     const hub_s = getEnv(arena, "MCP_NODE_HUB_LISTEN");
+    const stdio_s = getEnv(arena, "MCP_NODE_STDIO") orelse "";
+    const env_stdio = if (std.mem.eql(u8, stdio_s, "1"))
+        true
+    else if (stdio_s.len == 0 or std.mem.eql(u8, stdio_s, "0"))
+        false
+    else {
+        std.debug.print("MCP_NODE_STDIO must be 0 or 1, got '{s}'\n", .{stdio_s});
+        return error.InvalidConfig;
+    };
+    const stdio = cli.stdio or env_stdio;
     if (connect_s != null and hub_s != null) {
         std.debug.print("MCP_NODE_CONNECT/--connect and MCP_NODE_HUB_LISTEN are mutually exclusive\n", .{});
         return error.InvalidConfig;
     }
-    const mode: Mode = if (connect_s != null) .node else if (hub_s != null) .hub else .listen;
+    if (stdio and (connect_s != null or hub_s != null)) {
+        std.debug.print("--stdio/MCP_NODE_STDIO cannot be combined with MCP_NODE_CONNECT/--connect or MCP_NODE_HUB_LISTEN\n", .{});
+        return error.InvalidConfig;
+    }
+    const mode: Mode = if (stdio) .stdio else if (connect_s != null) .node else if (hub_s != null) .hub else .listen;
 
     const name = getEnv(arena, "MCP_NODE_NAME") orelse "mcp-node";
     const host = getEnv(arena, "MCP_NODE_HOST") orelse "127.0.0.1";
@@ -159,7 +187,7 @@ pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Confi
         }
     };
     const token = std.mem.trim(u8, token_raw, " \t\r\n");
-    if (token.len == 0 and mode != .node) {
+    if (token.len == 0 and mode != .node and mode != .stdio) {
         const insecure = getEnv(arena, "MCP_NODE_INSECURE") orelse "0";
         if (!std.mem.eql(u8, insecure, "1")) return error.TokenFileMissing;
     }
@@ -190,7 +218,7 @@ pub fn loadConfigMode(arena: Allocator, io: Io, cli_connect: ?[]const u8) !Confi
         .mode = mode,
     };
     switch (mode) {
-        .listen => {},
+        .listen, .stdio => {},
         .node => {
             cfg.connect = parseEndpoint(arena, connect_s.?) catch {
                 std.debug.print("MCP_NODE_CONNECT/--connect must be host:port, got '{s}'\n", .{connect_s.?});
@@ -272,10 +300,11 @@ pub fn parseEndpoint(arena: Allocator, s: []const u8) !Endpoint {
     return .{ .host = try arena.dupe(u8, host), .port = port };
 }
 
-/// Node mode opens no client listener, so the client token is unused and
-/// the token file is not read at all (the link has its own secret).
+/// Node and stdio modes open no client listener, so the client token is
+/// unused and the token file is not read at all (the link has its own
+/// secret; stdio trusts the process that holds its pipes).
 fn readTokenFile(arena: Allocator, io: Io, mode: Mode, path: []const u8) ![]u8 {
-    if (mode == .node) return &.{};
+    if (mode == .node or mode == .stdio) return &.{};
     return os.fd.readFileAlloc(arena, io, path, TOKEN_FILE_MAX_BYTES);
 }
 

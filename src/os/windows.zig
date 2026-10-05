@@ -16,11 +16,23 @@ extern "kernel32" fn WriteFile(
     lpNumberOfBytesWritten: ?*u32,
     lpOverlapped: ?*anyopaque,
 ) callconv(.winapi) i32;
+extern "kernel32" fn ReadFile(
+    hFile: std.os.windows.HANDLE,
+    lpBuffer: [*]u8,
+    nNumberOfBytesToRead: u32,
+    lpNumberOfBytesRead: ?*u32,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) i32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
+/// Win32 STD_INPUT_HANDLE constant: (DWORD)-10.
+const STD_INPUT_HANDLE: u32 = 0xffff_fff6;
 /// Win32 STD_OUTPUT_HANDLE constant: (DWORD)-11.
 const STD_OUTPUT_HANDLE: u32 = 0xffff_fff5;
 /// Win32 STD_ERROR_HANDLE constant: (DWORD)-12.
 const STD_ERROR_HANDLE: u32 = 0xffff_fff4;
+/// Win32 ERROR_BROKEN_PIPE: the write end of a pipe was closed (EOF).
+const ERROR_BROKEN_PIPE: u32 = 109;
 
 /// Handle of the process standard error stream via kernel32
 /// GetStdHandle; std 0.16 does not wrap it.
@@ -30,6 +42,24 @@ pub fn stdoutFd() fd_t {
 
 pub fn stderrFd() fd_t {
     return GetStdHandle(STD_ERROR_HANDLE) orelse std.os.windows.INVALID_HANDLE_VALUE;
+}
+
+pub fn stdinFd() fd_t {
+    return GetStdHandle(STD_INPUT_HANDLE) orelse std.os.windows.INVALID_HANDLE_VALUE;
+}
+
+pub const ReadError = error{ReadFailed};
+
+/// One blocking read from a synchronous handle. Returns 0 at end of file:
+/// a closed pipe reports ERROR_BROKEN_PIPE rather than a zero-byte read.
+pub fn readFd(fd: fd_t, buf: []u8) ReadError!usize {
+    const want: u32 = @intCast(@min(buf.len, 1 << 30));
+    var got: u32 = 0;
+    if (ReadFile(fd, buf.ptr, want, &got, null) == 0) {
+        if (GetLastError() == ERROR_BROKEN_PIPE) return 0;
+        return error.ReadFailed;
+    }
+    return got;
 }
 
 /// Close a handle. CloseHandle is the Windows equivalent of close(2) for

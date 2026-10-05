@@ -49,6 +49,33 @@ pub fn stdoutFd() fd_t {
     return std.posix.STDOUT_FILENO;
 }
 
+/// File descriptor of the process standard input stream.
+pub fn stdinFd() fd_t {
+    return std.posix.STDIN_FILENO;
+}
+
+pub const ReadError = error{ReadFailed};
+
+/// One blocking read into `buf`, retrying EINTR. Returns 0 at end of file.
+pub fn readFd(fd: fd_t, buf: []u8) ReadError!usize {
+    while (true) {
+        if (comptime builtin.os.tag == .linux) {
+            const rc = std.os.linux.read(fd, buf.ptr, buf.len);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return rc,
+                .INTR => continue,
+                else => return error.ReadFailed,
+            }
+        } else {
+            // libc POSIX path (macOS et al.).
+            const rc = std.c.read(fd, buf.ptr, buf.len);
+            if (rc >= 0) return @intCast(rc);
+            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            return error.ReadFailed;
+        }
+    }
+}
+
 /// File descriptor of the process standard error stream.
 /// POSIX guarantees STDERR_FILENO == 2 on every POSIX target.
 pub fn stderrFd() fd_t {
