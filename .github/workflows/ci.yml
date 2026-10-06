@@ -52,6 +52,10 @@ jobs:
         shell: bash
         run: python3 ci/test_reverse.py
 
+      - name: Python audit log suite (-Dtls-server binary)
+        shell: bash
+        run: python3 ci/test_audit.py
+
       - name: Cross builds (-Dtls-server)
         # Runs last: every cross build replaces zig-out/bin/mcp-node.
         shell: bash
@@ -155,6 +159,14 @@ jobs:
           PY=python3
           command -v "$PY" >/dev/null 2>&1 || PY=python
           "$PY" ci/test_reverse.py
+
+      - name: Python audit log suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_audit.py
 
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v6
