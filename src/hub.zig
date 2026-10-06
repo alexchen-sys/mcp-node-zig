@@ -39,8 +39,152 @@ pub const NAME_IN_USE = "name in use by a live link";
 pub const MIN_FORWARD_MS: u64 = 3600 * 1000;
 const ACCEPT_BACKOFF_MS: u64 = 50;
 const PINGER_STEP_MS: u64 = 250;
+/// Handshakes in progress from one source, on top of the global cap.
+pub const MAX_PENDING_PER_SOURCE: u8 = 4;
+/// Failed handshakes from one source within AUTH_FAIL_WINDOW_MS that
+/// make the hub refuse that source for AUTH_BAN_MS.
+pub const AUTH_FAIL_LIMIT: u8 = 8;
+pub const AUTH_FAIL_WINDOW_MS: i64 = 60 * 1000;
+pub const AUTH_BAN_MS: i64 = 60 * 1000;
+/// Sources tracked at once. Larger than MAX_PENDING_HANDSHAKES, so a
+/// source with a handshake in progress always has its own entry.
+pub const SOURCE_SLOTS: usize = 64;
 
 const gpa = std.heap.page_allocator;
+
+fn nowMs(io: Io) i64 {
+    return Io.Clock.awake.now(io).toMilliseconds();
+}
+
+// ---------------------------------------------------------------------------
+// Per-source accounting: a fixed table, no allocation
+// ---------------------------------------------------------------------------
+
+/// Where an accepted connection comes from. IPv4 (also IPv4-mapped IPv6)
+/// is keyed by the full address, IPv6 by its /64, the smallest block one
+/// host usually controls. 127.0.0.1 and ::1 are exempt: a local TLS
+/// terminator dials from there, and limiting it would limit every node.
+pub const Source = struct {
+    key: [16]u8,
+    exempt: bool,
+
+    pub fn of(addr: Io.net.IpAddress) Source {
+        var key = [_]u8{0} ** 16;
+        switch (addr) {
+            .ip4 => |a| {
+                key[10] = 0xff;
+                key[11] = 0xff;
+                @memcpy(key[12..16], &a.bytes);
+            },
+            .ip6 => |a| {
+                const mapped_prefix = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
+                if (std.mem.eql(u8, a.bytes[0..12], &mapped_prefix)) {
+                    key = a.bytes;
+                } else {
+                    const loopback6 = [_]u8{0} ** 15 ++ [_]u8{1};
+                    if (std.mem.eql(u8, &a.bytes, &loopback6)) return .{ .key = a.bytes, .exempt = true };
+                    @memcpy(key[0..8], a.bytes[0..8]);
+                }
+            },
+        }
+        const loopback4 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 };
+        return .{ .key = key, .exempt = std.mem.eql(u8, &key, &loopback4) };
+    }
+};
+
+pub const Admission = enum { admitted, busy, banned };
+
+/// How a handshake ended, for the failure count of its source.
+pub const Outcome = enum {
+    /// The peer proved the secret (also when its name was then refused).
+    authenticated,
+    /// Bad or missing HELLO, wrong MAC, unknown name, deadline.
+    failed,
+    /// Local trouble (socket option, allocation): not the peer's fault.
+    neutral,
+};
+
+const SourceEntry = struct {
+    used: bool = false,
+    key: [16]u8 = undefined,
+    pending: u8 = 0,
+    fails: u8 = 0,
+    window_start_ms: i64 = 0,
+    ban_until_ms: i64 = 0,
+    last_ms: i64 = 0,
+
+    fn idle(e: *const SourceEntry, now: i64) bool {
+        return e.pending == 0 and e.ban_until_ms <= now and
+            (e.fails == 0 or now - e.window_start_ms > AUTH_FAIL_WINDOW_MS);
+    }
+};
+
+/// Pending handshakes and failure bans per source, in constant memory.
+/// When every slot holds state, the least recently seen entry without a
+/// handshake in progress is reused, so a flood of fresh addresses can
+/// flush a ban early but never makes the table refuse a source it does
+/// not track. The global handshake cap still applies to everyone.
+pub const SourceTable = struct {
+    entries: [SOURCE_SLOTS]SourceEntry = [_]SourceEntry{.{}} ** SOURCE_SLOTS,
+
+    fn find(t: *SourceTable, key: [16]u8) ?*SourceEntry {
+        for (&t.entries) |*e| {
+            if (e.used and std.mem.eql(u8, &e.key, &key)) return e;
+        }
+        return null;
+    }
+
+    fn slotFor(t: *SourceTable, now: i64) ?*SourceEntry {
+        var victim: ?*SourceEntry = null;
+        for (&t.entries) |*e| {
+            if (!e.used or e.idle(now)) return e;
+            if (e.pending != 0) continue;
+            if (victim == null or e.last_ms < victim.?.last_ms) victim = e;
+        }
+        return victim;
+    }
+
+    /// Count a new handshake from `key`, or say why it is refused.
+    pub fn admit(t: *SourceTable, key: [16]u8, now: i64) Admission {
+        const e = t.find(key) orelse blk: {
+            // Unreachable while SOURCE_SLOTS > MAX_PENDING_HANDSHAKES;
+            // if it ever happens, the global cap alone decides.
+            const slot = t.slotFor(now) orelse return .admitted;
+            slot.* = .{ .used = true, .key = key };
+            break :blk slot;
+        };
+        e.last_ms = now;
+        if (e.ban_until_ms > now) return .banned;
+        if (e.pending >= MAX_PENDING_PER_SOURCE) return .busy;
+        e.pending += 1;
+        return .admitted;
+    }
+
+    /// End a handshake admitted for `key`. Returns true when this failure
+    /// started a ban.
+    pub fn finish(t: *SourceTable, key: [16]u8, outcome: Outcome, now: i64) bool {
+        const e = t.find(key) orelse return false;
+        if (e.pending > 0) e.pending -= 1;
+        e.last_ms = now;
+        switch (outcome) {
+            .neutral => {},
+            .authenticated => e.fails = 0,
+            .failed => {
+                if (e.fails == 0 or now - e.window_start_ms > AUTH_FAIL_WINDOW_MS) {
+                    e.window_start_ms = now;
+                    e.fails = 0;
+                }
+                e.fails += 1;
+                if (e.fails >= AUTH_FAIL_LIMIT) {
+                    e.fails = 0;
+                    e.ban_until_ms = now + AUTH_BAN_MS;
+                    return true;
+                }
+            },
+        }
+        return false;
+    }
+};
 
 pub const Hub = struct {
     io: Io,
@@ -53,9 +197,31 @@ pub const Hub = struct {
     /// Live handshake/reader threads; tests wait for zero.
     threads: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Per-source pending counts and failure bans (fixed size).
+    sources_mutex: Io.Mutex = .init,
+    sources: SourceTable = .{},
 
     pub fn init(io: Io, cfg: *const config.Config, secrets: link.SecretSet) Hub {
         return .{ .io = io, .cfg = cfg, .secrets = secrets };
+    }
+
+    fn admitSource(self: *Hub, src: Source) Admission {
+        if (src.exempt) return .admitted;
+        self.sources_mutex.lockUncancelable(self.io);
+        defer self.sources_mutex.unlock(self.io);
+        return self.sources.admit(src.key, nowMs(self.io));
+    }
+
+    fn finishSource(self: *Hub, src: Source, addr: Io.net.IpAddress, outcome: Outcome) void {
+        if (src.exempt) return;
+        const banned = blk: {
+            self.sources_mutex.lockUncancelable(self.io);
+            defer self.sources_mutex.unlock(self.io);
+            break :blk self.sources.finish(src.key, outcome, nowMs(self.io));
+        };
+        if (banned) std.debug.print("hub: refusing {f} for {d} s after {d} failed handshakes\n", .{
+            addr, @divTrunc(AUTH_BAN_MS, 1000), AUTH_FAIL_LIMIT,
+        });
     }
 
     /// Insert an authenticated link. An existing link with the same name is
@@ -419,14 +585,15 @@ fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) !Authenticated {
     return .{ .name = hello.name, .welcome = welcome };
 }
 
-const Accepted = struct { hub: *Hub, stream: Io.net.Stream };
+const Accepted = struct { hub: *Hub, stream: Io.net.Stream, source: Source };
 
 fn linkThread(acc: *Accepted) void {
     const hub = acc.hub;
     const stream = acc.stream;
+    const source = acc.source;
     gpa.destroy(acc);
     defer _ = hub.threads.fetchSub(1, .acq_rel);
-    const ln = authenticate(hub, stream) orelse return;
+    const ln = authenticate(hub, stream, source) orelse return;
     defer ln.release(); // the reader's reference
     defer hub.unregister(ln);
     defer ln.kill();
@@ -437,8 +604,12 @@ fn linkThread(acc: *Accepted) void {
 
 /// Handshake, WELCOME and registration; closes the stream on any failure.
 /// The handshake slot is released before the link becomes a reader.
-fn authenticate(hub: *Hub, stream: Io.net.Stream) ?*Link {
+fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
+    // The peer address is read before any close below can free the socket.
+    const peer = stream.socket.address;
+    var outcome: Outcome = .neutral;
     defer _ = hub.handshakes.fetchSub(1, .acq_rel);
+    defer hub.finishSource(source, peer, outcome);
     const fd = stream.socket.handle;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -448,9 +619,13 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream) ?*Link {
     };
     const auth = handshake(hub, arena_state.allocator(), fd) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
+        // Out of memory or entropy is ours; everything else is the peer's
+        // doing (no or bad HELLO, wrong MAC, unknown name, deadline).
+        outcome = if (@as(anyerror, err) == error.OutOfMemory) .neutral else .failed;
         stream.close(hub.io);
         return null;
     };
+    outcome = .authenticated;
     // Two live processes under one name would otherwise evict each other
     // forever. Keep the link that still answers; refuse the newcomer before
     // WELCOME, so it learns why and retries only at its backoff. Only an
@@ -527,22 +702,34 @@ fn pinger(hub: *Hub) void {
 }
 
 /// Hand an accepted stream to a link thread, or close it when the
-/// handshake budget is spent.
+/// handshake budget (global or per source) is spent or the source is
+/// banned after repeated failed handshakes.
 pub fn adopt(hub: *Hub, stream: Io.net.Stream) void {
     if (hub.handshakes.fetchAdd(1, .acq_rel) >= MAX_PENDING_HANDSHAKES) {
         _ = hub.handshakes.fetchSub(1, .acq_rel);
         stream.close(hub.io);
         return;
     }
+    const source = Source.of(stream.socket.address);
+    switch (hub.admitSource(source)) {
+        .admitted => {},
+        .busy, .banned => {
+            _ = hub.handshakes.fetchSub(1, .acq_rel);
+            stream.close(hub.io);
+            return;
+        },
+    }
     const acc = gpa.create(Accepted) catch {
+        hub.finishSource(source, stream.socket.address, .neutral);
         _ = hub.handshakes.fetchSub(1, .acq_rel);
         stream.close(hub.io);
         return;
     };
-    acc.* = .{ .hub = hub, .stream = stream };
+    acc.* = .{ .hub = hub, .stream = stream, .source = source };
     _ = hub.threads.fetchAdd(1, .acq_rel);
     const t = std.Thread.spawn(.{}, linkThread, .{acc}) catch {
         _ = hub.threads.fetchSub(1, .acq_rel);
+        hub.finishSource(source, stream.socket.address, .neutral);
         _ = hub.handshakes.fetchSub(1, .acq_rel);
         gpa.destroy(acc);
         stream.close(hub.io);
@@ -877,4 +1064,130 @@ test "hub caps handshakes in progress" {
     try testing.expectEqual(@as(usize, 0), n);
     try testing.expectEqual(MAX_PENDING_HANDSHAKES, fx.hub.handshakes.load(.acquire));
     fx.hub.handshakes.store(0, .release);
+}
+
+test "source key: IPv4, mapped IPv4, IPv6 /64 and loopback exemption" {
+    const a = Source.of(try Io.net.IpAddress.parse("192.0.2.7", 1));
+    const b = Source.of(try Io.net.IpAddress.parse("::ffff:192.0.2.7", 2));
+    try testing.expect(!a.exempt);
+    try testing.expectEqualSlices(u8, &a.key, &b.key);
+    const c = Source.of(try Io.net.IpAddress.parse("2001:db8:1:2:aaaa::1", 1));
+    const d = Source.of(try Io.net.IpAddress.parse("2001:db8:1:2:bbbb::9", 1));
+    const e = Source.of(try Io.net.IpAddress.parse("2001:db8:1:3::1", 1));
+    try testing.expectEqualSlices(u8, &c.key, &d.key);
+    try testing.expect(!std.mem.eql(u8, &c.key, &e.key));
+    try testing.expect(!std.mem.eql(u8, &a.key, &c.key));
+    try testing.expect(Source.of(try Io.net.IpAddress.parse("127.0.0.1", 1)).exempt);
+    try testing.expect(Source.of(try Io.net.IpAddress.parse("::1", 1)).exempt);
+    try testing.expect(Source.of(try Io.net.IpAddress.parse("::ffff:127.0.0.1", 1)).exempt);
+    try testing.expect(!Source.of(try Io.net.IpAddress.parse("127.0.0.2", 1)).exempt);
+}
+
+fn keyOf(comptime text: []const u8) ![16]u8 {
+    return Source.of(try Io.net.IpAddress.parse(text, 1)).key;
+}
+
+test "source table: per-source pending cap, others unaffected" {
+    var t: SourceTable = .{};
+    const a = try keyOf("192.0.2.1");
+    const b = try keyOf("192.0.2.2");
+    for (0..MAX_PENDING_PER_SOURCE) |_| try testing.expectEqual(Admission.admitted, t.admit(a, 0));
+    try testing.expectEqual(Admission.busy, t.admit(a, 0));
+    try testing.expectEqual(Admission.admitted, t.admit(b, 0));
+    // One finished handshake frees one slot for that source.
+    _ = t.finish(a, .authenticated, 1);
+    try testing.expectEqual(Admission.admitted, t.admit(a, 2));
+    try testing.expectEqual(Admission.busy, t.admit(a, 2));
+}
+
+test "source table: repeated failures ban a source for a while" {
+    var t: SourceTable = .{};
+    const a = try keyOf("198.51.100.9");
+    var now: i64 = 1000;
+    for (0..AUTH_FAIL_LIMIT) |i| {
+        try testing.expectEqual(Admission.admitted, t.admit(a, now));
+        const banned = t.finish(a, .failed, now);
+        try testing.expectEqual(i + 1 == AUTH_FAIL_LIMIT, banned);
+        now += 10;
+    }
+    try testing.expectEqual(Admission.banned, t.admit(a, now));
+    try testing.expectEqual(Admission.banned, t.admit(a, now + AUTH_BAN_MS - 20));
+    try testing.expectEqual(Admission.admitted, t.admit(a, now + AUTH_BAN_MS));
+}
+
+test "source table: success resets failures, old failures expire" {
+    var t: SourceTable = .{};
+    const a = try keyOf("198.51.100.10");
+    for (0..AUTH_FAIL_LIMIT - 1) |_| {
+        _ = t.admit(a, 0);
+        try testing.expect(!t.finish(a, .failed, 0));
+    }
+    _ = t.admit(a, 0);
+    try testing.expect(!t.finish(a, .authenticated, 0));
+    for (0..AUTH_FAIL_LIMIT - 1) |_| {
+        _ = t.admit(a, 0);
+        try testing.expect(!t.finish(a, .failed, 0));
+    }
+    // Past the window the count starts over instead of banning.
+    _ = t.admit(a, AUTH_FAIL_WINDOW_MS + 1);
+    try testing.expect(!t.finish(a, .failed, AUTH_FAIL_WINDOW_MS + 1));
+    // Neutral endings neither count nor reset.
+    _ = t.admit(a, AUTH_FAIL_WINDOW_MS + 2);
+    try testing.expect(!t.finish(a, .neutral, AUTH_FAIL_WINDOW_MS + 2));
+    try testing.expectEqual(Admission.admitted, t.admit(a, AUTH_FAIL_WINDOW_MS + 3));
+}
+
+test "source table: constant size, busy entries are never evicted" {
+    var t: SourceTable = .{};
+    // Fill every slot with a banned source, one of them also pending.
+    var keys: [SOURCE_SLOTS][16]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, @intCast(i) };
+        for (0..AUTH_FAIL_LIMIT) |_| {
+            _ = t.admit(k.*, 0);
+            _ = t.finish(k.*, .failed, 0);
+        }
+    }
+    t.entries[0].ban_until_ms = 0;
+    try testing.expectEqual(Admission.admitted, t.admit(keys[0], 1));
+    t.entries[0].ban_until_ms = AUTH_BAN_MS;
+    // A new source takes the least recently seen entry without a pending
+    // handshake; entry 0 (pending) keeps its state.
+    const fresh = try keyOf("203.0.113.5");
+    try testing.expectEqual(Admission.admitted, t.admit(fresh, 2));
+    try testing.expect(t.find(keys[0]) != null);
+    try testing.expectEqual(@as(u8, 1), t.find(keys[0]).?.pending);
+    try testing.expect(t.find(keys[1]) == null);
+    try testing.expectEqual(Admission.banned, t.admit(keys[2], 3));
+}
+
+test "hub refuses a source over its pending cap while another is served" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    const a = Source.of(try Io.net.IpAddress.parse("192.0.2.1", 1));
+    for (0..MAX_PENDING_PER_SOURCE) |_| try testing.expectEqual(Admission.admitted, fx.hub.admitSource(a));
+    // The accepted loopback peer is exempt, so drive admission through a
+    // stream whose recorded address is a non-loopback source.
+    var p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    p.near.socket.address = try Io.net.IpAddress.parse("192.0.2.1", 4000);
+    adopt(&fx.hub, p.near); // over the per-source cap: closed, no CHALLENGE
+    var buf: [16]u8 = undefined;
+    const n = os.net.socketReadSome(p.far.socket.handle, &buf, 5000) catch 0;
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(@as(u32, 0), fx.hub.handshakes.load(.acquire));
+
+    var q = try tcpPair(io, &fx.server);
+    defer q.far.close(io);
+    q.near.socket.address = try Io.net.IpAddress.parse("192.0.2.2", 4000);
+    adopt(&fx.hub, q.near); // another source still gets a CHALLENGE
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ch = try link.readFrame(arena_state.allocator(), q.far.socket.handle, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.challenge, ch.kind);
+    try link.writeFrame(q.far.socket.handle, .ping, 0, "12345678", 5000);
+    try waitZero(&fx.hub.threads);
+    for (0..MAX_PENDING_PER_SOURCE) |_| fx.hub.finishSource(a, try Io.net.IpAddress.parse("192.0.2.1", 1), .neutral);
 }
