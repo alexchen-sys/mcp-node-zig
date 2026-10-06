@@ -127,6 +127,11 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 | `MCP_NODE_SESSION_TTL_S` | `600` |
 | `MCP_NODE_MAX_OUT` | `400000` байт на поток |
 | `MCP_NODE_STDIO` | не задано; `1` — обслуживать одного клиента через stdin/stdout, без слушателя (то же, что `--stdio`) |
+| `MCP_NODE_AUDIT_FILE` | не задано; включает [аудит-лог](docs/audit-log.md) по этому пути |
+| `MCP_NODE_AUDIT_KEY_FILE` | не задано; HMAC-ключ цепочки аудита (0600), отдельный от токена и секрета связи |
+| `MCP_NODE_AUDIT_ARGS` | `summary`; `full` пишет argv и пути целиком, содержимое — никогда |
+| `MCP_NODE_AUDIT_ON_FULL` | `block`; `drop` сбрасывает записи при зависшем диске с цепочечным маркером `dropped` |
+| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864`; сверх этого файл уходит в `<file>.<first-seq>`, цепочка продолжается |
 
 Остальные (`MCP_NODE_NAME`, `MCP_NODE_ALLOWED_ORIGINS`, `MCP_NODE_SOCKET_TIMEOUT_S`, `MCP_NODE_TEXT_MIRROR`) описаны в [README.md](README.md#configuration).
 
@@ -146,7 +151,24 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 - Через чужие сети используйте `MCP_NODE_CONNECT_TLS=1`: нода всегда проверяет цепочку сертификатов и имя сервера, отключить проверку нельзя. Голый TCP оставьте для одного хоста или доверенной LAN.
 - Лимиты рукопожатий считаются по адресу источника: хаб ведёт не больше 16 неаутентифицированных рукопожатий всего и 4 с одного IPv4-адреса или IPv6 /64, а 8 неудачных рукопожатий за минуту блокируют источник на минуту. Адреса 127.0.0.1 и ::1 из лимита исключены, поэтому за локальным TLS-терминатором все ноды выглядят одним адресом: задайте лимит на IP в самом терминаторе (nginx `limit_conn`) и, где можно, откройте публичный порт в файрволе только для известных адресов. Со встроенным TLS-сервером хаб видит настоящий адрес пира, и лимиты работают в полную силу.
 
-Пока нет PTY и аудит-лога, оба в планах. Версия `0.1.x`, контракт может меняться.
+## Аудит-лог
+
+Задайте `MCP_NODE_AUDIT_FILE` — и каждый вызов инструмента оставляет одну
+append-only JSONL-запись, сцепленную HMAC-SHA256: правки, удаления и
+перестановки прошлых записей обнаруживаются офлайн:
+
+```sh
+openssl rand -hex 32 > audit-key && chmod 600 audit-key
+MCP_NODE_AUDIT_FILE=/var/log/mcp-node.jsonl MCP_NODE_AUDIT_KEY_FILE=./audit-key ./mcp-node
+mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
+```
+
+Нода пишет каждый `tools/call` (инструмент, транспорт, пир, сводку аргументов,
+результат), хаб пишет маршрутизацию `relay` и события линков; обе стороны
+сходятся по `req_id`. Скрипты, содержимое файлов и stdout не пишутся никогда.
+Подробности и модель угроз: [docs/audit-log.md](docs/audit-log.md).
+
+Пока нет PTY, в планах. Версия `0.1.x`, контракт может меняться.
 
 ## Ссылки
 

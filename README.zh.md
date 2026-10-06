@@ -211,10 +211,31 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 | `MCP_NODE_MAX_INFLIGHT_BYTES` | `67108864`，在途请求体的总大小上限 |
 | `MCP_NODE_TEXT_MIRROR` | `1`；设为 `0` 时只返回 `structuredContent`，响应体积减半 |
 | `MCP_NODE_INSECURE` | 未设置；设为 `1` 时允许空 token（不建议） |
+| `MCP_NODE_AUDIT_FILE` | 未设置；在此路径启用[审计日志](docs/audit-log.md) |
+| `MCP_NODE_AUDIT_KEY_FILE` | 未设置；审计链的 HMAC 密钥（0600），独立于 token 和链路密钥 |
+| `MCP_NODE_AUDIT_ARGS` | `summary`；`full` 记录完整 argv 与路径，但绝不记录内容 |
+| `MCP_NODE_AUDIT_ON_FULL` | `block`；`drop` 在磁盘卡顿时丢弃记录并留下带链的 `dropped` 标记 |
+| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864`；超过后文件更名为 `<file>.<first-seq>`，链在新文件中延续 |
 
 `mcp-node --version` 输出版本号，`--help` 输出参数说明；除这两个和 `--connect` 之外，传入其他参数都会报错。
 
 反向连接相关变量（`MCP_NODE_CONNECT*`、`MCP_NODE_HUB_*`）见 [docs/reverse-connect.md](docs/reverse-connect.md)。
+
+## 审计日志
+
+设置 `MCP_NODE_AUDIT_FILE` 后，每次工具调用都会留下一条仅追加的 JSONL 记录，
+记录之间用 HMAC-SHA256 链接，因此对历史记录的篡改、删除和乱序都可以离线检测：
+
+```sh
+openssl rand -hex 32 > audit-key && chmod 600 audit-key
+MCP_NODE_AUDIT_FILE=/var/log/mcp-node.jsonl MCP_NODE_AUDIT_KEY_FILE=./audit-key ./mcp-node
+mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
+```
+
+节点记录每个 `tools/call`（工具、传输方式、对端、按工具白名单的参数摘要、结果），
+枢纽记录 `relay` 路由与链路生命周期；两侧通过 `req_id` 关联。
+脚本、文件内容和 stdout 在任何模式下都不会被记录。
+详见 [docs/audit-log.md](docs/audit-log.md)（含威胁模型）。
 
 ## 故障排查
 
@@ -229,7 +250,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 
 ## 局限
 
-仅支持明文 HTTP，不支持 PTY（交互式 TUI 无法使用），暂无审计日志。这三项都已列入路线图。API 版本为 `0.1.x`，后续可能变动。
+仅支持明文 HTTP，不支持 PTY（交互式 TUI 无法使用）。这两项都已列入路线图。API 版本为 `0.1.x`，后续可能变动。
 
 ## 从源码构建
 

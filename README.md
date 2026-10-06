@@ -141,6 +141,23 @@ any sessions still running.
 
 `--stdio` can't be combined with `--connect` or `MCP_NODE_HUB_LISTEN`.
 
+## Audit log
+
+Set `MCP_NODE_AUDIT_FILE` and every tool call leaves one append-only JSONL
+record, chained with HMAC-SHA256 so edits, deletions and reordering of past
+records are detectable offline:
+
+```sh
+openssl rand -hex 32 > audit-key && chmod 600 audit-key
+MCP_NODE_AUDIT_FILE=/var/log/mcp-node.jsonl MCP_NODE_AUDIT_KEY_FILE=./audit-key ./mcp-node
+mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
+```
+
+The node records each `tools/call` (tool, transport, peer, per-tool argument
+summary, result), the hub records `relay` routing plus link lifecycle; the
+two join by `req_id`. Scripts, file contents and stdout are never logged.
+Details and the threat model: [docs/audit-log.md](docs/audit-log.md).
+
 ## Tools
 
 | Tool | Does |
@@ -244,9 +261,16 @@ Environment variables only.
 | `MCP_NODE_TEXT_MIRROR` | `1`; `0` returns `structuredContent` only, halving response size |
 | `MCP_NODE_INSECURE` | unset; `1` allows an empty token (avoid) |
 | `MCP_NODE_STDIO` | unset; `1` serves one client over stdin/stdout, no listener (same as `--stdio`) |
+| `MCP_NODE_AUDIT_FILE` | unset; enables the [audit log](docs/audit-log.md) at this path |
+| `MCP_NODE_AUDIT_KEY_FILE` | unset; HMAC key for the audit chain (0600), separate from token and link secret |
+| `MCP_NODE_AUDIT_ARGS` | `summary`; `full` logs full argv and paths, never contents |
+| `MCP_NODE_AUDIT_ON_FULL` | `block`; `drop` sheds records under a stuck disk with a chained `dropped` marker |
+| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864`; past this the file rotates to `<file>.<first-seq>` and the chain continues |
 
 `mcp-node --version` prints the version, `--help` the flags; any other
-argument than these, `--connect` and `--stdio` is an error.
+argument than these, `--connect` and `--stdio` is an error. The one
+subcommand is `mcp-node audit-verify [--anchor] <file>...`, which checks an
+audit log chain offline.
 
 Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 [docs/reverse-connect.md](docs/reverse-connect.md).
@@ -264,7 +288,7 @@ Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 
 ## Limitations
 
-Plain HTTP only, no PTY (interactive TUIs won't work), no audit log yet. All three are on the roadmap. The API is `0.1.x` and may change.
+Plain HTTP only, no PTY (interactive TUIs won't work). Both are on the roadmap. The API is `0.1.x` and may change.
 
 ## Build from source
 
