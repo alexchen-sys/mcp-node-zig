@@ -635,6 +635,13 @@ def case_tls_link(env):
         env.start_node('tlsnode', target=target, extra={
             'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'good-ca.pem')})
         check(env.wait_node('tlsnode', 15), 'TLS node never appeared in /n')
+        status, reply = env.rpc('tlsnode', 'initialize', {
+            'protocolVersion': '2025-06-18', 'capabilities': {},
+            'clientInfo': {'name': 'tls-e2e', 'version': '0'}})
+        check(status == 200 and 'result' in reply, (status, reply))
+        status, reply = env.rpc('tlsnode', 'tools/list', {})
+        tools = reply.get('result', {}).get('tools', []) if isinstance(reply, dict) else []
+        check(status == 200 and len(tools) == 13, (status, len(tools)))
         out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-tls'], 'timeout': 10})
         check(out.get('ok') and out.get('stdout') == 'over-tls\n', out)
 
@@ -661,11 +668,94 @@ def case_tls_link(env):
             'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'other-ca.pem')})
         failed = wait_until(lambda: 'TLS handshake failed' in bad.logs(), 10, 0.1)
         check(failed, 'untrusted CA was not rejected: ' + bad.logs()[-1000:])
+        check('TlsCertificateNotVerified' in bad.logs(), bad.logs()[-1000:])
         time.sleep(1.5)
         check('tlsbad' not in env.nodes(), env.nodes())
         check(bad.alive(), 'node must keep retrying, not exit')
+
+        # Trusted CA, but the name to verify is not in the certificate.
+        sni = env.start_node('tlssni', target=target, extra={
+            'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'good-ca.pem'),
+            'MCP_NODE_CONNECT_SERVER_NAME': 'not-this-host.example'})
+        failed = wait_until(lambda: 'TLS handshake failed' in sni.logs(), 10, 0.1)
+        check(failed, 'wrong server name was not rejected: ' + sni.logs()[-1000:])
+        check('CertificateHostMismatch' in sni.logs(), sni.logs()[-1000:])
+        check('tlssni' not in env.nodes(), env.nodes())
     finally:
         term.close()
+
+
+def _dial_from(src_ip, port):
+    s = socket.socket()
+    s.settimeout(5)
+    s.bind((src_ip, 0))
+    s.connect(('127.0.0.1', port))
+    return s
+
+
+def _first_frame_type(sock):
+    """Type of the first frame the hub sends, or None when it closes first."""
+    buf = b''
+    try:
+        while len(buf) < 9:
+            chunk = sock.recv(9 - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+    except (ConnectionResetError, socket.timeout):
+        return None
+    return buf[4]
+
+
+CHALLENGE = 2
+
+
+def case_per_source_pending_cap(env):
+    if sys.platform != 'linux':
+        raise SkipCase('needs the whole 127/8 on loopback')
+    env.start_hub()
+    held = []
+    try:
+        for _ in range(4):
+            s = _dial_from('127.0.0.2', env.link_port)
+            held.append(s)
+            check(_first_frame_type(s) == CHALLENGE, 'pending handshake from 127.0.0.2 not served')
+        fifth = _dial_from('127.0.0.2', env.link_port)
+        held.append(fifth)
+        check(_first_frame_type(fifth) is None, '5th pending handshake from one source got a CHALLENGE')
+        other = _dial_from('127.0.0.3', env.link_port)
+        held.append(other)
+        check(_first_frame_type(other) == CHALLENGE, 'another source was refused')
+        # A real node from loopback (exempt, like a local TLS terminator)
+        # still connects while 127.0.0.2 holds its four slots.
+        env.start_node('alpha')
+        check(env.wait_node('alpha'), 'node did not connect next to a capped source')
+    finally:
+        for s in held:
+            s.close()
+
+
+def case_failed_handshakes_ban_source(env):
+    if sys.platform != 'linux':
+        raise SkipCase('needs the whole 127/8 on loopback')
+    hub = env.start_hub()
+    for _ in range(8):
+        s = _dial_from('127.0.0.4', env.link_port)
+        check(_first_frame_type(s) == CHALLENGE, 'source refused before the failure limit')
+        s.sendall(struct.pack('>IBI', 8, 6, 0) + b'12345678')  # PING instead of HELLO
+        try:
+            while s.recv(512):
+                pass
+        except OSError:
+            pass
+        s.close()
+    check(wait_until(lambda: 'failed handshakes' in hub.logs(), 5), hub.logs()[-800:])
+    s = _dial_from('127.0.0.4', env.link_port)
+    check(_first_frame_type(s) is None, 'banned source still got a CHALLENGE')
+    s.close()
+    s = _dial_from('127.0.0.5', env.link_port)
+    check(_first_frame_type(s) == CHALLENGE, 'ban leaked to another source')
+    s.close()
 
 
 CASES = [
@@ -681,7 +771,9 @@ CASES = [
     ('a live name is kept, a second node is refused', case_live_name_is_kept),
     ('default listener mode unaffected', case_listen_mode_unaffected),
     ('a second listener on a taken port fails with AddressInUse', case_second_listener_refused),
-    ('TLS link: trusted CA connects and serves exec, other CA never appears', case_tls_link),
+    ('TLS link: trusted CA connects and serves exec, other CA and wrong name never appear', case_tls_link),
+    ('per-source cap: 5th pending handshake from one IP refused, other IP served', case_per_source_pending_cap),
+    ('repeated failed handshakes ban the source, not others', case_failed_handshakes_ban_source),
 ]
 
 
