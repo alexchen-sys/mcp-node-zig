@@ -13,6 +13,12 @@
 #define MBEDTLS_THREADING_C
 #define MBEDTLS_THREADING_ALT
 
+/* check_config.h makes PLATFORM_C mandatory on Windows; mingw also
+ * auto-defines MBEDTLS_PLATFORM_SNPRINTF_ALT, which requires it. */
+#if defined(_WIN32)
+#define MBEDTLS_PLATFORM_C
+#endif
+
 /* Crypto primitives. With no MBEDTLS_PSA_CRYPTO_CONFIG, PSA derives its
  * algorithm set from these legacy symbols. */
 #define MBEDTLS_AES_C
@@ -60,6 +66,10 @@
 #define MBEDTLS_SSL_TLS_C
 #define MBEDTLS_SSL_SRV_C
 #define MBEDTLS_SSL_PROTO_TLS1_3
+/* Middlebox compatibility mode: send a dummy ChangeCipherSpec after
+ * ServerHello. Some TLS 1.3 clients (Zig std among them) only switch to
+ * decrypting handshake records when that record arrives. */
+#define MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE
 /* check_config.h requires keeping the peer cert for TLS 1.3. */
 #define MBEDTLS_SSL_KEEP_PEER_CERTIFICATE
 /* TLS 1.3 ephemeral key exchange: the mode every certificate-based
