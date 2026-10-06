@@ -108,6 +108,8 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 
 私有 CA 请加 `MCP_NODE_CONNECT_CA_FILE`；按 IP 连接时设置 `MCP_NODE_CONNECT_SERVER_NAME`。终结器配置和可信局域网下的明文 TCP 方式见 [docs/reverse-connect.md](docs/reverse-connect.md)。
 
+用 `-Dtls-server` 构建的二进制可以在节点链路端口上直接提供 TLS（`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`），无需前置终结器；此时枢纽能看到真实的对端地址，按来源的握手限制完全生效。
+
 ## 工具
 
 | 工具 | 作用 |
@@ -186,7 +188,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 - **节点密钥等于该节点上的 shell，并占有其名称。** `name:secret` 每行为一个名称设置独立密钥；单一共享密钥允许持有者以任意名称连接。
 - **握手只做认证，不保护链路。** 双方用基于新鲜 nonce 的 HMAC-SHA256 证明密钥，但之后的帧在明文 TCP 上既不加密也没有完整性保护。
 - **跨越不受你控制的网络时使用 TLS。** `MCP_NODE_CONNECT_TLS=1` 让节点始终校验证书链和服务器名，无法关闭校验。明文 TCP 只用于同一主机或可信局域网。
-- **握手限制按来源地址计算。** 枢纽总共最多进行 16 个未认证的握手，来自同一 IPv4 地址或 IPv6 /64 的最多 4 个；同一来源一分钟内失败 8 次握手会被拒绝一分钟。127.0.0.1 和 ::1 不受此限制，所以在本机 TLS 终结器后面所有节点看起来来自同一地址：请在终结器上设置按 IP 的限制（nginx `limit_conn`），并尽量用防火墙把公网端口限制到已知来源。
+- **握手限制按来源地址计算。** 枢纽总共最多进行 16 个未认证的握手，来自同一 IPv4 地址或 IPv6 /64 的最多 4 个；同一来源一分钟内失败 8 次握手会被拒绝一分钟。127.0.0.1 和 ::1 不受此限制，所以在本机 TLS 终结器后面所有节点看起来来自同一地址：请在终结器上设置按 IP 的限制（nginx `limit_conn`），并尽量用防火墙把公网端口限制到已知来源。使用内置 TLS 服务器时枢纽能看到真实的对端地址，上述限制完全生效。
 - **不在范围内：** 按工具或路径的权限、沙箱、审计日志，以及已被攻破的枢纽或节点主机。
 
 ## 配置

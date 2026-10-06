@@ -111,6 +111,11 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
   ./mcp-node --connect hub.example.com:8400
 ```
 
+A binary built with `-Dtls-server` can serve TLS on the link port itself
+(`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`), with no
+terminator in front; the hub then sees the real peer addresses, so its
+per-source handshake limits apply as written.
+
 Full setup, a terminator config and the plain TCP variant for trusted
 networks are in [docs/reverse-connect.md](docs/reverse-connect.md).
 
@@ -210,12 +215,12 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 ## Security model
 
 - **Whoever holds the client token runs commands.** On a plain node that means the node; on a hub the token reaches every connected node, so treat the hub token as the sum of them.
-- **The hub sees everything.** TLS ends in front of it, so it handles every request and response in plaintext, and a hub that holds a node's secret can run anything on that node.
+- **The hub sees everything.** TLS ends on it (or in front of it), so it handles every request and response in plaintext, and a hub that holds a node's secret can run anything on that node.
 - **A node secret is a shell on that node and owns its name.** With `name:secret` lines each name has its own secret; a single shared secret lets any holder connect under any name, including one not yet taken.
 - **The handshake authenticates, it does not protect the link.** Hub and node prove the secret with HMAC-SHA256 over fresh nonces, but later frames are neither encrypted nor integrity-protected: over plain TCP an active relay can read and change them.
-- **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. The hub has no TLS server, so terminate TLS in front of its link port and keep that port on loopback.
+- **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. A binary built with `-Dtls-server` serves TLS on the hub's link port itself (see [Reverse connect](#reverse-connect-no-inbound-ports)); otherwise terminate TLS in front of that port and keep it on loopback.
 - **Plain TCP links are for the same host or a trusted LAN.**
-- **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. 127.0.0.1 and ::1 are exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can.
+- **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. 127.0.0.1 and ::1 are exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can. With the built-in TLS server the hub sees the real peer address, so these limits work fully.
 - **Out of scope:** per-tool or per-path permissions, sandboxing, audit logs, and a compromised hub or node host. The node runs with the full rights of its OS user.
 
 ## Configuration

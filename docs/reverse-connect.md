@@ -11,9 +11,37 @@ MCP client --HTTP+token--> hub :8341  /n/<name>/mcp
 
 ## Quickstart
 
-The default setup runs the link over TLS. The hub has no TLS server of its
-own, so its link port stays on loopback and a TLS terminator in front of it
-takes the public port.
+The default setup runs the link over TLS. Two ways to terminate it:
+
+- **Built-in TLS server** (binary built with `-Dtls-server`): the hub
+  serves TLS 1.3 on its link port itself, from a PEM certificate and key
+  (`MCP_NODE_HUB_TLS_CERT_FILE`, `MCP_NODE_HUB_TLS_KEY_FILE`). No other
+  process in front, and the hub sees the real peer address, so its
+  per-source handshake limits apply fully.
+- **External terminator** (any binary): the link port stays on loopback
+  and nginx `stream`, stunnel or HAProxy serves TLS on the public port.
+
+### Built-in TLS server
+
+The default release binaries are built without it; build from source with
+`zig build -Dtls-server` (that compiles mbedTLS 3.6 LTS in; the license
+stays Apache-2.0). Then:
+
+```sh
+# hub serves TLS 1.3 on the public port itself
+MCP_NODE_HUB_LISTEN=0.0.0.0:8400 MCP_NODE_HUB_SECRET_FILE=nodes \
+  MCP_NODE_HUB_TLS_CERT_FILE=hub.crt MCP_NODE_HUB_TLS_KEY_FILE=hub.key \
+  ./mcp-node
+```
+
+Both variables must be set together; a binary built without the flag
+refuses them with a startup error. The certificate file may hold a chain
+(leaf first). Store the key file with `0600` permissions, like any node
+secret. TLS versions are pinned to 1.3, and the node side
+(`MCP_NODE_CONNECT_TLS=1`) always verifies the certificate chain and
+server name.
+
+### External terminator
 
 On the hub (a host the node can reach):
 
@@ -83,6 +111,8 @@ this only where nobody you don't trust can sit on the path.
 | `MCP_NODE_CONNECT_SERVER_NAME` | node | name to verify; default: host part of connect |
 | `MCP_NODE_HUB_LISTEN` | hub | `ip:port` for node links |
 | `MCP_NODE_HUB_SECRET_FILE` | hub | one shared secret, or `name:secret` lines |
+| `MCP_NODE_HUB_TLS_CERT_FILE` | hub | PEM certificate (chain) for the built-in TLS server; needs a `-Dtls-server` build |
+| `MCP_NODE_HUB_TLS_KEY_FILE` | hub | PEM private key for it; both or neither |
 
 Connect and hub modes are mutually exclusive. A node needs no client token
 file: it never accepts connections. With neither variable set, the binary
@@ -166,7 +196,8 @@ do not survive a node restart.
   relay. Across untrusted networks use TLS (`MCP_NODE_CONNECT_TLS=1`).
 - `MCP_NODE_CONNECT_TLS=1` makes the node a TLS client (Zig std TLS 1.2/1.3)
   that always verifies the certificate chain and server name; there is no
-  insecure switch. The hub has no TLS server of its own: terminate TLS in front
+  insecure switch. On the hub side, either build with `-Dtls-server` and let
+  the hub serve TLS 1.3 itself (mbedTLS 3.6 LTS), or terminate TLS in front
   of the link port, for example with stunnel, HAProxy or nginx `stream`.
 - Beyond the secret (and the certificate, with TLS) there is no further
   identity check. A secret is a shell on that node; store it with `0600`
@@ -194,7 +225,8 @@ do not survive a node restart.
   arrives from loopback, so these limits do not apply there: limit
   connections per IP in the terminator (nginx `limit_conn`, HAProxy
   `src_conn_cur`) and firewall the public port to known sources where you
-  can.
+  can. With the built-in TLS server the hub sees the real peer address, so
+  the limits apply as written.
 - Each link has one write lock, so a large response delays the other
   frames on the same link until it is written.
 - A relayed request waits for its node up to max(socket timeout, 1 h).
@@ -206,7 +238,9 @@ do not survive a node restart.
 
 ## What it deliberately does not do
 
-- No TLS server in the hub, no own cryptography beyond std HMAC and TLS.
+- No own cryptography beyond std HMAC and TLS; the opt-in `-Dtls-server`
+  build embeds mbedTLS 3.6 LTS for the hub's TLS server and calls only its
+  public API.
 - No hub clustering, persistence or request replay.
 - No streaming of partial output across the link; each RPC is one request and
   one response, as on `/mcp`.
@@ -219,6 +253,8 @@ Measured on x86_64 Linux, ReleaseSafe:
 - binary: 4.30 MiB before this feature, 8.70 MiB with the link, hub and TLS
   client (x86_64 baseline ReleaseSafe; +4.4 MiB, almost all of it std TLS
   and X.509 parsing; the link and hub alone added about 0.6 MiB);
+  the opt-in `-Dtls-server` build adds 2.67 MiB of mbedTLS on top
+  (11.42 MiB against 8.75 MiB, x86_64-linux ReleaseSafe, mbedTLS 3.6.7);
 - idle memory after 6 s, each mode started from its own copy of the binary
   so that no file pages are shared:
 
