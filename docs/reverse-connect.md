@@ -11,23 +11,65 @@ MCP client --HTTP+token--> hub :8341  /n/<name>/mcp
 
 ## Quickstart
 
+The default setup runs the link over TLS. The hub has no TLS server of its
+own, so its link port stays on loopback and a TLS terminator in front of it
+takes the public port.
+
 On the hub (a host the node can reach):
 
 ```sh
+umask 077
 printf '%s' "$(openssl rand -hex 32)" > token          # client token, as before
 printf 'laptop:%s\n' "$(openssl rand -hex 32)" > nodes  # one line per node
-MCP_NODE_HUB_LISTEN=0.0.0.0:8400 MCP_NODE_HUB_SECRET_FILE=nodes ./mcp-node
+MCP_NODE_HUB_LISTEN=127.0.0.1:8401 MCP_NODE_HUB_SECRET_FILE=nodes ./mcp-node
+```
+
+In front of it, nginx `stream` (or stunnel, HAProxy) terminates TLS on the
+public port `8400` and passes plain TCP to `127.0.0.1:8401`:
+
+```nginx
+# needs the stream module; where it is built as a dynamic module, also
+# load_module modules/ngx_stream_module.so; at the top level
+stream {
+    server {
+        listen 8400 ssl;
+        ssl_certificate     /etc/mcp-node/hub.crt;  # cert for hub.example.com
+        ssl_certificate_key /etc/mcp-node/hub.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        proxy_pass          127.0.0.1:8401;
+    }
+}
 ```
 
 On the node (`secret` holds only the part after `laptop:`):
 
 ```sh
-MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret \
+MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 \
   ./mcp-node --connect hub.example.com:8400
 ```
 
+The node verifies the certificate against the system store and the name
+`hub.example.com`. For a private CA or a self-signed certificate add
+`MCP_NODE_CONNECT_CA_FILE=hub-ca.pem`; if you dial an IP or another name
+than the one in the certificate, set `MCP_NODE_CONNECT_SERVER_NAME`.
+
 Clients point at `http://127.0.0.1:8341/n/laptop/mcp` with the usual token.
 `POST /n` lists connected nodes (`name`, `connected_s`, `inflight`).
+
+### Plain TCP (same host or trusted LAN only)
+
+Without a terminator, the hub can listen for links directly and the node
+dials without `MCP_NODE_CONNECT_TLS`:
+
+```sh
+MCP_NODE_HUB_LISTEN=192.168.1.10:8400 MCP_NODE_HUB_SECRET_FILE=nodes ./mcp-node
+MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret \
+  ./mcp-node --connect 192.168.1.10:8400
+```
+
+The handshake still authenticates both sides, but the frames after it are
+neither encrypted nor integrity-protected (see [Security](#security)). Use
+this only where nobody you don't trust can sit on the path.
 
 ## Configuration
 
@@ -132,8 +174,9 @@ do not survive a node restart.
 ## Limits
 
 - The hub keeps at most 16 unauthenticated handshakes at once; further
-  connections are closed at once. If the link port is reachable from the
-  internet, firewall it to known sources.
+  connections are closed at once. There is no per-IP limit, so one source
+  can hold all 16 slots. If the link port is reachable from the internet,
+  firewall it to known sources.
 - Each link has one write lock, so a large response delays the other
   frames on the same link until it is written.
 - A relayed request waits for its node up to max(socket timeout, 1 h).

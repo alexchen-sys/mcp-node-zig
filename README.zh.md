@@ -92,11 +92,21 @@ mcp-node 是面向智能体的执行 API。通过 SSH，智能体拿到的是一
 - **可校验的文件写入。** `write_file` 接收 base64，并返回实际落盘内容的 SHA-256。
 - **自描述的接口。** 任何 MCP 客户端都能通过 `tools/list` 发现工具，无需额外教智能体。
 
-速度不是重点：连接建立后，两者都很快。mcp-node 本身不做加密，所以对远程机器的常见做法是两者配合：节点监听 `127.0.0.1`，你通过 SSH 隧道（`ssh -L 8341:127.0.0.1:8341 host`）、VPN 或 TLS 反向代理访问它。
+速度不是重点：连接建立后，两者都很快。mcp-node 的 HTTP 服务本身不做加密，所以对远程机器的常见做法是两者配合：节点监听 `127.0.0.1`，你通过 SSH 隧道（`ssh -L 8341:127.0.0.1:8341 host`）、VPN 或 TLS 反向代理访问它。
 
 ## 反向连接（无需入站端口）
 
-对于位于 NAT 后面或没有 sshd 的机器，用 `--connect hub:port` 启动节点：它会主动连接枢纽（即设置了 `MCP_NODE_HUB_LISTEN` 的同一个二进制文件），客户端通过枢纽上的 `/n/<name>/mcp` 访问它。详见 [docs/reverse-connect.md](docs/reverse-connect.md)。
+对于位于 NAT 后面或没有 sshd 的机器，用 `--connect hub:port` 启动节点：它会主动连接枢纽（即设置了 `MCP_NODE_HUB_LISTEN` 的同一个二进制文件），客户端通过枢纽上的 `/n/<name>/mcp` 访问它。默认配置用 TLS 保护这条链路：枢纽的节点端口只监听 `127.0.0.1`，前面由 TLS 终结器（nginx `stream`、stunnel、HAProxy）接管公网端口，节点用 `MCP_NODE_CONNECT_TLS=1` 连接：
+
+```sh
+# 枢纽；nginx/stunnel 在 :8400 终结 TLS，转发到 127.0.0.1:8401
+MCP_NODE_HUB_LISTEN=127.0.0.1:8401 MCP_NODE_HUB_SECRET_FILE=nodes ./mcp-node
+# 节点；枢纽上的 `nodes` 含一行 laptop:<secret>，这里的 `secret` 只含 <secret>
+MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 \
+  ./mcp-node --connect hub.example.com:8400
+```
+
+私有 CA 请加 `MCP_NODE_CONNECT_CA_FILE`；按 IP 连接时设置 `MCP_NODE_CONNECT_SERVER_NAME`。终结器配置和可信局域网下的明文 TCP 方式见 [docs/reverse-connect.md](docs/reverse-connect.md)。
 
 ## 工具
 
@@ -166,8 +176,18 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 - **必须提供 token。** token 文件缺失或为空时，服务器拒绝启动。比较采用常数时间。
 - **默认仅监听回环地址。** 它绑定 `127.0.0.1`。如需对外暴露，设置 `MCP_NODE_HOST`，并把客户端使用的 `host:port` 加入 `MCP_NODE_ALLOWED_HOSTS`。
 - **先校验 Host 和 Origin**，再解析请求体：未知 Host 返回 421，未知 Origin 返回 403。
-- **不内置 TLS。** 请放在反向代理、隧道或 VPN 后面，例如 `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`。
+- **不内置 TLS 服务器。** 请放在反向代理、隧道或 VPN 后面，例如 `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`。
 - **拿到 token 就等于拿到节点运行用户的 shell。** 请用权限只覆盖智能体所需范围的账户来运行它。
+
+## 安全模型
+
+- **持有客户端 token 的人就能执行命令。** 枢纽的 token 可以访问所有已连接的节点。
+- **枢纽能看到全部内容。** 它以明文处理所有请求和响应；持有节点密钥的枢纽可以在该节点上执行任何操作。
+- **节点密钥等于该节点上的 shell，并占有其名称。** `name:secret` 每行为一个名称设置独立密钥；单一共享密钥允许持有者以任意名称连接。
+- **握手只做认证，不保护链路。** 双方用基于新鲜 nonce 的 HMAC-SHA256 证明密钥，但之后的帧在明文 TCP 上既不加密也没有完整性保护。
+- **跨越不受你控制的网络时使用 TLS。** `MCP_NODE_CONNECT_TLS=1` 让节点始终校验证书链和服务器名，无法关闭校验。明文 TCP 只用于同一主机或可信局域网。
+- **没有按 IP 的限制。** 枢纽总共最多保持 16 个未认证的握手；请用防火墙把节点端口限制到已知来源。
+- **不在范围内：** 按工具或路径的权限、沙箱、审计日志，以及已被攻破的枢纽或节点主机。
 
 ## 配置
 

@@ -92,14 +92,27 @@ mcp-node is an execution API for agents. Through SSH, an agent gets one string t
 - **Verified file writes.** `write_file` takes base64 and returns the SHA-256 of what landed on disk.
 - **A self-describing interface.** Any MCP client discovers the tools from `tools/list`; nothing to teach the agent.
 
-Speed isn't the argument: on an open connection both are fast. mcp-node has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
+Speed isn't the argument: on an open connection both are fast. The mcp-node HTTP server has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
 
 ## Reverse connect (no inbound ports)
 
 For machines behind NAT or without sshd, run the node with
 `--connect hub:port`: it dials out to a hub (the same binary with
 `MCP_NODE_HUB_LISTEN`), and clients reach it at `/n/<name>/mcp` on the hub.
-See [docs/reverse-connect.md](docs/reverse-connect.md).
+The default setup wraps the link in TLS: the hub's link port stays on
+`127.0.0.1` behind a TLS terminator (nginx `stream`, stunnel, HAProxy), and
+the node dials it with `MCP_NODE_CONNECT_TLS=1`:
+
+```sh
+# hub; nginx/stunnel terminates TLS on :8400 and forwards to 127.0.0.1:8401
+MCP_NODE_HUB_LISTEN=127.0.0.1:8401 MCP_NODE_HUB_SECRET_FILE=nodes ./mcp-node
+# node; `nodes` on the hub holds the line laptop:<secret>, `secret` here holds <secret>
+MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 \
+  ./mcp-node --connect hub.example.com:8400
+```
+
+Full setup, a terminator config and the plain TCP variant for trusted
+networks are in [docs/reverse-connect.md](docs/reverse-connect.md).
 
 ## stdio mode
 
@@ -191,8 +204,19 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 - **Token required.** The server refuses to start with a missing or empty token file. Comparison is constant-time.
 - **Loopback by default.** It binds `127.0.0.1`. To expose it, set `MCP_NODE_HOST` and add the `host:port` clients use to `MCP_NODE_ALLOWED_HOSTS`.
 - **Host and Origin checked** before the body is parsed: unknown Host gets 421, unknown Origin gets 403.
-- **No built-in TLS.** Put it behind a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
+- **No built-in TLS server.** Put it behind a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
 - **The token is a shell as the user the node runs as.** Run it under an account scoped to what the agent should touch.
+
+## Security model
+
+- **Whoever holds the client token runs commands.** On a plain node that means the node; on a hub the token reaches every connected node, so treat the hub token as the sum of them.
+- **The hub sees everything.** TLS ends in front of it, so it handles every request and response in plaintext, and a hub that holds a node's secret can run anything on that node.
+- **A node secret is a shell on that node and owns its name.** With `name:secret` lines each name has its own secret; a single shared secret lets any holder connect under any name, including one not yet taken.
+- **The handshake authenticates, it does not protect the link.** Hub and node prove the secret with HMAC-SHA256 over fresh nonces, but later frames are neither encrypted nor integrity-protected: over plain TCP an active relay can read and change them.
+- **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. The hub has no TLS server, so terminate TLS in front of its link port and keep that port on loopback.
+- **Plain TCP links are for the same host or a trusted LAN.**
+- **No per-IP limits.** The hub caps unauthenticated handshakes at 16 in total; firewall the link port to known sources.
+- **Out of scope:** per-tool or per-path permissions, sandboxing, audit logs, and a compromised hub or node host. The node runs with the full rights of its OS user.
 
 ## Configuration
 
