@@ -28,6 +28,17 @@ pub const Endpoint = struct {
 /// serves one client over stdin/stdout and opens no socket at all.
 pub const Mode = enum { listen, node, hub, stdio };
 
+/// How much of the tool arguments the audit log records (design:
+/// docs/audit-log.md). `summary` logs the per-tool allowlist only;
+/// `full` adds the full argv/path. Scripts, file contents and stdout are
+/// never logged in either mode.
+pub const AuditArgsMode = enum { summary, full };
+
+/// What a tool call does when the audit ring is full: wait (an unlogged
+/// action is worse than a slow one) or drop (a chained `dropped` record
+/// with the count follows when space returns).
+pub const AuditOnFull = enum { block, drop };
+
 pub const Config = struct {
     name: []const u8,
     host: []const u8,
@@ -70,6 +81,20 @@ pub const Config = struct {
     hub_tls_key_file: ?[]const u8 = null,
     /// hub mode: the live node registry (set by main, read by http).
     hub: ?*anyopaque = null,
+    /// The audit log writer (set by main when MCP_NODE_AUDIT_FILE is set),
+    /// cast to *audit.Writer at the call site like `hub` above.
+    audit: ?*anyopaque = null,
+    /// audit env configuration (off when audit_file is null).
+    audit_file: ?[]const u8 = null,
+    audit_key_file: ?[]const u8 = null,
+    /// The audit HMAC key bytes; never logged, never fingerprinted.
+    audit_key: []const u8 = "",
+    audit_args: AuditArgsMode = .summary,
+    audit_on_full: AuditOnFull = .block,
+    audit_max_bytes: u64 = 64 * 1024 * 1024,
+    /// The token file path, for the audit config fingerprint (the token
+    /// itself never enters the fingerprint or the log).
+    token_file: []const u8 = "",
 };
 
 /// Global budget of in-flight request-body bytes (default 64 MiB via
@@ -223,6 +248,7 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
         .max_inflight_bytes = max_inflight_bytes,
         .text_mirror = text_mirror,
         .mode = mode,
+        .token_file = try arena.dupe(u8, token_path),
     };
     switch (mode) {
         .listen, .stdio => {},
@@ -297,6 +323,70 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 cfg.hub_tls_key_file = tls_key;
             }
         },
+    }
+
+    // Audit log (off when MCP_NODE_AUDIT_FILE is unset). The key file needs
+    // the log: a key without a file is a typo and fails startup. Key
+    // material must be 0600 on POSIX (fail-closed, with the variable named).
+    if (getEnv(arena, "MCP_NODE_AUDIT_FILE")) |af| {
+        if (af.len != 0) cfg.audit_file = af;
+    }
+    const audit_key_path = blk: {
+        const p = getEnv(arena, "MCP_NODE_AUDIT_KEY_FILE") orelse break :blk null;
+        if (p.len == 0) break :blk null;
+        break :blk p;
+    };
+    if (audit_key_path != null and cfg.audit_file == null) {
+        std.debug.print("MCP_NODE_AUDIT_KEY_FILE requires MCP_NODE_AUDIT_FILE\n", .{});
+        return error.InvalidConfig;
+    }
+    if (audit_key_path) |path| {
+        os.fd.checkPrivateFileMode(io, path) catch {
+            std.debug.print("MCP_NODE_AUDIT_KEY_FILE '{s}' must not grant group/other access (0600)\n", .{path});
+            return error.InvalidConfig;
+        };
+        const raw = try readSecretFile(arena, io, "MCP_NODE_AUDIT_KEY_FILE", path);
+        const key = std.mem.trim(u8, raw, " \t\r\n");
+        if (key.len == 0) {
+            std.debug.print("MCP_NODE_AUDIT_KEY_FILE is empty\n", .{});
+            return error.InvalidConfig;
+        }
+        cfg.audit_key = key;
+        cfg.audit_key_file = path;
+    }
+    const audit_args_s = getEnv(arena, "MCP_NODE_AUDIT_ARGS") orelse "";
+    if (audit_args_s.len != 0) {
+        if (std.mem.eql(u8, audit_args_s, "summary")) {
+            cfg.audit_args = .summary;
+        } else if (std.mem.eql(u8, audit_args_s, "full")) {
+            cfg.audit_args = .full;
+        } else {
+            std.debug.print("MCP_NODE_AUDIT_ARGS must be summary or full, got '{s}'\n", .{audit_args_s});
+            return error.InvalidConfig;
+        }
+    }
+    const on_full_s = getEnv(arena, "MCP_NODE_AUDIT_ON_FULL") orelse "";
+    if (on_full_s.len != 0) {
+        if (std.mem.eql(u8, on_full_s, "block")) {
+            cfg.audit_on_full = .block;
+        } else if (std.mem.eql(u8, on_full_s, "drop")) {
+            cfg.audit_on_full = .drop;
+        } else {
+            std.debug.print("MCP_NODE_AUDIT_ON_FULL must be block or drop, got '{s}'\n", .{on_full_s});
+            return error.InvalidConfig;
+        }
+    }
+    const audit_max_s = getEnv(arena, "MCP_NODE_AUDIT_MAX_BYTES") orelse "";
+    if (audit_max_s.len != 0) {
+        const parsed = std.fmt.parseInt(u64, audit_max_s, 10) catch {
+            std.debug.print("MCP_NODE_AUDIT_MAX_BYTES must be an unsigned integer, got '{s}'\n", .{audit_max_s});
+            return error.InvalidConfig;
+        };
+        if (parsed < 4096) {
+            std.debug.print("MCP_NODE_AUDIT_MAX_BYTES must be at least 4096\n", .{});
+            return error.InvalidConfig;
+        }
+        cfg.audit_max_bytes = parsed;
     }
     return cfg;
 }
@@ -941,4 +1031,77 @@ test "config hub TLS cert/key env parsing" {
     const node = try loadConfig(arena, io);
     try testing.expectEqual(Mode.node, node.mode);
     try testing.expect(node.hub_tls_cert_file == null and node.hub_tls_key_file == null);
+}
+
+test "config audit env parsing and the key/file pairing rule" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "tok\n" });
+    // The key is written with 0600 at creation; writeFile's mode only
+    // applies to a fresh file, so the 0644 case below deletes first.
+    const akey_path = try tmpRelPath(arena, &tmp, "akey");
+    try os.fd.writeFile(io, akey_path, "audit-key-material\n", 0o600);
+    const token: EnvVar = .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") };
+    const afile: EnvVar = .{ .key = "MCP_NODE_AUDIT_FILE", .value = try tmpRelPath(arena, &tmp, "audit.log") };
+    const akey: EnvVar = .{ .key = "MCP_NODE_AUDIT_KEY_FILE", .value = akey_path };
+    defer env_state.process_environ = .empty;
+
+    // Audit off by default: no file, no key, summary+block defaults.
+    env_state.process_environ = try makeEnviron(arena, &.{token});
+    const off = try loadConfig(arena, io);
+    try testing.expect(off.audit_file == null and off.audit_key_file == null);
+    try testing.expectEqual(AuditArgsMode.summary, off.audit_args);
+    try testing.expectEqual(AuditOnFull.block, off.audit_on_full);
+    try testing.expectEqual(@as(u64, 64 * 1024 * 1024), off.audit_max_bytes);
+
+    // Key without a log file is a typo: fail fast.
+    env_state.process_environ = try makeEnviron(arena, &.{ token, akey });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    // A readable 0600 key loads; the log file is created by the daemon later.
+    env_state.process_environ = try makeEnviron(arena, &.{ token, afile, akey });
+    const on = try loadConfig(arena, io);
+    try testing.expectEqualStrings("audit-key-material", on.audit_key);
+    try testing.expect(on.audit_file != null);
+
+    // Group/other-readable key material is refused on POSIX.
+    if (comptime builtin.os.tag != .windows) {
+        try tmp.dir.deleteFile(io, "akey");
+        try os.fd.writeFile(io, akey_path, "audit-key-material\n", 0o644);
+        env_state.process_environ = try makeEnviron(arena, &.{ token, afile, akey });
+        try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+        try tmp.dir.deleteFile(io, "akey");
+        try os.fd.writeFile(io, akey_path, "audit-key-material\n", 0o600);
+    }
+
+    // Enum typos are startup errors, never silent defaults.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token, afile, .{ .key = "MCP_NODE_AUDIT_ARGS", .value = "everything" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token, afile, .{ .key = "MCP_NODE_AUDIT_ON_FULL", .value = "spill" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token, afile, .{ .key = "MCP_NODE_AUDIT_MAX_BYTES", .value = "17" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        afile,
+        .{ .key = "MCP_NODE_AUDIT_ARGS", .value = "full" },
+        .{ .key = "MCP_NODE_AUDIT_ON_FULL", .value = "drop" },
+        .{ .key = "MCP_NODE_AUDIT_MAX_BYTES", .value = "1048576" },
+    });
+    const tuned = try loadConfig(arena, io);
+    try testing.expectEqual(AuditArgsMode.full, tuned.audit_args);
+    try testing.expectEqual(AuditOnFull.drop, tuned.audit_on_full);
+    try testing.expectEqual(@as(u64, 1048576), tuned.audit_max_bytes);
 }

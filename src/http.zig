@@ -11,6 +11,7 @@ const util = @import("util.zig");
 const config = @import("config.zig");
 const rpc_mod = @import("rpc.zig");
 const hub_mod = @import("hub.zig");
+const audit = @import("audit.zig");
 
 const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
@@ -29,6 +30,7 @@ const HeadInfo = struct {
     authorization: ?[]const u8 = null,
     connection: ?[]const u8 = null,
     expect_continue: bool = false,
+    mcp_session_id: ?[]const u8 = null,
 };
 
 /// Milliseconds left on the absolute request deadline; null when expired.
@@ -173,6 +175,11 @@ pub fn parseHead(head: []const u8) !HeadInfo {
             if (!asciiEqlIgnoreCase(value, "100-continue")) return error.BadExpectation;
             if (info.expect_continue) return error.DuplicateHeader;
             info.expect_continue = true;
+        } else if (asciiEqlIgnoreCase(name, "mcp-session-id")) {
+            // Not a security header, but single-valued: the audit log records
+            // its hash prefix, and ambiguity must not split the audit trail.
+            if (info.mcp_session_id != null) return error.DuplicateHeader;
+            info.mcp_session_id = value;
         } else if (asciiEqlIgnoreCase(name, "transfer-encoding")) {
             return error.TransferEncodingUnsupported;
         } else if (asciiEqlIgnoreCase(name, "content-length")) {
@@ -516,17 +523,27 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
         }
     }
 
+    // Audit context: the peer address and the Mcp-Session-Id hash prefix
+    // (never the id itself).
+    var addr_buf: [96]u8 = undefined;
+    const client = std.fmt.bufPrint(&addr_buf, "{f}", .{stream.socket.address}) catch "";
+    var sess_buf: [16]u8 = undefined;
+    const call_ctx: audit.CallCtx = .{
+        .transport = .http,
+        .client = client,
+        .session = audit.sessionHashHex(info.mcp_session_id, &sess_buf),
+    };
     switch (route) {
         .local => {},
-        .list, .node => return serveHubRoute(ra, cfg, fd, route, body, keep_alive, timeout_ms),
+        .list, .node => return serveHubRoute(ra, cfg, io, fd, route, body, keep_alive, timeout_ms, client),
     }
-    const rpc = try rpc_mod.handleRpc(ra, io, cfg, body);
+    const rpc = try rpc_mod.handleRpcCtx(ra, io, cfg, body, call_ctx);
     try sendHttpRawMode(ra, fd, rpc.status, "application/json", rpc.body, keep_alive, timeout_ms);
     return keep_alive;
 }
 
 /// Hub routes, reached only after every check passed and the body was read.
-fn serveHubRoute(ra: Allocator, cfg: *const config.Config, fd: std.posix.fd_t, route: Route, body: []const u8, keep_alive: bool, timeout_ms: u64) !bool {
+fn serveHubRoute(ra: Allocator, cfg: *const config.Config, io: Io, fd: std.posix.fd_t, route: Route, body: []const u8, keep_alive: bool, timeout_ms: u64, client: []const u8) !bool {
     const hub: *hub_mod.Hub = @ptrCast(@alignCast(cfg.hub orelse {
         try sendHttpError(ra, fd, 503, "busy", "hub not ready", timeout_ms);
         return false;
@@ -539,12 +556,29 @@ fn serveHubRoute(ra: Allocator, cfg: *const config.Config, fd: std.posix.fd_t, r
             return keep_alive;
         },
         .node => |name| {
-            const res = try hub_mod.forward(hub, ra, name, body, hub_mod.forwardDeadlineMs(cfg));
+            // The relay record: who asked which node for what, joined to the
+            // node's tool.call by req_id and the link stream id.
+            const peek = audit.relayPeek(ra, body);
+            const started = Io.Clock.awake.now(io);
+            var sid: u32 = 0;
+            const res = try hub_mod.forward(hub, ra, name, body, hub_mod.forwardDeadlineMs(cfg), &sid);
+            const dur_ms: u64 = @intCast(@max(0, started.untilNow(io, .awake).toMilliseconds()));
+            const aw = audit.fromCfg(cfg);
             switch (res) {
-                .unknown_node => try sendHttpError(ra, fd, 404, "unknown_node", "no node connected under this name", timeout_ms),
-                .node_disconnected => try sendHttpError(ra, fd, 502, "node_disconnected", "node link lost before the answer", timeout_ms),
-                .node_timeout => try sendHttpError(ra, fd, 504, "node_timeout", "node did not answer in time", timeout_ms),
+                .unknown_node => {
+                    audit.relay(aw, client, name, peek.method, peek.tool, peek.req_id_rendered, 0, false, "unknown_node", dur_ms, body.len, 0);
+                    try sendHttpError(ra, fd, 404, "unknown_node", "no node connected under this name", timeout_ms);
+                },
+                .node_disconnected => {
+                    audit.relay(aw, client, name, peek.method, peek.tool, peek.req_id_rendered, sid, false, "node_disconnected", dur_ms, body.len, 0);
+                    try sendHttpError(ra, fd, 502, "node_disconnected", "node link lost before the answer", timeout_ms);
+                },
+                .node_timeout => {
+                    audit.relay(aw, client, name, peek.method, peek.tool, peek.req_id_rendered, sid, false, "node_timeout", dur_ms, body.len, 0);
+                    try sendHttpError(ra, fd, 504, "node_timeout", "node did not answer in time", timeout_ms);
+                },
                 .resp => |r| {
+                    audit.relay(aw, client, name, peek.method, peek.tool, peek.req_id_rendered, sid, true, null, dur_ms, body.len, r.body.len);
                     try sendHttpRawMode(ra, fd, r.status, "application/json", r.body, keep_alive, timeout_ms);
                     return keep_alive;
                 },
@@ -819,7 +853,13 @@ const TestServeOutcome = struct {
 /// client saw. The response is read only when the peer reports readability
 /// within 2 s, so the clean-EOF path (nothing written) is testable too.
 fn testServeRequest(io: Io, arena: Allocator, sock: TestSock, carry: *std.ArrayList(u8)) !TestServeOutcome {
-    var stream = Io.net.Stream{ .socket = .{ .handle = sock.subject, .address = undefined } };
+    var stream = Io.net.Stream{
+        .socket = .{
+            .handle = sock.subject,
+            // Audit logs the peer address: the fake stream needs a valid one.
+            .address = try Io.net.IpAddress.parseIp4("127.0.0.1", 43210),
+        },
+    };
     const cfg = testServeConfig();
     const keep = try serveOneRequest(io, &cfg, &stream, carry);
     var response: []const u8 = "";

@@ -533,7 +533,16 @@ fn worker(job: *Job) void {
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
-    const rpc = rpc_mod.handleRpc(ra, node.io, node.cfg, copy.body) catch |err| {
+    var client_buf: [96]u8 = undefined;
+    const client = if (node.cfg.connect) |ep|
+        std.fmt.bufPrint(&client_buf, "hub:{s}:{d}", .{ ep.host, ep.port }) catch "hub"
+    else
+        "hub";
+    const rpc = rpc_mod.handleRpcCtx(ra, node.io, node.cfg, copy.body, .{
+        .transport = .link,
+        .client = client,
+        .link_sid = copy.sid,
+    }) catch |err| {
         std.debug.print("node link request failed: {s}\n", .{@errorName(err)});
         copy.ln.writeResp(copy.sid, 500, "{\"error\":\"internal\",\"message\":\"request failed\"}");
         return;

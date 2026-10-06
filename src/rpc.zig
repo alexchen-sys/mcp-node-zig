@@ -10,6 +10,7 @@ const Value = std.json.Value;
 const util = @import("util.zig");
 const config = @import("config.zig");
 const tools = @import("tools.zig");
+const audit = @import("audit.zig");
 
 const VERSION: []const u8 = @import("build_options").version;
 
@@ -23,6 +24,11 @@ const RpcResponse = struct {
 /// HTTP 4xx, method-level errors stay inside a 200 JSON-RPC error object.
 /// Notifications (no id, or method "notifications/*") get 202 with empty body.
 pub fn handleRpc(arena: Allocator, io: Io, cfg: *const config.Config, body: []const u8) !RpcResponse {
+    return handleRpcCtx(arena, io, cfg, body, .{ .transport = .http });
+}
+
+/// Same as handleRpc, with the transport context the audit log records.
+pub fn handleRpcCtx(arena: Allocator, io: Io, cfg: *const config.Config, body: []const u8, ctx: audit.CallCtx) !RpcResponse {
     const req = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch {
         return .{ .status = 400, .body = try rpcError(arena, Value.null, -32700, "Parse error") };
     };
@@ -134,7 +140,7 @@ pub fn handleRpc(arena: Allocator, io: Io, cfg: *const config.Config, body: []co
         return .{ .status = 200, .body = out.items };
     }
     if (std.mem.eql(u8, method, "tools/call")) {
-        return handleToolCall(arena, io, cfg, id, req.object.get("params"));
+        return handleToolCall(arena, io, cfg, id, req.object.get("params"), ctx);
     }
     return .{ .status = 200, .body = try rpcError(arena, id, -32601, "Method not found") };
 }
@@ -146,7 +152,7 @@ fn supportedProtocolVersion(v: []const u8) bool {
         std.mem.eql(u8, v, "2025-11-25");
 }
 
-fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value, params_v: ?Value) !RpcResponse {
+fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value, params_v: ?Value, ctx: audit.CallCtx) !RpcResponse {
     const params = params_v orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     if (params != .object) return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
     const name_v = params.object.get("name") orelse return .{ .status = 200, .body = try rpcError(arena, id, -32602, "Invalid params") };
@@ -159,8 +165,25 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value
     }
     const args = args_v orelse Value.null;
 
+    // Audit: one tool.call record per call (plus tool.start for the long
+    // tools, so a crash mid-call still leaves a trace). The writer is null
+    // and the calls no-op when audit is off.
+    const aw = audit.fromCfg(cfg);
+    var ctx2 = ctx;
+    var id_buf: audit.Buf = undefined;
+    id_buf.reset();
+    audit.renderReqId(&id_buf, id);
+    ctx2.req_id = if (id_buf.overflow) "null" else id_buf.slice();
+    const long_tool = std.mem.eql(u8, name_v.string, "exec") or
+        std.mem.eql(u8, name_v.string, "exec_start") or
+        std.mem.eql(u8, name_v.string, "exec_shell");
+    if (long_tool) audit.toolStart(aw, ctx2, name_v.string, args);
+    const started = Io.Clock.awake.now(io);
+
     var payload: std.ArrayList(u8) = .empty;
     dispatchTool(arena, io, cfg, name_v.string, args, &payload) catch |err| {
+        const dur_ms: u64 = @intCast(@max(0, started.untilNow(io, .awake).toMilliseconds()));
+        audit.toolCall(aw, ctx2, name_v.string, args, false, null, @errorName(err), dur_ms, payload.items.len);
         switch (err) {
             error.UnknownTool => return unknownToolResult(arena, id, name_v.string),
             // A present argument with the wrong JSON type is a protocol
@@ -170,7 +193,54 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value
         }
         return .{ .status = 200, .body = try toolEnvelope(arena, cfg, id, payload.items, false) };
     };
+    const dur_ms: u64 = @intCast(@max(0, started.untilNow(io, .awake).toMilliseconds()));
+    const facts = payloadFacts(payload.items);
+    audit.toolCall(aw, ctx2, name_v.string, args, facts.ok orelse true, facts.exit_code, facts.err, dur_ms, payload.items.len);
     return .{ .status = 200, .body = try toolEnvelope(arena, cfg, id, payload.items, false) };
+}
+
+/// The ok/exit_code/error facts of a tool payload. All tool writers emit
+/// them as the first fields of a flat object, so the scan window is the
+/// first 160 bytes — output text (which could contain the same bytes)
+/// never enters the window.
+const PayloadFacts = struct { ok: ?bool, exit_code: ?i32, err: ?[]const u8 };
+
+fn payloadFacts(payload: []const u8) PayloadFacts {
+    var f: PayloadFacts = .{ .ok = null, .exit_code = null, .err = null };
+    const head = payload[0..@min(payload.len, 160)];
+    if (!std.mem.startsWith(u8, head, "{\"ok\":")) return f;
+    if (std.mem.startsWith(u8, head[5..], "true")) {
+        f.ok = true;
+    } else if (std.mem.startsWith(u8, head[5..], "false")) {
+        f.ok = false;
+    }
+    if (std.mem.indexOf(u8, head, ",\"exit_code\":")) |at| {
+        var i = at + ",\"exit_code\":".len;
+        var v: i64 = 0;
+        var neg = false;
+        if (i < head.len and head[i] == '-') {
+            neg = true;
+            i += 1;
+        }
+        var digits: usize = 0;
+        while (i < head.len and head[i] >= '0' and head[i] <= '9') : (i += 1) {
+            v = v * 10 + (head[i] - '0');
+            digits += 1;
+            if (digits > 9) break;
+        }
+        if (digits > 0 and digits <= 9) {
+            if (neg) v = -v;
+            f.exit_code = @intCast(v);
+        }
+    }
+    if (std.mem.indexOf(u8, head, ",\"error\":\"")) |at| {
+        const start = at + ",\"error\":\"".len;
+        // Error names are identifier-shaped (@errorName): no escapes.
+        if (std.mem.indexOfScalarPos(u8, head, start, '"')) |end| {
+            if (end - start <= 64) f.err = head[start..end];
+        }
+    }
+    return f;
 }
 
 fn dispatchTool(arena: Allocator, io: Io, cfg: *const config.Config, name: []const u8, args: Value, out: *std.ArrayList(u8)) !void {

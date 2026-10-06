@@ -23,6 +23,7 @@ const os = @import("os.zig");
 const util = @import("util.zig");
 const link = @import("link.zig");
 const config = @import("config.zig");
+const audit = @import("audit.zig");
 
 const build_options = @import("build_options");
 const tls_server = if (build_options.tls_server) @import("tls_server.zig") else struct {};
@@ -272,9 +273,12 @@ pub const Hub = struct {
             defer self.sources_mutex.unlock(self.io);
             break :blk self.sources.finish(src.key, outcome, nowMs(self.io));
         };
-        if (banned) std.debug.print("hub: refusing {f} for {d} s after {d} failed handshakes\n", .{
-            addr, @divTrunc(AUTH_BAN_MS, 1000), AUTH_FAIL_LIMIT,
-        });
+        if (banned) {
+            std.debug.print("hub: refusing {f} for {d} s after {d} failed handshakes\n", .{
+                addr, @divTrunc(AUTH_BAN_MS, 1000), AUTH_FAIL_LIMIT,
+            });
+            audit.linkBan(audit.fromCfg(self.cfg), src.key, @intCast(@divTrunc(AUTH_BAN_MS, 1000)));
+        }
     }
 
     /// Insert an authenticated link. An existing link with the same name is
@@ -549,14 +553,16 @@ pub fn forwardDeadlineMs(cfg: *const config.Config) u64 {
 }
 
 /// Send `body` to node `name` and wait up to `deadline_ms` for its answer.
-pub fn forward(hub: *Hub, arena: Allocator, name: []const u8, body: []const u8, deadline_ms: u64) !Forwarded {
+/// `out_sid`, when given, receives the link stream id the request went out
+/// on (0 when nothing was sent); the audit relay record joins on it.
+pub fn forward(hub: *Hub, arena: Allocator, name: []const u8, body: []const u8, deadline_ms: u64, out_sid: ?*u32) !Forwarded {
     if (!link.validName(name)) return .unknown_node;
     const ln = hub.acquire(name) orelse return .unknown_node;
     defer ln.release();
-    return forwardOn(ln, arena, body, deadline_ms);
+    return forwardOn(ln, arena, body, deadline_ms, out_sid);
 }
 
-fn forwardOn(ln: *Link, arena: Allocator, body: []const u8, deadline_ms: u64) !Forwarded {
+fn forwardOn(ln: *Link, arena: Allocator, body: []const u8, deadline_ms: u64, out_sid: ?*u32) !Forwarded {
     const io = ln.hub.io;
     _ = ln.inflight.fetchAdd(1, .acq_rel);
     defer _ = ln.inflight.fetchSub(1, .acq_rel);
@@ -566,6 +572,7 @@ fn forwardOn(ln: *Link, arena: Allocator, body: []const u8, deadline_ms: u64) !F
         error.LinkDead => return .node_disconnected,
         else => return err,
     };
+    if (out_sid) |p| p.* = sid;
     ln.writeFrame(.req, sid, &.{body});
 
     const deadline: Io.Clock.Timestamp = .fromNow(io, .{
@@ -652,9 +659,12 @@ fn linkThread(acc: *Accepted) void {
     defer ln.release(); // the reader's reference
     defer hub.unregister(ln);
     defer ln.kill();
+    var reason: []const u8 = "closed";
     readLoop(ln) catch |err| {
+        reason = @errorName(err);
         if (!ln.dead.load(.acquire)) std.debug.print("hub link '{s}' lost: {s}\n", .{ ln.name, @errorName(err) });
     };
+    audit.linkDown(audit.fromCfg(hub.cfg), ln.name, reason);
 }
 
 /// Handshake, WELCOME and registration; closes the stream on any failure.
@@ -662,6 +672,9 @@ fn linkThread(acc: *Accepted) void {
 fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     // The peer address is read before any close below can free the socket.
     const peer = stream.socket.address;
+    var peer_buf: [96]u8 = undefined;
+    const peer_s = std.fmt.bufPrint(&peer_buf, "{f}", .{peer}) catch "";
+    const aw = audit.fromCfg(hub.cfg);
     var outcome: Outcome = .neutral;
     defer _ = hub.handshakes.fetchSub(1, .acq_rel);
     defer hub.finishSource(source, peer, outcome);
@@ -689,6 +702,7 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
                     error.OutOfMemory, error.EntropyUnavailable, error.Canceled => .neutral,
                     else => .failed,
                 };
+                audit.linkFail(aw, peer_s, @errorName(err));
                 stream.close(hub.io);
                 return null;
             };
@@ -697,6 +711,7 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     }
     const auth = handshake(hub, arena_state.allocator(), conn, started) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
+        audit.linkFail(aw, peer_s, @errorName(err));
         // Out of memory, no entropy or shutdown is ours; everything else
         // counts against the peer (no or bad HELLO, wrong MAC, unknown
         // name, deadline, reset mid-handshake).
@@ -714,6 +729,7 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     // authenticated peer gets this answer.
     if (hub.nameHeldByLiveLink(auth.name)) {
         std.debug.print("hub: refused a second link for '{s}': " ++ NAME_IN_USE ++ "\n", .{auth.name});
+        audit.linkFail(aw, peer_s, "NameInUse");
         const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
         link.writeFramePartsOn(conn, .goaway, 0, &.{NAME_IN_USE}, timeout_ms) catch {};
         stream.close(hub.io);
@@ -734,6 +750,7 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
         return null;
     };
     std.debug.print("hub: node '{s}' connected\n", .{ln.name});
+    audit.linkUp(aw, ln.name, peer_s);
     return ln;
 }
 
@@ -999,7 +1016,7 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
         }
     };
     const t = try std.Thread.spawn(.{}, Peer.answer, .{ ln, far });
-    const ok = try forwardOn(ln, arena, "{\"x\":1}", 5000);
+    const ok = try forwardOn(ln, arena, "{\"x\":1}", 5000, null);
     t.join();
     try testing.expectEqual(@as(u16, 201), ok.resp.status);
     try testing.expectEqualStrings("{\"x\":1}", ok.resp.body);
@@ -1008,7 +1025,7 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
     // Timeout: nobody answers; the waiter is removed and a late RESP for
     // that stream_id is dropped (freed) instead of being delivered.
     const before = ln.next_sid.load(.acquire);
-    const late = try forwardOn(ln, arena, "{}", 50);
+    const late = try forwardOn(ln, arena, "{}", 50, null);
     try testing.expect(late == .node_timeout);
     try testing.expectEqual(@as(usize, 0), ln.waiterCount());
     const stale = try gpa.alloc(u8, 2);
@@ -1026,11 +1043,11 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
         }
     };
     const k = try std.Thread.spawn(.{}, Killer.run, .{ln});
-    const lost = try forwardOn(ln, arena, "{}", 5000);
+    const lost = try forwardOn(ln, arena, "{}", 5000, null);
     k.join();
     try testing.expect(lost == .node_disconnected);
     // A dead link refuses new waiters outright.
-    try testing.expect((try forwardOn(ln, arena, "{}", 5000)) == .node_disconnected);
+    try testing.expect((try forwardOn(ln, arena, "{}", 5000, null)) == .node_disconnected);
 }
 
 test "hub relay deadline is at least one hour" {
@@ -1078,11 +1095,11 @@ test "hub handshake accepts a real node and relays a request end to end" {
     ln.release();
     try waitZero(&fx.hub.handshakes);
 
-    const res = try forward(&fx.hub, arena, "pc", "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}", 5000);
+    const res = try forward(&fx.hub, arena, "pc", "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}", 5000, null);
     try testing.expectEqual(@as(u16, 200), res.resp.status);
     try testing.expect(std.mem.indexOf(u8, res.resp.body, "\"id\":42") != null);
-    try testing.expect((try forward(&fx.hub, arena, "other", "{}", 5000)) == .unknown_node);
-    try testing.expect((try forward(&fx.hub, arena, "a/b", "{}", 5000)) == .unknown_node);
+    try testing.expect((try forward(&fx.hub, arena, "other", "{}", 5000, null)) == .unknown_node);
+    try testing.expect((try forward(&fx.hub, arena, "a/b", "{}", 5000, null)) == .unknown_node);
 
     // Dropping the link on the hub side ends the node session.
     fx.hub.killAll();

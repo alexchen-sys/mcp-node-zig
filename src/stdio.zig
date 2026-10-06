@@ -117,7 +117,10 @@ pub const Dispatcher = struct {
                 if (std.mem.trim(u8, line, " \t").len == 0) return;
                 var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena_state.deinit();
-                const resp = rpc.handleRpc(arena_state.allocator(), self.io, self.cfg, line) catch |err| {
+                const resp = rpc.handleRpcCtx(arena_state.allocator(), self.io, self.cfg, line, .{
+                    .transport = .stdio,
+                    .client = "stdio",
+                }) catch |err| {
                     std.debug.print("stdio request failed: {s}\n", .{@errorName(err)});
                     try self.sink.writeLine(INTERNAL_ERROR);
                     return;

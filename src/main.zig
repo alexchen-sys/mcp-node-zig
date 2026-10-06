@@ -10,6 +10,7 @@ const env_state = @import("env_state.zig");
 const node_link = @import("node_link.zig");
 const hub_mod = @import("hub.zig");
 const stdio = @import("stdio.zig");
+const audit = @import("audit.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -62,6 +63,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .run => |c| c,
         .version => return printOut("mcp-node " ++ VERSION ++ "\n"),
         .help => return printOut(USAGE),
+        .verify => |v| {
+            var files: std.ArrayList([]const u8) = .empty;
+            for (v.files) |f| try files.append(arena, f);
+            const code = audit.verifyCli(arena, io, v.anchor, files.items) catch |err| {
+                std.debug.print("audit-verify: {s}\n", .{@errorName(err)});
+                std.process.exit(2);
+            };
+            std.process.exit(code);
+        },
     };
     var cfg = try config.loadConfigCli(arena, io, cli);
     var sessions = session_mod.SessionStore.init(io, cfg.max_sessions);
@@ -71,10 +81,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var inflight = config.InflightGate{ .io = io, .max = cfg.max_inflight_bytes };
     cfg.inflight = &inflight;
 
+    if (cfg.audit_file) |af| {
+        const aw = audit.start(std.heap.page_allocator, io, .{
+            .path = af,
+            .key = if (cfg.audit_key.len > 0) cfg.audit_key else null,
+            .host = cfg.name,
+            .role = if (cfg.mode == .hub) "hub" else "node",
+            .mode = @tagName(cfg.mode),
+            .config_fingerprint = audit.configFingerprint(&cfg),
+            .args_mode = cfg.audit_args,
+            .on_full = cfg.audit_on_full,
+            .max_bytes = cfg.audit_max_bytes,
+        }) catch |err| {
+            std.debug.print("audit log setup failed: {s}\n", .{@errorName(err)});
+            return error.AuditSetupFailed;
+        };
+        cfg.audit = aw;
+    }
+
     if (cfg.mode == .stdio) {
         // stdio mode: no listener and no token; stdout carries only
         // JSON-RPC response lines, every log line goes to stderr.
         stdio.run(io, &cfg);
+        if (audit.fromCfg(&cfg)) |aw| audit.stop(aw);
         return;
     }
 
@@ -84,6 +113,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         logLine("mcp-node connecting", ep.host, ep.port);
         var node = node_link.Node{ .io = io, .cfg = &cfg };
         node_link.run(&node);
+        if (audit.fromCfg(&cfg)) |aw| audit.stop(aw);
         return;
     }
 
@@ -195,6 +225,7 @@ const VERSION: []const u8 = @import("build_options").version;
 
 const USAGE =
     \\Usage: mcp-node [--connect host:port | --stdio]
+    \\       mcp-node audit-verify [--anchor] <log-file>...
     \\
     \\MCP server that gives an agent a shell on this machine.
     \\Configuration comes from MCP_NODE_* environment variables.
@@ -207,6 +238,11 @@ const USAGE =
     \\  -h, --help           show this help and exit
     \\  -V, --version        print the version and exit
     \\
+    \\audit-verify checks an audit log (MCP_NODE_AUDIT_FILE) for chain
+    \\integrity: seq continuity, prev links and HMACs, using the key from
+    \\MCP_NODE_AUDIT_KEY_FILE. --anchor prints the last seq + mac pair for
+    \\off-box anchoring. Exit 0 clean, 1 broken.
+    \\
     \\Docs: https://github.com/alexchen-sys/mcp-node-zig
     \\
 ;
@@ -215,6 +251,12 @@ const Args = union(enum) {
     run: config.Cli,
     version,
     help,
+    verify: VerifyArgs,
+};
+
+const VerifyArgs = struct {
+    anchor: bool,
+    files: []const [:0]const u8,
 };
 
 fn printOut(text: []const u8) void {
@@ -226,6 +268,22 @@ fn printOut(text: []const u8) void {
 fn parseArgs(argv: []const [:0]const u8) !Args {
     var cli: config.Cli = .{};
     var i: usize = 1;
+    if (i < argv.len and std.mem.eql(u8, argv[i], "audit-verify")) {
+        i += 1;
+        var anchor = false;
+        while (i < argv.len and std.mem.eql(u8, argv[i], "--anchor")) : (i += 1) anchor = true;
+        if (i >= argv.len) {
+            std.debug.print("audit-verify needs at least one log file\n", .{});
+            return error.InvalidConfig;
+        }
+        for (argv[i..]) |f| {
+            if (f.len > 0 and f[0] == '-') {
+                std.debug.print("audit-verify: '{s}' is a flag, not a log file\n", .{f});
+                return error.InvalidConfig;
+            }
+        }
+        return .{ .verify = .{ .anchor = anchor, .files = argv[i..] } };
+    }
     while (i < argv.len) : (i += 1) {
         const a: []const u8 = argv[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
@@ -268,6 +326,20 @@ test "command line: --connect, --stdio, --help, --version, unknown arguments" {
     try std.testing.expect((try parseArgs(&.{ "mcp-node", "-h", "--bogus" })) == .help);
 }
 
+test "command line: audit-verify subcommand" {
+    const plain = (try parseArgs(&.{ "mcp-node", "audit-verify", "a.log" })).verify;
+    try std.testing.expect(!plain.anchor);
+    try std.testing.expectEqual(@as(usize, 1), plain.files.len);
+    try std.testing.expectEqualStrings("a.log", plain.files[0]);
+    const anchored = (try parseArgs(&.{ "mcp-node", "audit-verify", "--anchor", "a.log", "b.log" })).verify;
+    try std.testing.expect(anchored.anchor);
+    try std.testing.expectEqual(@as(usize, 2), anchored.files.len);
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "audit-verify" }));
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "audit-verify", "--anchor" }));
+    // The subcommand never falls through to the daemon flags.
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "audit-verify", "--stdio" }));
+}
+
 test "discover module tests" {
     // Test builds analyze decls lazily per decl: a module not referenced by
     // any root test would have its test blocks silently skipped. Pull them in.
@@ -277,6 +349,7 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("node_link.zig"));
     std.testing.refAllDecls(@import("hub.zig"));
     std.testing.refAllDecls(@import("stdio.zig"));
+    std.testing.refAllDecls(@import("audit.zig"));
     if (@import("build_options").tls_server)
         std.testing.refAllDecls(@import("tls_server.zig"));
 }
