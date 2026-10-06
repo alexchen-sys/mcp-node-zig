@@ -823,11 +823,19 @@ fn testServeRequest(io: Io, arena: Allocator, sock: TestSock, carry: *std.ArrayL
     const cfg = testServeConfig();
     const keep = try serveOneRequest(io, &cfg, &stream, carry);
     var response: []const u8 = "";
-    if (testWaitReadable(sock.peer, 2000)) {
+    // A response may span several writes (e.g. an interim 100 Continue
+    // followed by the final answer), and some platforms deliver each write
+    // as a separate read. Keep reading until the peer goes quiet.
+    var collected: std.ArrayList(u8) = .empty;
+    var wait_ms: i32 = 2000;
+    while (testWaitReadable(sock.peer, wait_ms)) {
         var buf: [4096]u8 = undefined;
         const m = try std.posix.read(sock.peer, &buf);
-        response = try arena.dupe(u8, buf[0..m]);
+        if (m == 0) break;
+        try collected.appendSlice(arena, buf[0..m]);
+        wait_ms = 200;
     }
+    response = collected.items;
     return .{ .keep = keep, .response = response };
 }
 
