@@ -13,6 +13,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  tls-server:
+    # The opt-in -Dtls-server build: compiles mbedTLS in and exercises the
+    # built-in TLS hub end to end. Default artifacts stay flagless.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k x86_64-linux '.[$v][$k].tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k x86_64-linux '.[$v][$k].shasum')
+          mkdir -p "$RUNNER_TEMP/zig"
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Unit tests (-Dtls-server)
+        shell: bash
+        run: zig build -Dtls-server test
+
+      - name: Release build (-Dtls-server)
+        shell: bash
+        run: zig build -Dtls-server -Doptimize=ReleaseSafe
+
+      - name: Cross builds (-Dtls-server)
+        shell: bash
+        run: |
+          set -e
+          zig build -Dtls-server -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
+          zig build -Dtls-server -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
+          zig build -Dtls-server -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+
+      - name: Python reverse connect suite (-Dtls-server binary)
+        shell: bash
+        run: python3 ci/test_reverse.py
+
   test:
     strategy:
       fail-fast: false
