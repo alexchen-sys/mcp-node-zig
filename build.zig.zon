@@ -4,10 +4,20 @@
     // Changing this has security and trust implications.
     .fingerprint = 0x81c85ef93a1925d1,
     .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // mbedTLS 3.6 LTS, the hub TLS server behind -Dtls-server. Lazy:
+        // the default build never fetches or compiles it.
+        .mbedtls = .{
+            .url = "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-3.6.7.tar.gz",
+            .hash = "N-V-__8AALrvlQKVtYlvv9dpBnbrJfdwR_F0wAgwsvZhAF1Y",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "tls",
         "LICENSE",
         "README.md",
     },
