@@ -111,7 +111,8 @@ sides' fresh nonces.
    `{"v":1,"auth":..}` with
    `HMAC-SHA256(secret, "mcp-node-reverse-v1 hub" | hub_nonce | node_nonce | name)`.
    An unknown name and a wrong MAC get the same answer and the same work.
-   HELLO must arrive within 10 s; at most 16 handshakes run at once.
+   HELLO must arrive within 10 s; at most 16 handshakes run at once, 4 per
+   source address.
 4. The node checks the WELCOME MAC in constant time before it accepts any
    other frame. A missing or wrong MAC, or any other frame first, ends the
    link with "hub authentication failed" and the node backs off and redials.
@@ -173,10 +174,22 @@ do not survive a node restart.
 
 ## Limits
 
-- The hub keeps at most 16 unauthenticated handshakes at once; further
-  connections are closed at once. There is no per-IP limit, so one source
-  can hold all 16 slots. If the link port is reachable from the internet,
-  firewall it to known sources.
+- The hub keeps at most 16 unauthenticated handshakes at once, and at most
+  4 from one source: one IPv4 address (IPv4-mapped IPv6 included) or one
+  IPv6 /64. Further connections are closed before CHALLENGE.
+- 8 failed handshakes from one source within 60 s (no or bad HELLO, wrong
+  MAC, unknown name, HELLO deadline) make the hub close that source's
+  connections at once for 60 s, and the hub logs it. A successful handshake
+  resets the count.
+- Sources are tracked in a fixed table of 64 entries. When it is full, the
+  least recently seen entry without a handshake in progress is reused, so an
+  attacker with many addresses can end a ban early; the global cap of 16
+  still holds.
+- 127.0.0.1 and ::1 are exempt. Behind a local TLS terminator every node
+  arrives from loopback, so these limits do not apply there: limit
+  connections per IP in the terminator (nginx `limit_conn`, HAProxy
+  `src_conn_cur`) and firewall the public port to known sources where you
+  can.
 - Each link has one write lock, so a large response delays the other
   frames on the same link until it is written.
 - A relayed request waits for its node up to max(socket timeout, 1 h).
