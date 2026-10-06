@@ -535,6 +535,38 @@ class SkipCase(Exception):
     pass
 
 
+def _start_tls_hub(env, extra=None):
+    """Start a hub with built-in TLS on the node-link listener.
+
+    Returns the hub proc. Raises SkipCase when the binary was built
+    without -Dtls-server (the env pair is a startup error there).
+    """
+    if env.hub_port is None:
+        env.hub_port = pick_port()
+        env.link_port = pick_port()
+    secrets_path = str(env.dir / 'hub-secrets')
+    e = dict(extra or {})
+    e.update(MCP_NODE_HOST='127.0.0.1', MCP_NODE_PORT=str(env.hub_port),
+             MCP_NODE_NAME='hub', MCP_NODE_SOCKET_TIMEOUT_S='5',
+             MCP_NODE_HUB_LISTEN='127.0.0.1:%d' % env.link_port,
+             MCP_NODE_HUB_SECRET_FILE=secrets_path,
+             MCP_NODE_HUB_TLS_CERT_FILE=str(env.dir / 'server.pem'),
+             MCP_NODE_HUB_TLS_KEY_FILE=str(env.dir / 'server.key'))
+    e['MCP_NODE_TOKEN_' + 'FILE'] = str(env.dir / 'client-token')
+    merged = base_env()
+    merged.update(e)
+    hub = env.spawn('hub', merged)
+    wait_until(lambda: port_open(env.hub_port) or not hub.alive(), 10)
+    if not hub.alive():
+        logs = hub.logs()
+        if 'need a build with -Dtls-server' in logs:
+            raise SkipCase('binary built without -Dtls-server')
+        raise AssertionError('TLS hub did not start: ' + logs[-1000:])
+    check(wait_until(lambda: 'serving TLS 1.3 node links' in hub.logs(), 5, 0.05),
+          'hub did not announce TLS: ' + hub.logs()[-1000:])
+    return hub
+
+
 def _openssl(*args, cwd):
     subprocess.run(['openssl', *args], cwd=cwd, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -685,6 +717,182 @@ def case_tls_link(env):
         term.close()
 
 
+def _tls_probe(env, src_ip, port, cafile):
+    """TLS-handshake the hub link listener from src_ip and read one frame.
+
+    Returns (frame_kind, payload). Raises on TLS or EOF failure.
+    """
+    import ssl
+    s = socket.socket()
+    s.settimeout(5)
+    s.bind((src_ip, 0))
+    s.connect(('127.0.0.1', port))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile)
+    ctx.check_hostname = False  # reachability probe; the node checks names
+    with ctx.wrap_socket(s, server_hostname='localhost') as tls:
+        kind, _, payload = _recv_frame(tls)
+        return kind, payload
+
+
+def case_tls_builtin_hub(env):
+    import shutil
+    if shutil.which('openssl') is None:
+        raise SkipCase('openssl CLI not found')
+    d = str(env.dir)
+    _make_ca(d, 'hubgood')
+    _make_ca(d, 'hubother')
+    _make_server_cert(d, 'hubgood')
+    hub = _start_tls_hub(env)
+
+    target = 'localhost:%d' % env.link_port
+    env.start_node('tlsnode', target=target, extra={
+        'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'hubgood-ca.pem')})
+    check(env.wait_node('tlsnode', 15), 'TLS node never appeared in /n: ' + hub.logs()[-500:])
+    status, reply = env.rpc('tlsnode', 'initialize', {
+        'protocolVersion': '2025-06-18', 'capabilities': {},
+        'clientInfo': {'name': 'tls-builtin-e2e', 'version': '0'}})
+    check(status == 200 and 'result' in reply, (status, reply))
+    status, reply = env.rpc('tlsnode', 'tools/list', {})
+    tools = reply.get('result', {}).get('tools', []) if isinstance(reply, dict) else []
+    check(status == 200 and len(tools) == 13, (status, len(tools)))
+    out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-builtin-tls'], 'timeout': 10})
+    check(out.get('ok') and out.get('stdout') == 'over-builtin-tls\n', out)
+
+    # 16 concurrent exec over the built-in TLS link.
+    results = {}
+
+    def one(i):
+        try:
+            r = env.tool('tlsnode', 'exec', {'argv': ['echo', 'btls-%d' % i], 'timeout': 20}, timeout=40)
+            results[i] = r.get('stdout')
+        except Exception as e:
+            results[i] = repr(e)
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    bad = {i: v for i, v in results.items() if v != 'btls-%d\n' % i}
+    check(len(results) == 16 and not bad, bad or results)
+    check('tlsnode' in env.nodes(), 'built-in TLS link dropped under concurrency')
+
+    bad_ca = env.start_node('tlsbadca', target=target, extra={
+        'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'hubother-ca.pem')})
+    failed = wait_until(lambda: 'TLS handshake failed' in bad_ca.logs(), 10, 0.1)
+    check(failed, 'untrusted CA was not rejected: ' + bad_ca.logs()[-1000:])
+    check('TlsCertificateNotVerified' in bad_ca.logs(), bad_ca.logs()[-1000:])
+    check('tlsbadca' not in env.nodes(), env.nodes())
+
+    sni = env.start_node('tlsbadsni', target=target, extra={
+        'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'hubgood-ca.pem'),
+        'MCP_NODE_CONNECT_SERVER_NAME': 'not-this-host.example'})
+    failed = wait_until(lambda: 'TLS handshake failed' in sni.logs(), 10, 0.1)
+    check(failed, 'wrong server name was not rejected: ' + sni.logs()[-1000:])
+    check('CertificateHostMismatch' in sni.logs(), sni.logs()[-1000:])
+    check('tlsbadsni' not in env.nodes(), env.nodes())
+
+
+def case_tls_builtin_plaintext_refused(env):
+    import shutil
+    if shutil.which('openssl') is None:
+        raise SkipCase('openssl CLI not found')
+    d = str(env.dir)
+    _make_ca(d, 'hubgood')
+    _make_server_cert(d, 'hubgood')
+    hub = _start_tls_hub(env)
+
+    # A plaintext probe (the hub speaks first in the link protocol, so a
+    # plaintext node would never send anything): bytes that are not a TLS
+    # record make the hub fail the TLS handshake, log it and close.
+    s = socket.create_connection(('127.0.0.1', env.link_port), timeout=5)
+    s.sendall(b'GET / HTTP/1.0\r\n\r\n')
+    _drain_until_close(s)
+    s.close()
+    check(wait_until(lambda: 'TLS handshake failed' in hub.logs(), 12),
+          'hub log has no TLS failure for plaintext: ' + hub.logs()[-1000:])
+
+    # A plaintext node keeps waiting for a CHALLENGE that never comes; it
+    # must never appear, and the hub must stay up for real TLS nodes.
+    node = env.start_node('plainnode')
+    env.start_node('tlsnode2', target='localhost:%d' % env.link_port, extra={
+        'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'hubgood-ca.pem')})
+    check(env.wait_node('tlsnode2'), 'TLS node did not connect after a plaintext probe')
+    time.sleep(2)
+    check('plainnode' not in env.nodes(), env.nodes())
+    check(node.alive(), 'node must keep retrying, not exit')
+
+
+def _drain_until_close(sock):
+    """Return the bytes the peer sent before closing (b'' = silent refusal)."""
+    got = b''
+    try:
+        while True:
+            chunk = sock.recv(512)
+            if not chunk:
+                return got
+            got += chunk
+    except OSError:
+        return got
+
+
+def case_tls_builtin_per_source_cap(env):
+    import shutil
+    if sys.platform != 'linux':
+        raise SkipCase('needs the whole 127/8 on loopback')
+    if shutil.which('openssl') is None:
+        raise SkipCase('openssl CLI not found')
+    d = str(env.dir)
+    _make_ca(d, 'hubgood')
+    _make_server_cert(d, 'hubgood')
+    _start_tls_hub(env)
+
+    held = []
+    try:
+        # Four stalled TLS handshakes from one source: connected, silent.
+        for _ in range(4):
+            held.append(_dial_from('127.0.0.2', env.link_port))
+        fifth = _dial_from('127.0.0.2', env.link_port)
+        held.append(fifth)
+        check(_drain_until_close(fifth) == b'', '5th pending TLS handshake from one source was served')
+        # Another source completes TLS and gets the link CHALLENGE.
+        kind, payload = _tls_probe(env, '127.0.0.3', env.link_port, str(env.dir / 'hubgood-ca.pem'))
+        check(kind == CHALLENGE and len(payload) == 32, (kind, len(payload)))
+        # Loopback (exempt, like a local terminator) still connects.
+        env.start_node('alpha', target='localhost:%d' % env.link_port, extra={
+            'MCP_NODE_CONNECT_TLS': '1', 'MCP_NODE_CONNECT_CA_FILE': str(env.dir / 'hubgood-ca.pem')})
+        check(env.wait_node('alpha'), 'TLS node did not connect next to a capped source')
+    finally:
+        for s in held:
+            s.close()
+
+
+def case_tls_builtin_failed_handshakes_ban(env):
+    import shutil
+    if sys.platform != 'linux':
+        raise SkipCase('needs the whole 127/8 on loopback')
+    if shutil.which('openssl') is None:
+        raise SkipCase('openssl CLI not found')
+    d = str(env.dir)
+    _make_ca(d, 'hubgood')
+    _make_server_cert(d, 'hubgood')
+    hub = _start_tls_hub(env)
+
+    for _ in range(8):
+        s = _dial_from('127.0.0.4', env.link_port)
+        s.sendall(b'this is not a TLS record at all')
+        _drain_until_close(s)
+        s.close()
+    check(wait_until(lambda: 'refusing 127.0.0.4' in hub.logs(), 5),
+          'no ban after 8 failed TLS handshakes: ' + hub.logs()[-1000:])
+    # The ban refuses at accept: not even a TLS alert goes out.
+    s = _dial_from('127.0.0.4', env.link_port)
+    check(_drain_until_close(s) == b'', 'banned source still got TLS bytes')
+    s.close()
+    kind, payload = _tls_probe(env, '127.0.0.5', env.link_port, str(env.dir / 'hubgood-ca.pem'))
+    check(kind == CHALLENGE and len(payload) == 32, (kind, len(payload)))
+
+
 def _dial_from(src_ip, port):
     s = socket.socket()
     s.settimeout(5)
@@ -777,6 +985,10 @@ CASES = [
     ('default listener mode unaffected', case_listen_mode_unaffected),
     ('a second listener on a taken port fails with AddressInUse', case_second_listener_refused),
     ('TLS link: trusted CA connects and serves exec, other CA and wrong name never appear', case_tls_link),
+    ('built-in TLS hub: trusted CA node serves 13 tools and exec', case_tls_builtin_hub),
+    ('built-in TLS hub: plaintext node refused, hub stays up', case_tls_builtin_plaintext_refused),
+    ('built-in TLS hub: per-source cap with real TLS sources', case_tls_builtin_per_source_cap),
+    ('built-in TLS hub: failed TLS handshakes ban the source', case_tls_builtin_failed_handshakes_ban),
     ('per-source cap: 5th pending handshake from one IP refused, other IP served', case_per_source_pending_cap),
     ('repeated failed handshakes ban the source, not others', case_failed_handshakes_ban_source),
 ]
