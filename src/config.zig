@@ -11,6 +11,7 @@ const util = @import("util.zig");
 const session_mod = @import("session.zig");
 const env_state = @import("env_state.zig");
 const link = @import("link.zig");
+const build_options = @import("build_options");
 
 const TOKEN_FILE_MAX_BYTES: usize = 4096;
 const MIN_INFLIGHT_BYTES: u64 = 1024 * 1024; // config floor: below this the in-flight budget is unusable
@@ -61,6 +62,12 @@ pub const Config = struct {
     /// hub mode: node-link listener and the secrets nodes authenticate with.
     hub_listen: ?Endpoint = null,
     hub_secrets: ?link.SecretSet = null,
+    /// hub mode: serve the node-link listener over TLS 1.3 with this PEM
+    /// certificate chain and private key (MCP_NODE_HUB_TLS_CERT_FILE /
+    /// MCP_NODE_HUB_TLS_KEY_FILE). Setting them in a build without
+    /// -Dtls-server is a startup error.
+    hub_tls_cert_file: ?[]const u8 = null,
+    hub_tls_key_file: ?[]const u8 = null,
     /// hub mode: the live node registry (set by main, read by http).
     hub: ?*anyopaque = null,
 };
@@ -273,6 +280,22 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 std.debug.print("MCP_NODE_HUB_SECRET_FILE is invalid: {s}\n", .{@errorName(err)});
                 return error.InvalidConfig;
             };
+            var tls_cert = getEnv(arena, "MCP_NODE_HUB_TLS_CERT_FILE");
+            var tls_key = getEnv(arena, "MCP_NODE_HUB_TLS_KEY_FILE");
+            if (tls_cert != null and tls_cert.?.len == 0) tls_cert = null;
+            if (tls_key != null and tls_key.?.len == 0) tls_key = null;
+            if (tls_cert != null or tls_key != null) {
+                if (comptime !build_options.tls_server) {
+                    std.debug.print("MCP_NODE_HUB_TLS_CERT_FILE/MCP_NODE_HUB_TLS_KEY_FILE need a build with -Dtls-server\n", .{});
+                    return error.InvalidConfig;
+                }
+                if (tls_cert == null or tls_key == null) {
+                    std.debug.print("MCP_NODE_HUB_TLS_CERT_FILE and MCP_NODE_HUB_TLS_KEY_FILE must be set together\n", .{});
+                    return error.InvalidConfig;
+                }
+                cfg.hub_tls_cert_file = tls_cert;
+                cfg.hub_tls_key_file = tls_key;
+            }
         },
     }
     return cfg;
@@ -848,4 +871,74 @@ test "config link modes: connect, hub, exclusivity and fatal secrets" {
         .{ .key = "MCP_NODE_HUB_LISTEN", .value = "0.0.0.0:8443" },
     });
     try testing.expectError(error.InvalidConfig, loadConfigMode(arena, io, "hub:1"));
+}
+
+test "config hub TLS cert/key env parsing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "tok\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "hsec", .data = "one\n" });
+    const token: EnvVar = .{ .key = "MCP_NODE_TOKEN_FILE", .value = try tmpRelPath(arena, &tmp, "token") };
+    const hsec: EnvVar = .{ .key = "MCP_NODE_HUB_SECRET_FILE", .value = try tmpRelPath(arena, &tmp, "hsec") };
+    const listen: EnvVar = .{ .key = "MCP_NODE_HUB_LISTEN", .value = "127.0.0.1:8443" };
+    defer env_state.process_environ = .empty;
+
+    // Both set: parsed in -Dtls-server builds, a startup error otherwise.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        listen,
+        .{ .key = "MCP_NODE_HUB_TLS_CERT_FILE", .value = "/etc/mcp/hub.pem" },
+        .{ .key = "MCP_NODE_HUB_TLS_KEY_FILE", .value = "/etc/mcp/hub.key" },
+    });
+    if (build_options.tls_server) {
+        const cfg = try loadConfig(arena, io);
+        try testing.expectEqualStrings("/etc/mcp/hub.pem", cfg.hub_tls_cert_file.?);
+        try testing.expectEqualStrings("/etc/mcp/hub.key", cfg.hub_tls_key_file.?);
+    } else {
+        try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+    }
+
+    // Only one of the pair is an error in every build flavor.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        listen,
+        .{ .key = "MCP_NODE_HUB_TLS_CERT_FILE", .value = "/etc/mcp/hub.pem" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        listen,
+        .{ .key = "MCP_NODE_HUB_TLS_KEY_FILE", .value = "/etc/mcp/hub.key" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+
+    // Empty values count as unset: the hub stays plain TCP.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        token,
+        hsec,
+        listen,
+        .{ .key = "MCP_NODE_HUB_TLS_CERT_FILE", .value = "" },
+        .{ .key = "MCP_NODE_HUB_TLS_KEY_FILE", .value = "" },
+    });
+    const no_tls = try loadConfig(arena, io);
+    try testing.expect(no_tls.hub_tls_cert_file == null and no_tls.hub_tls_key_file == null);
+
+    // Node mode ignores the hub TLS variables entirely.
+    env_state.process_environ = try makeEnviron(arena, &.{
+        .{ .key = "MCP_NODE_CONNECT", .value = "hub:1" },
+        .{ .key = "MCP_NODE_CONNECT_SECRET_FILE", .value = try tmpRelPath(arena, &tmp, "hsec") },
+        .{ .key = "MCP_NODE_HUB_TLS_CERT_FILE", .value = "/etc/mcp/hub.pem" },
+        .{ .key = "MCP_NODE_HUB_TLS_KEY_FILE", .value = "/etc/mcp/hub.key" },
+    });
+    const node = try loadConfig(arena, io);
+    try testing.expectEqual(Mode.node, node.mode);
+    try testing.expect(node.hub_tls_cert_file == null and node.hub_tls_key_file == null);
 }

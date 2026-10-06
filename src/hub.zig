@@ -24,6 +24,56 @@ const util = @import("util.zig");
 const link = @import("link.zig");
 const config = @import("config.zig");
 
+const build_options = @import("build_options");
+const tls_server = if (build_options.tls_server) @import("tls_server.zig") else struct {};
+
+/// Byte channel of one accepted link: the plain socket, or, in a
+/// -Dtls-server build with MCP_NODE_HUB_TLS_* set, TLS over the same
+/// socket (see tls_server.zig). Without the build option this alias is
+/// exactly the plain FdConn, so the default build is unchanged.
+const Conn = if (build_options.tls_server) union(enum) {
+    plain: link.FdConn,
+    tls: *tls_server.Conn,
+
+    pub fn readSome(self: Conn, buf: []u8, timeout_ms: u64) !usize {
+        return switch (self) {
+            .plain => |p| p.readSome(buf, timeout_ms),
+            .tls => |t| t.readSome(buf, timeout_ms),
+        };
+    }
+
+    pub fn write(self: Conn, bytes: []const u8, timeout_ms: u64) !void {
+        return switch (self) {
+            .plain => |p| p.write(bytes, timeout_ms),
+            .tls => |t| t.write(bytes, timeout_ms),
+        };
+    }
+
+    pub fn flush(self: Conn, timeout_ms: u64) !void {
+        return switch (self) {
+            .plain => |p| p.flush(timeout_ms),
+            .tls => |t| t.flush(timeout_ms),
+        };
+    }
+} else link.FdConn;
+
+fn plainConn(fd: os.net.Handle) Conn {
+    return if (build_options.tls_server) .{ .plain = .{ .fd = fd } } else .{ .fd = fd };
+}
+
+/// Free the transport state of a conn that no Link took over (plain
+/// sockets own nothing).
+fn connDeinit(conn: Conn) void {
+    if (build_options.tls_server) {
+        if (conn == .tls) conn.tls.destroy();
+    }
+}
+
+/// Hub.tls stays a void placeholder in default builds, so the struct
+/// layout there is untouched.
+const TlsField = if (build_options.tls_server) ?*tls_server.Server else void;
+const defaultTls: TlsField = if (build_options.tls_server) null else {};
+
 pub const PING_INTERVAL_MS: u64 = 15 * 1000;
 pub const DEAD_AFTER_MS: u64 = 45 * 1000;
 pub const HANDSHAKE_MS: u64 = 10 * 1000;
@@ -200,6 +250,9 @@ pub const Hub = struct {
     /// Per-source pending counts and failure bans (fixed size).
     sources_mutex: Io.Mutex = .init,
     sources: SourceTable = .{},
+    /// TLS server state for the node-link listener (MCP_NODE_HUB_TLS_*),
+    /// or null when links stay plain TCP. `void` without -Dtls-server.
+    tls: TlsField = defaultTls,
 
     pub fn init(io: Io, cfg: *const config.Config, secrets: link.SecretSet) Hub {
         return .{ .io = io, .cfg = cfg, .secrets = secrets };
@@ -344,6 +397,7 @@ const Waiter = struct {
 pub const Link = struct {
     hub: *Hub,
     stream: Io.net.Stream,
+    conn: Conn,
     name: []u8,
     connected_at: Io.Timestamp,
     write_mutex: Io.Mutex = .init,
@@ -356,11 +410,11 @@ pub const Link = struct {
     waiters_mutex: Io.Mutex = .init,
     waiters: std.AutoHashMapUnmanaged(u32, *Waiter) = .empty,
 
-    fn create(hub: *Hub, stream: Io.net.Stream, name: []const u8) !*Link {
+    fn create(hub: *Hub, stream: Io.net.Stream, conn: Conn, name: []const u8) !*Link {
         const owned = try gpa.dupe(u8, name);
         errdefer gpa.free(owned);
         const ln = try gpa.create(Link);
-        ln.* = .{ .hub = hub, .stream = stream, .name = owned, .connected_at = Io.Clock.awake.now(hub.io) };
+        ln.* = .{ .hub = hub, .stream = stream, .conn = conn, .name = owned, .connected_at = Io.Clock.awake.now(hub.io) };
         return ln;
     }
 
@@ -370,6 +424,7 @@ pub const Link = struct {
 
     pub fn release(self: *Link) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        connDeinit(self.conn);
         self.stream.close(self.hub.io);
         self.waiters.deinit(gpa);
         gpa.free(self.name);
@@ -398,7 +453,7 @@ pub const Link = struct {
         self.write_mutex.lockUncancelable(io);
         defer self.write_mutex.unlock(io);
         // kill() never takes the write mutex, so calling it here is safe.
-        link.writeFrameParts(self.stream.socket.handle, kind, sid, parts, timeout_ms) catch self.kill();
+        link.writeFramePartsOn(self.conn, kind, sid, parts, timeout_ms) catch self.kill();
     }
 
     /// PING the peer and wait up to PROBE_MS for any inbound frame.
@@ -555,22 +610,22 @@ const Authenticated = struct {
 /// costs the same HMAC as a bad MAC for a known name.
 const DUMMY_KEY = "mcp-node-reverse-unknown-name";
 
-/// Authenticate a freshly accepted peer. Returns the node name and the
-/// WELCOME payload (in `arena`) or an error after sending GOAWAY where that
-/// makes sense.
-fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) !Authenticated {
+/// Authenticate a freshly accepted peer over `conn`. Returns the node name
+/// and the WELCOME payload (in `arena`) or an error after sending GOAWAY
+/// where that makes sense. `started` bounds the whole handshake phase
+/// (transport setup included) to HANDSHAKE_MS.
+fn handshake(hub: *Hub, arena: Allocator, conn: Conn, started: Io.Timestamp) !Authenticated {
     const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
     var nonce: [link.NONCE_LEN]u8 = undefined;
     try hub.io.randomSecure(&nonce);
-    const started = Io.Clock.awake.now(hub.io);
-    try link.writeFrame(fd, .challenge, 0, &nonce, timeout_ms);
-    const frame = try link.readFrameWithin(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, hub.io, started, HANDSHAKE_MS);
+    try link.writeFramePartsOn(conn, .challenge, 0, &.{&nonce}, timeout_ms);
+    const frame = try link.readFrameWithinOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, hub.io, started, HANDSHAKE_MS);
     if (frame.kind != .hello) {
-        link.writeFrame(fd, .goaway, 0, "expected hello", timeout_ms) catch {};
+        link.writeFramePartsOn(conn, .goaway, 0, &.{"expected hello"}, timeout_ms) catch {};
         return error.BadHello;
     }
     const hello = link.parseHello(arena, frame.payload) catch |err| {
-        link.writeFrame(fd, .goaway, 0, "bad hello", timeout_ms) catch {};
+        link.writeFramePartsOn(conn, .goaway, 0, &.{"bad hello"}, timeout_ms) catch {};
         return err;
     };
     const secret = hub.secrets.lookup(hello.name);
@@ -578,7 +633,7 @@ fn handshake(hub: *Hub, arena: Allocator, fd: os.net.Handle) !Authenticated {
     // work: the unknown-name path still computes one HMAC, with a dummy key.
     const mac_ok = link.verifyAuth(.node, secret orelse DUMMY_KEY, &nonce, &hello.nonce, hello.name, hello.auth);
     if (!(mac_ok and secret != null)) {
-        link.writeFrame(fd, .goaway, 0, "auth failed", timeout_ms) catch {};
+        link.writeFramePartsOn(conn, .goaway, 0, &.{"auth failed"}, timeout_ms) catch {};
         return error.AuthFailed;
     }
     const welcome = try link.buildWelcome(arena, secret.?, &nonce, &hello.nonce, hello.name);
@@ -617,7 +672,30 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
         stream.close(hub.io);
         return null;
     };
-    const auth = handshake(hub, arena_state.allocator(), fd) catch |err| {
+    // One deadline for the whole handshake phase: a transport handshake
+    // (when the build has one) and the HELLO exchange share HANDSHAKE_MS.
+    const started = Io.Clock.awake.now(hub.io);
+    var conn = plainConn(fd);
+    var conn_taken = false;
+    defer if (!conn_taken) connDeinit(conn);
+    if (build_options.tls_server) {
+        if (hub.tls) |srv| {
+            // TLS first; the HELLO exchange below then runs over it. A bad
+            // TLS handshake is the peer's failure (garbage, no TLS, stale
+            // deadline), local setup trouble is neutral — same rule the
+            // protocol handshake below follows.
+            const tc = tls_server.Conn.accept(srv, hub.io, fd, started, HANDSHAKE_MS) catch |err| {
+                outcome = switch (@as(anyerror, err)) {
+                    error.OutOfMemory, error.EntropyUnavailable, error.Canceled => .neutral,
+                    else => .failed,
+                };
+                stream.close(hub.io);
+                return null;
+            };
+            conn = .{ .tls = tc };
+        }
+    }
+    const auth = handshake(hub, arena_state.allocator(), conn, started) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
         // Out of memory, no entropy or shutdown is ours; everything else
         // counts against the peer (no or bad HELLO, wrong MAC, unknown
@@ -637,14 +715,15 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     if (hub.nameHeldByLiveLink(auth.name)) {
         std.debug.print("hub: refused a second link for '{s}': " ++ NAME_IN_USE ++ "\n", .{auth.name});
         const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
-        link.writeFrame(fd, .goaway, 0, NAME_IN_USE, timeout_ms) catch {};
+        link.writeFramePartsOn(conn, .goaway, 0, &.{NAME_IN_USE}, timeout_ms) catch {};
         stream.close(hub.io);
         return null;
     }
-    const ln = Link.create(hub, stream, auth.name) catch {
+    const ln = Link.create(hub, stream, conn, auth.name) catch {
         stream.close(hub.io);
         return null;
     };
+    conn_taken = true; // the link owns the transport state from here on
     ln.writeFrame(.welcome, 0, &.{auth.welcome});
     if (ln.dead.load(.acquire)) {
         ln.release();
@@ -659,11 +738,10 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
 }
 
 fn readLoop(ln: *Link) !void {
-    const fd = ln.stream.socket.handle;
     while (!ln.dead.load(.acquire)) {
         // Any inbound frame refreshes liveness: the per-read idle bound is
         // the 45 s silence limit.
-        const frame = try link.readFrame(gpa, fd, link.MAX_PAYLOAD, DEAD_AFTER_MS);
+        const frame = try link.readFrameOn(gpa, ln.conn, link.MAX_PAYLOAD, DEAD_AFTER_MS);
         _ = ln.rx_frames.fetchAdd(1, .acq_rel);
         switch (frame.kind) {
             .resp => ln.fulfil(frame.stream_id, frame.payload), // takes payload
@@ -758,6 +836,16 @@ fn acceptLoop(hub: *Hub, server: *Io.net.Server) void {
 /// `server` must outlive the hub (main keeps it for the process lifetime).
 pub fn start(hub: *Hub, server: *Io.net.Server) !void {
     const ep = hub.cfg.hub_listen orelse return error.NoHubListen;
+    if (build_options.tls_server) {
+        if (hub.cfg.hub_tls_cert_file) |cert_file| {
+            const srv = tls_server.Server.init(hub.io, cert_file, hub.cfg.hub_tls_key_file.?) catch |err| {
+                std.debug.print("hub TLS setup failed: {s}\n", .{@errorName(err)});
+                return error.TlsSetupFailed;
+            };
+            hub.tls = srv;
+            std.debug.print("hub: serving TLS 1.3 node links (mbedTLS {s})\n", .{tls_server.version()});
+        }
+    }
     const addr = try Io.net.IpAddress.parse(ep.host, ep.port);
     server.* = try os.net.listenTcp(hub.io, addr); // no SO_REUSEPORT, see os.net
     const a = try std.Thread.spawn(.{}, acceptLoop, .{ hub, server });
@@ -847,8 +935,8 @@ test "hub registry: a new link for a name replaces the old one" {
     defer p1.far.close(io);
     const p2 = try tcpPair(io, &fx.server);
     defer p2.far.close(io);
-    const a = try Link.create(&fx.hub, p1.near, "pc");
-    const b = try Link.create(&fx.hub, p2.near, "pc");
+    const a = try Link.create(&fx.hub, p1.near, plainConn(p1.near.socket.handle), "pc");
+    const b = try Link.create(&fx.hub, p2.near, plainConn(p2.near.socket.handle), "pc");
     try fx.hub.register(a);
     try testing.expect(fx.hub.acquire("pc").? == a);
     a.release();
@@ -894,7 +982,7 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
 
     const p = try tcpPair(io, &fx.server);
     defer p.far.close(io);
-    const ln = try Link.create(&fx.hub, p.near, "pc");
+    const ln = try Link.create(&fx.hub, p.near, plainConn(p.near.socket.handle), "pc");
     defer ln.release();
     const far = p.far.socket.handle;
 

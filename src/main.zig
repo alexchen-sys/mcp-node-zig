@@ -277,4 +277,6 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("node_link.zig"));
     std.testing.refAllDecls(@import("hub.zig"));
     std.testing.refAllDecls(@import("stdio.zig"));
+    if (@import("build_options").tls_server)
+        std.testing.refAllDecls(@import("tls_server.zig"));
 }
