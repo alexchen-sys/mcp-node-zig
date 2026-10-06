@@ -86,7 +86,10 @@ fn addMbedTls(b: *std.Build, root: *std.Build.Module) void {
         .file = b.path("tls/mcp_hub_threading.c"),
         .flags = &.{ "-DMBEDTLS_CONFIG_FILE=<mcp_hub_mbedtls_config.h>", "-std=c99" },
     });
-    // Windows entropy uses BCryptGenRandom (see mbedtls entropy_poll.c).
-    if (root.resolved_target.?.result.os.tag == .windows)
+    // Windows entropy uses BCryptGenRandom, and x509_crt.c parses IP CNs
+    // with inet_pton (ws2_32).
+    if (root.resolved_target.?.result.os.tag == .windows) {
         root.linkSystemLibrary("bcrypt", .{});
+        root.linkSystemLibrary("ws2_32", .{});
+    }
 }

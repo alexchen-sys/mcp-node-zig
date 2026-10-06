@@ -24,6 +24,13 @@ const link = @import("link.zig");
 
 pub const c = @cImport({
     @cDefine("MBEDTLS_CONFIG_FILE", "<mcp_hub_mbedtls_config.h>");
+    // In optimizing builds zig translates with _FORTIFY_SOURCE on, and
+    // mingw-w64's fortified string.h then defines static inlines calling
+    // wcscat_s/wcscpy_s, which translate-c renders as unused local structs
+    // (a hard error). The fortified view buys nothing here — the C library
+    // keeps its own fortify at C-compile time regardless — so the import
+    // view asks for the plain declarations.
+    @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("mbedtls/ssl.h");
     @cInclude("mbedtls/x509_crt.h");
     @cInclude("mbedtls/pk.h");
