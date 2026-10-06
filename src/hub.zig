@@ -619,9 +619,13 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     };
     const auth = handshake(hub, arena_state.allocator(), fd) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
-        // Out of memory or entropy is ours; everything else is the peer's
-        // doing (no or bad HELLO, wrong MAC, unknown name, deadline).
-        outcome = if (@as(anyerror, err) == error.OutOfMemory) .neutral else .failed;
+        // Out of memory, no entropy or shutdown is ours; everything else
+        // counts against the peer (no or bad HELLO, wrong MAC, unknown
+        // name, deadline, reset mid-handshake).
+        outcome = switch (@as(anyerror, err)) {
+            error.OutOfMemory, error.EntropyUnavailable, error.Canceled => .neutral,
+            else => .failed,
+        };
         stream.close(hub.io);
         return null;
     };
