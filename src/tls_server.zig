@@ -11,11 +11,13 @@
 //! peer cannot stretch the budget, exactly like the plain-socket path.
 //!
 //! Threads: the config/certificate live read-only behind the shared
-//! Server; every connection owns its mbedTLS context. As documented by
-//! mbedTLS, one thread may read while another writes on the same context —
-//! the hub's reader loop and its writers rely on that, and mbedTLS's PSA
-//! core is made thread-safe by the OS mutex bindings in
-//! tls/mcp_hub_threading.c (installed once at server init).
+//! Server; every connection owns its mbedTLS context. The hub reads and
+//! writes a link from different threads; that is safe here because this
+//! pinned mbedTLS 3.6 server's read path never writes to the socket (no
+//! KeyUpdate support, session tickets stay off without f_ticket_write, and
+//! link writes are serialized by the hub's write mutex). mbedTLS's PSA core
+//! is made thread-safe by the OS mutex bindings in tls/mcp_hub_threading.c
+//! (installed once at server init).
 
 const std = @import("std");
 const Io = std.Io;
@@ -138,17 +140,18 @@ pub const Conn = struct {
     /// rest of the handshake budget counted from `started`.
     pub fn accept(server: *Server, io: Io, fd: os.net.Handle, started: Io.Timestamp, budget_ms: u64) !*Conn {
         const self = try gpa.create(Conn);
+        // Both defers fire on every error path; declared in this order so
+        // the ssl context is freed before the Conn holding it (LIFO).
+        var conn_taken = false;
+        defer if (!conn_taken) gpa.destroy(self);
         self.* = .{ .fd = fd, .io = io, .ssl = undefined };
         c.mbedtls_ssl_init(&self.ssl);
-        var ssl_live = true;
-        defer if (!ssl_live) c.mbedtls_ssl_free(&self.ssl);
-        errdefer gpa.destroy(self);
+        var ssl_taken = false;
+        defer if (!ssl_taken) c.mbedtls_ssl_free(&self.ssl);
 
         const rc = c.mbedtls_ssl_setup(&self.ssl, &server.conf);
-        if (rc != 0) {
-            ssl_live = false;
+        if (rc != 0)
             return logMbedErr("mbedtls_ssl_setup", rc, error.OutOfMemory);
-        }
         c.mbedtls_ssl_set_bio(&self.ssl, self, bioSend, null, bioRecvTimeout);
 
         const elapsed_i = started.untilNow(io, .awake).toMilliseconds();
@@ -159,12 +162,17 @@ pub const Conn = struct {
 
         while (true) {
             const hrc = c.mbedtls_ssl_handshake(&self.ssl);
-            if (hrc == 0) return self;
+            if (hrc == 0) {
+                ssl_taken = true;
+                conn_taken = true;
+                return self;
+            }
             switch (hrc) {
                 c.MBEDTLS_ERR_SSL_WANT_READ, c.MBEDTLS_ERR_SSL_WANT_WRITE => {
                     if (remainingMs(self) == 0) return error.LinkTimeout;
                     continue;
                 },
+                c.MBEDTLS_ERR_SSL_ALLOC_FAILED => return error.OutOfMemory,
                 c.MBEDTLS_ERR_SSL_TIMEOUT => return error.LinkTimeout,
                 else => {
                     var buf: [128]u8 = undefined;
