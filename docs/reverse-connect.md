@@ -177,14 +177,19 @@ do not survive a node restart.
 - The hub keeps at most 16 unauthenticated handshakes at once, and at most
   4 from one source: one IPv4 address (IPv4-mapped IPv6 included) or one
   IPv6 /64. Further connections are closed before CHALLENGE.
-- 8 failed handshakes from one source within 60 s (no or bad HELLO, wrong
-  MAC, unknown name, HELLO deadline) make the hub close that source's
-  connections at once for 60 s, and the hub logs it. A successful handshake
-  resets the count.
+- 8 failed handshakes from one source within 60 s of its first failure (no
+  or bad HELLO, wrong MAC, unknown name, HELLO deadline, connection reset
+  mid-handshake) make the hub close that source's connections at once for
+  60 s, and the hub logs it. The window is fixed, not sliding. A successful
+  handshake resets the count.
 - Sources are tracked in a fixed table of 64 entries. When it is full, the
   least recently seen entry without a handshake in progress is reused, so an
   attacker with many addresses can end a ban early; the global cap of 16
   still holds.
+- Limits follow addresses, not nodes. Nodes behind one NAT, one IPv6 /64 or
+  a NAT64 prefix share a cap and a ban, so a hostile neighbour there can keep
+  them out. An attacker holding a larger IPv6 block has many /64s and can
+  still fill the global 16; a firewall or a terminator is the answer there.
 - 127.0.0.1 and ::1 are exempt. Behind a local TLS terminator every node
   arrives from loopback, so these limits do not apply there: limit
   connections per IP in the terminator (nginx `limit_conn`, HAProxy

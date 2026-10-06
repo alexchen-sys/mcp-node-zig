@@ -215,7 +215,7 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 - **The handshake authenticates, it does not protect the link.** Hub and node prove the secret with HMAC-SHA256 over fresh nonces, but later frames are neither encrypted nor integrity-protected: over plain TCP an active relay can read and change them.
 - **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. The hub has no TLS server, so terminate TLS in front of its link port and keep that port on loopback.
 - **Plain TCP links are for the same host or a trusted LAN.**
-- **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. Loopback is exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can.
+- **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. 127.0.0.1 and ::1 are exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can.
 - **Out of scope:** per-tool or per-path permissions, sandboxing, audit logs, and a compromised hub or node host. The node runs with the full rights of its OS user.
 
 ## Configuration
