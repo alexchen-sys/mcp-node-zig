@@ -1346,8 +1346,10 @@ test "read http request rejects chunked transfer encoding" {
 
         // Frames written after the serve loop returned stay unread in the
         // socket: chunk framing was never interpreted.
+        // Wait instead of a zero-timeout poll: some platforms make written
+        // bytes visible to the other end of a socketpair a moment later.
         try os.writeAllFd(sock.peer, "5\r\nhello\r\n0\r\n\r\n");
-        try std.testing.expect(testSocketReadable(sock.subject));
+        try std.testing.expect(testWaitReadable(sock.subject, 1000));
     }
 }
 
