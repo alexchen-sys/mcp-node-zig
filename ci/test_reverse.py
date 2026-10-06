@@ -694,7 +694,10 @@ def _dial_from(src_ip, port):
 
 
 def _first_frame_type(sock):
-    """Type of the first frame the hub sends, or None when it closes first."""
+    """Type of the first frame the hub sends, None when it closes first.
+
+    A timeout raises: a hub that hangs is not a hub that refused.
+    """
     buf = b''
     try:
         while len(buf) < 9:
@@ -702,8 +705,10 @@ def _first_frame_type(sock):
             if not chunk:
                 return None
             buf += chunk
-    except (ConnectionResetError, socket.timeout):
+    except ConnectionResetError:
         return None
+    except socket.timeout:
+        raise AssertionError('hub neither answered nor closed the connection')
     return buf[4]
 
 
