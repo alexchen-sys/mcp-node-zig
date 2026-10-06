@@ -48,17 +48,18 @@ jobs:
         shell: bash
         run: zig build -Dtls-server -Doptimize=ReleaseSafe
 
+      - name: Python reverse connect suite (-Dtls-server binary)
+        shell: bash
+        run: python3 ci/test_reverse.py
+
       - name: Cross builds (-Dtls-server)
+        # Runs last: every cross build replaces zig-out/bin/mcp-node.
         shell: bash
         run: |
           set -e
           zig build -Dtls-server -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
           zig build -Dtls-server -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
           zig build -Dtls-server -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
-
-      - name: Python reverse connect suite (-Dtls-server binary)
-        shell: bash
-        run: python3 ci/test_reverse.py
 
   test:
     strategy:
