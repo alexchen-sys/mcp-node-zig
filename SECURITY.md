@@ -26,6 +26,8 @@ In scope:
 - Request smuggling or desync in the HTTP layer
 - Exceeding the configured resource caps (output, connections, sessions, request size)
 - One session reading or killing another without its id
+- Connecting to a hub as a node without that node's secret
+- Audit log records altered, removed or reordered without `audit-verify` noticing
 
 Out of scope:
 
@@ -36,7 +38,8 @@ Out of scope:
 
 ## Deploying safely
 
-- Keep the default `127.0.0.1` bind. For remote access, put TLS in front or use a VPN. The built-in HTTP is plaintext.
+- Keep the default `127.0.0.1` bind. For remote machines, use reverse connect with `MCP_NODE_CONNECT_TLS=1`; to expose the HTTP API directly, put a TLS proxy or a VPN in front of it.
 - Keep the token file at `0600` and rotate it if exposed.
 - Leave `MCP_NODE_ALLOWED_HOSTS` and `MCP_NODE_ALLOWED_ORIGINS` at their defaults unless you need more.
 - Run as a dedicated, unprivileged user. Root isn't needed.
+- Turn on the audit log (`MCP_NODE_AUDIT_FILE`) and keep its key off the audited machine where you can.
