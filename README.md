@@ -6,13 +6,13 @@
 
 English | [Русский](README.ru.md) | [中文](README.zh.md)
 
-Give your AI agent a shell on any machine. One binary, no runtime, no SSH.
+Your servers call home. Your agent gets a structured shell on any machine, even behind NAT — you keep the keys, the perimeter and the kill switch.
 
 ![mcp-node-zig: a node behind NAT dials out to a hub, the hub runs a command on it](assets/demo.gif)
 
-**1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
+mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your agent can run commands, drive long-running sessions and read or write files there. The node dials out to a hub you run (the same binary), so the machine opens no inbound ports, no SSH key ever reaches the agent, and no third-party cloud sits in the path. The link is mutually authenticated with HMAC-SHA256 and runs over TLS, the hub rate-limits handshakes per source, and every tool call can land in a tamper-evident audit log.
 
-mcp-node-zig is a remote execution node that speaks MCP: put one static binary on a machine and your agent can run commands, drive long-running sessions and read or write files there. Since v0.2.0 the node can dial out to a hub instead of listening, so a box behind NAT or someone else's firewall is reachable with no inbound ports and no SSH. It answers its first MCP request 1.9 ms after start and idles at 0.62 MiB, which makes leaving one on every machine basically free.
+**1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
 
 ## Install
 
@@ -20,7 +20,7 @@ mcp-node-zig is a remote execution node that speaks MCP: put one static binary o
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). Pin a version with `MCP_NODE_VERSION=0.2.0`, change the target directory with `PREFIX=/some/dir`.
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). Pin a version with `MCP_NODE_VERSION=0.2.1`, change the target directory with `PREFIX=/some/dir`.
 
 Manual install, Linux x86_64:
 
@@ -71,11 +71,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 
 ## Why
 
+- **Keys stay with you.** The agent holds a token for the node, never an SSH key. Stop the node and access is gone; rotate the token and every old copy stops working.
 - **Nothing to provision.** No Node, no Python, no OpenSSH, no keys to distribute. Copy one file and run it.
 - **Processes outlive requests.** Start a build, disconnect, come back and read the output by offset.
 - **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 288 KiB, not a second ~190 MiB server process.
 - **No shell unless you ask.** `exec` passes argv verbatim. `exec_shell` is the one explicit shell layer.
 - **Kills the whole tree.** Process groups on POSIX, Job Objects on Windows. No orphaned children holding pipes.
+- **Every call on the record.** Turn on the audit log and each tool call leaves an HMAC-chained JSONL line that `audit-verify` checks offline.
 - **Linux, macOS, Windows.** All three are built and smoke-tested in CI on every push.
 
 ## How is this different from SSH?
@@ -92,7 +94,7 @@ mcp-node is an execution API for agents. Through SSH, an agent gets one string t
 - **Verified file writes.** `write_file` takes base64 and returns the SHA-256 of what landed on disk.
 - **A self-describing interface.** Any MCP client discovers the tools from `tools/list`; nothing to teach the agent.
 
-Speed isn't the argument: on an open connection both are fast. The mcp-node HTTP server has no encryption of its own, so for remote machines the usual setup is both together: the node listens on `127.0.0.1` and you reach it through an SSH tunnel (`ssh -L 8341:127.0.0.1:8341 host`), a VPN or a TLS reverse proxy.
+For remote machines, [reverse connect](#reverse-connect-no-inbound-ports) replaces the tunnel: no sshd on the target and no key in the agent's hands. Where SSH is already in place, the two pair up: the node listens on `127.0.0.1` and you forward the port (`ssh -L 8341:127.0.0.1:8341 host`).
 
 ## Reverse connect (no inbound ports)
 
@@ -226,7 +228,7 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 - **Token required.** The server refuses to start with a missing or empty token file. Comparison is constant-time.
 - **Loopback by default.** It binds `127.0.0.1`. To expose it, set `MCP_NODE_HOST` and add the `host:port` clients use to `MCP_NODE_ALLOWED_HOSTS`.
 - **Host and Origin checked** before the body is parsed: unknown Host gets 421, unknown Origin gets 403.
-- **No built-in TLS server.** Put it behind a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
+- **TLS on the wire.** The node link runs over TLS, served by the hub itself in a `-Dtls-server` build or by any terminator. The local HTTP API stays on loopback; to expose it, front it with a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
 - **The token is a shell as the user the node runs as.** Run it under an account scoped to what the agent should touch.
 
 ## Security model
@@ -286,9 +288,11 @@ Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 | Connection refused | Check `MCP_NODE_HOST`/`MCP_NODE_PORT`; loopback isn't reachable from other machines. |
 | Exits at startup | Create a non-empty token file. |
 
-## Limitations
+## Roadmap
 
-Plain HTTP only, no PTY (interactive TUIs won't work). Both are on the roadmap. The API is `0.1.x` and may change.
+Shipped: reverse connect with a mutual HMAC handshake, TLS on the node link, per-source handshake limits, the tamper-evident audit log.
+
+Next: signed release artifacts, per-tool scopes, sessions that survive a node restart, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
 
 ## Build from source
 

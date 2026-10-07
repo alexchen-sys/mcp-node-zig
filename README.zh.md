@@ -6,13 +6,13 @@
 
 [English](README.md) | [Русский](README.ru.md) | 中文
 
-让你的 AI 智能体在任何机器上拥有一个 shell。单个二进制文件，无需运行时，无需 SSH。
+你的服务器主动连回你的枢纽。智能体在任何机器上（哪怕在 NAT 后面）都能拿到结构化的 shell — 密钥、边界和紧急开关始终在你手里。
 
 ![mcp-node-zig：NAT 后面的节点主动连接枢纽，枢纽在节点上执行命令](assets/demo.gif)
 
-**1.9 ms** 冷启动 · **0.62 MiB** 空闲 RSS · **8.70 MiB** 磁盘占用 · **0.7 ms** p50 执行往返（[基准测试](BENCHMARKS.md)）
+mcp-node-zig 是一个支持 MCP 的静态二进制文件。把它放到机器上，你的智能体就能在那里执行命令、驱动长时间运行的会话、读写文件。节点主动连接你自己运行的枢纽（同一个二进制文件），所以机器不开放任何入站端口，SSH 密钥永远不会交到智能体手里，路径上也没有第三方云。链路用 HMAC-SHA256 双向认证并走 TLS，枢纽按来源限制握手，每次工具调用都可以写入防篡改的审计日志。
 
-mcp-node-zig 是一个支持 MCP 的远程执行节点：在机器上放一个静态二进制文件，你的智能体就能在那里执行命令、驱动长时间运行的会话，以及读写文件。从 v0.2.0 起，节点可以主动连接枢纽，而不必监听端口，因此位于 NAT 或他人防火墙后面的机器也能访问，无需开放入站端口，也无需 SSH。它启动后 1.9 ms 即可响应第一个 MCP 请求，空闲时仅占 0.62 MiB，所以在每台机器上都留一个节点常驻，基本不花什么成本。
+**1.9 ms** 冷启动 · **0.62 MiB** 空闲 RSS · **8.70 MiB** 磁盘占用 · **0.7 ms** p50 执行往返（[基准测试](BENCHMARKS.md)）
 
 ## 安装
 
@@ -20,7 +20,7 @@ mcp-node-zig 是一个支持 MCP 的远程执行节点：在机器上放一个�
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。用 `MCP_NODE_VERSION=0.2.0` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
+脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。用 `MCP_NODE_VERSION=0.2.1` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
 
 手动安装（Linux x86_64）：
 
@@ -71,11 +71,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 
 ## 为什么用它
 
+- **密钥留在你手里。** 智能体拿到的是节点的 token，而不是 SSH 密钥。停掉节点，访问立即失效；轮换 token，所有旧副本随即作废。
 - **无需部署任何依赖。** 不需要 Node、Python、OpenSSH，也不用分发密钥。复制一个文件，运行即可。
 - **进程不随请求结束。** 启动一次构建，断开连接，回来后按偏移量读取输出。
 - **常驻成本很低。** 空闲时不到 1 MiB。每多连接一个智能体，只增加约 288 KiB，而不是再起一个约 190 MiB 的服务器进程。
 - **除非你要求，否则不用 shell。** `exec` 原样传递 argv。`exec_shell` 是唯一显式的 shell 层。
 - **终止整棵进程树。** POSIX 上用进程组，Windows 上用 Job Object。不会留下占着管道的孤儿子进程。
+- **每次调用都有记录。** 开启审计日志后，每次工具调用都会写入一行 HMAC 链式 JSONL，`audit-verify` 可离线校验。
 - **支持 Linux、macOS、Windows。** 每次推送，CI 都会构建这三个平台并跑冒烟测试。
 
 ## 它和 SSH 有什么不同？
@@ -92,7 +94,7 @@ mcp-node 是面向智能体的执行 API。通过 SSH，智能体拿到的是一
 - **可校验的文件写入。** `write_file` 接收 base64，并返回实际落盘内容的 SHA-256。
 - **自描述的接口。** 任何 MCP 客户端都能通过 `tools/list` 发现工具，无需额外教智能体。
 
-速度不是重点：连接建立后，两者都很快。mcp-node 的 HTTP 服务本身不做加密，所以对远程机器的常见做法是两者配合：节点监听 `127.0.0.1`，你通过 SSH 隧道（`ssh -L 8341:127.0.0.1:8341 host`）、VPN 或 TLS 反向代理访问它。
+对远程机器，[反向连接](#反向连接无需入站端口)可以取代隧道：目标机器不需要 sshd，密钥也不会交到智能体手里。已经部署了 SSH 的地方，两者可以配合：节点监听 `127.0.0.1`，再转发端口（`ssh -L 8341:127.0.0.1:8341 host`）。
 
 ## 反向连接（无需入站端口）
 
@@ -178,7 +180,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 - **必须提供 token。** token 文件缺失或为空时，服务器拒绝启动。比较采用常数时间。
 - **默认仅监听回环地址。** 它绑定 `127.0.0.1`。如需对外暴露，设置 `MCP_NODE_HOST`，并把客户端使用的 `host:port` 加入 `MCP_NODE_ALLOWED_HOSTS`。
 - **先校验 Host 和 Origin**，再解析请求体：未知 Host 返回 421，未知 Origin 返回 403。
-- **不内置 TLS 服务器。** 请放在反向代理、隧道或 VPN 后面，例如 `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`。
+- **链路走 TLS。** 节点链路使用 TLS，可由 `-Dtls-server` 构建的枢纽直接提供，也可由任意终结器提供。本地 HTTP API 只监听回环地址；如需对外暴露，请放在反向代理、隧道或 VPN 后面，例如 `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`。
 - **拿到 token 就等于拿到节点运行用户的 shell。** 请用权限只覆盖智能体所需范围的账户来运行它。
 
 ## 安全模型
@@ -248,9 +250,11 @@ mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
 | 连接被拒绝 | 检查 `MCP_NODE_HOST`/`MCP_NODE_PORT`；回环地址无法从其他机器访问。 |
 | 启动即退出 | 创建一个非空的 token 文件。 |
 
-## 局限
+## 路线图
 
-仅支持明文 HTTP，不支持 PTY（交互式 TUI 无法使用）。这两项都已列入路线图。API 版本为 `0.1.x`，后续可能变动。
+已发布：带双向 HMAC 握手的反向连接、节点链路 TLS、按来源的握手限制、防篡改审计日志。
+
+下一步：签名的发布产物、按工具的权限、在节点重启后仍存活的会话，以及支持交互式 TUI 的 PTY。API 版本为 `0.x`，1.0 之前仍可能变动。
 
 ## 从源码构建
 
