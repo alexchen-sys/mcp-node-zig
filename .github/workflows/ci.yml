@@ -56,6 +56,12 @@ jobs:
         shell: bash
         run: python3 ci/test_audit.py
 
+      - name: Built-in TLS hub smoke (-Dtls-server binary)
+        shell: bash
+        env:
+          MCP_SMOKE_TLS_REQUIRE: '1'
+        run: python3 ci/smoke_tls.py
+
       - name: Cross builds (-Dtls-server)
         # Runs last: every cross build replaces zig-out/bin/mcp-node.
         shell: bash
@@ -64,6 +70,69 @@ jobs:
           zig build -Dtls-server -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
           zig build -Dtls-server -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
           zig build -Dtls-server -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+
+  tls-smoke:
+    # Built-in TLS hub end to end on macOS and Windows (Linux runs the full
+    # suites in the tls-server job above).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            zig_tarball_key: aarch64-macos
+            binary: mcp-node
+          - os: windows-latest
+            zig_tarball_key: x86_64-windows
+            binary: mcp-node.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          INDEX=$(curl -fsSL https://ziglang.org/download/index.json)
+          URL=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].tarball')
+          SHA=$(printf '%s' "$INDEX" | jq -r --arg v "$ZIG_VERSION" --arg k "${{ matrix.zig_tarball_key }}" '.[$v][$k].shasum')
+          mkdir -p "$RUNNER_TEMP/zig"
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.pkg"
+          echo "$SHA  $RUNNER_TEMP/zig.pkg" | sha256sum -c -
+          case "$URL" in
+            *.zip) unzip -q "$RUNNER_TEMP/zig.pkg" -d "$RUNNER_TEMP/zig" && mv "$RUNNER_TEMP/zig"/zig-*/* "$RUNNER_TEMP/zig/" ;;
+            *) tar -xJf "$RUNNER_TEMP/zig.pkg" -C "$RUNNER_TEMP/zig" --strip-components=1 ;;
+          esac
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: OpenSSL 3 CLI for test certificates (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Unit tests (-Dtls-server)
+        shell: bash
+        run: zig build -Dtls-server test
+
+      - name: Release build (-Dtls-server)
+        shell: bash
+        run: zig build -Dtls-server -Doptimize=ReleaseSafe
+
+      - name: Built-in TLS hub smoke
+        shell: bash
+        env:
+          MCP_SMOKE_TLS_REQUIRE: '1'
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          openssl version
+          "$PY" ci/smoke_tls.py zig-out/bin/${{ matrix.binary }}
 
   test:
     strategy:
