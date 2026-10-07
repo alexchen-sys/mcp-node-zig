@@ -1,12 +1,19 @@
 #!/bin/sh
 # mcp-node-zig installer. Usage:
 #   curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
-#   MCP_NODE_VERSION=0.2.0 ... | sh   # pin a version instead of latest
+#   MCP_NODE_VERSION=0.3.0 ... | sh   # pin a version instead of latest
+#   MCP_NODE_FLAVOR=tls ... | sh      # hub build with the built-in TLS server (Linux)
 #   PREFIX=/opt/bin ... | sh          # install somewhere else
 set -eu
 
 REPO="alexchen-sys/mcp-node-zig"
 VERSION="${MCP_NODE_VERSION:-latest}"
+FLAVOR="${MCP_NODE_FLAVOR:-}"
+case "$FLAVOR" in
+    "")  suffix="" ;;
+    tls) suffix="-tls" ;;
+    *)   echo "install: unknown MCP_NODE_FLAVOR: $FLAVOR (use tls or leave it unset)" >&2; exit 1 ;;
+esac
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -37,7 +44,8 @@ case "$ARCH" in
 esac
 target="$arch-$os"
 [ "$target" = "x86_64-macos" ] && die "no x86_64 macOS build; use aarch64-macos (Apple Silicon) or build from source"
-pkg="mcp-node-v$VERSION-$target"
+[ -n "$suffix" ] && [ "$os" != linux ] && die "the tls flavor ships for Linux only; build with zig build -Dtls-server elsewhere"
+pkg="mcp-node-v$VERSION-$target$suffix"
 base="https://github.com/$REPO/releases/download/v$VERSION"
 
 # --- download + verify ---
