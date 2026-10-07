@@ -20,12 +20,12 @@ mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your 
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server, add `MCP_NODE_FLAVOR=tls` (Linux and macOS releases). Pin a version with `MCP_NODE_VERSION=0.3.0`, change the target directory with `PREFIX=/some/dir`.
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server, add `MCP_NODE_FLAVOR=tls` (Linux and macOS releases). Pin a version with `MCP_NODE_VERSION=0.3.1`, change the target directory with `PREFIX=/some/dir`.
 
 Manual install, Linux x86_64:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.1/mcp-node-v0.3.1-x86_64-linux.tar.gz | tar xz
 ```
 
 Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`, signed with [cosign](https://github.com/sigstore/cosign) keyless (Sigstore); `install.sh` verifies the signature when cosign is on your PATH.
@@ -34,7 +34,7 @@ Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zi
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.3.0-x86_64-linux/mcp-node &
+./mcp-node-v0.3.1-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.1/mcp-node-v0.3.1-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.3.0-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.3.1-x86_64-windows\mcp-node.exe
 ```
 
 From a second window:

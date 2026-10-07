@@ -1,7 +1,7 @@
 #!/bin/sh
 # mcp-node-zig installer. Usage:
 #   curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
-#   MCP_NODE_VERSION=0.3.0 ... | sh   # pin a version instead of latest
+#   MCP_NODE_VERSION=0.3.1 ... | sh   # pin a version instead of latest
 #   MCP_NODE_FLAVOR=tls ... | sh      # hub build with the built-in TLS server
 #   PREFIX=/opt/bin ... | sh          # install somewhere else
 #   MCP_NODE_VERIFY=require ... | sh  # fail unless cosign verifies the signature

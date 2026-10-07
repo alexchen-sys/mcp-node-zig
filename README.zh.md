@@ -20,12 +20,12 @@ mcp-node-zig 是一个支持 MCP 的静态二进制文件。把它放到机器�
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。需要内置 TLS 服务器的枢纽，加上 `MCP_NODE_FLAVOR=tls`（Linux 和 macOS 版本）。用 `MCP_NODE_VERSION=0.3.0` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
+脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。需要内置 TLS 服务器的枢纽，加上 `MCP_NODE_FLAVOR=tls`（Linux 和 macOS 版本）。用 `MCP_NODE_VERSION=0.3.1` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
 
 手动安装（Linux x86_64）：
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.1/mcp-node-v0.3.1-x86_64-linux.tar.gz | tar xz
 ```
 
 其他平台见 [Releases 页面](https://github.com/alexchen-sys/mcp-node-zig/releases)：`aarch64-linux`、`aarch64-macos`、`x86_64-windows`。每个版本都附带 `SHA256SUMS.txt`，并用 [cosign](https://github.com/sigstore/cosign) 无密钥（Sigstore）签名；当 PATH 中有 cosign 时，`install.sh` 会校验签名。
@@ -34,7 +34,7 @@ curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mc
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.3.0-x86_64-linux/mcp-node &
+./mcp-node-v0.3.1-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows（PowerShell）</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.1/mcp-node-v0.3.1-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.3.0-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.3.1-x86_64-windows\mcp-node.exe
 ```
 
 在另一个窗口中执行：
