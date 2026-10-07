@@ -20,12 +20,12 @@ mcp-node-zig — один статический бинарь, который г
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-Скрипт сам определяет платформу, скачивает свежий релиз, сверяет его с `SHA256SUMS.txt` и ставит в `/usr/local/bin` (или `~/.local/bin`). Зафиксировать версию: `MCP_NODE_VERSION=0.2.1`, другой каталог: `PREFIX=/some/dir`.
+Скрипт сам определяет платформу, скачивает свежий релиз, сверяет его с `SHA256SUMS.txt` и ставит в `/usr/local/bin` (или `~/.local/bin`). Хаб со встроенным TLS-сервером на Linux: `MCP_NODE_FLAVOR=tls`. Зафиксировать версию: `MCP_NODE_VERSION=0.3.0`, другой каталог: `PREFIX=/some/dir`.
 
 Ручная установка, Linux x86_64:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Для Linux ARM64, macOS (Apple Silicon) и Windows замените имя архива: `aarch64-linux.tar.gz`, `aarch64-macos.tar.gz`, `x86_64-windows.zip`. Все архивы и `SHA256SUMS.txt` лежат на [странице релиза](https://github.com/alexchen-sys/mcp-node-zig/releases).
@@ -34,7 +34,7 @@ curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mc
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.2.1-x86_64-linux/mcp-node &
+./mcp-node-v0.3.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -55,10 +55,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.2.1-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.3.0-x86_64-windows\mcp-node.exe
 ```
 
 </details>
@@ -110,7 +110,7 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 
 Для своего CA добавьте `MCP_NODE_CONNECT_CA_FILE`, для подключения по IP задайте `MCP_NODE_CONNECT_SERVER_NAME`. Конфиг терминатора и вариант без TLS для доверенной сети описаны в [docs/reverse-connect.md](docs/reverse-connect.md).
 
-Бинарь, собранный с `-Dtls-server`, умеет сам служить TLS на порту для нод (`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`), без терминатора спереди; тогда хаб видит настоящие адреса пиров и его лимиты рукопожатий по источнику работают в полную силу.
+Релизная сборка `-tls` (или любой бинарь, собранный с `-Dtls-server`) умеет сам служить TLS на порту для нод (`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`), без терминатора спереди; тогда хаб видит настоящие адреса пиров и его лимиты рукопожатий по источнику работают в полную силу.
 
 ## Конфиг
 

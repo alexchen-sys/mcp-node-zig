@@ -20,12 +20,12 @@ mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your 
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). Pin a version with `MCP_NODE_VERSION=0.2.1`, change the target directory with `PREFIX=/some/dir`.
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server on Linux, add `MCP_NODE_FLAVOR=tls`. Pin a version with `MCP_NODE_VERSION=0.3.0`, change the target directory with `PREFIX=/some/dir`.
 
 Manual install, Linux x86_64:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`.
@@ -34,7 +34,7 @@ Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zi
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.2.1-x86_64-linux/mcp-node &
+./mcp-node-v0.3.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.2.1-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.3.0-x86_64-windows\mcp-node.exe
 ```
 
 From a second window:
@@ -113,7 +113,7 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
   ./mcp-node --connect hub.example.com:8400
 ```
 
-A binary built with `-Dtls-server` can serve TLS on the link port itself
+The `-tls` release build (or any binary built with `-Dtls-server`) can serve TLS on the link port itself
 (`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`), with no
 terminator in front; the hub then sees the real peer addresses, so its
 per-source handshake limits apply as written.

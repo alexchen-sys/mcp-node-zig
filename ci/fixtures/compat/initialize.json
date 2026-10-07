@@ -6,7 +6,7 @@
       "request": {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "compat", "version": "0"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 101, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.2.1"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
+        "response": {"jsonrpc": "2.0", "id": 101, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.3.0"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
       }
     },
     {
@@ -14,7 +14,7 @@
       "request": {"jsonrpc": "2.0", "id": 102, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 102, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.2.1"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
+        "response": {"jsonrpc": "2.0", "id": 102, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.3.0"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
       }
     },
     {
@@ -22,7 +22,7 @@
       "request": {"jsonrpc": "2.0", "id": "init-str", "method": "initialize"},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": "init-str", "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.2.1"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
+        "response": {"jsonrpc": "2.0", "id": "init-str", "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "compat-node", "version": "0.3.0"}, "instructions": "Runs commands and file operations on this host. Prefer exec (argv, no shell) over exec_shell (pipes, redirects, shell syntax). For long-running or interactive processes: exec_start, then exec_poll; always exec_close, sessions persist across requests. Auth: X-Node-Token header or Authorization: Bearer."}}
       }
     }
   ]

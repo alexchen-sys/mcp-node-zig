@@ -20,12 +20,12 @@ mcp-node-zig 是一个支持 MCP 的静态二进制文件。把它放到机器�
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。用 `MCP_NODE_VERSION=0.2.1` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
+脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。Linux 上需要内置 TLS 服务器的枢纽，加上 `MCP_NODE_FLAVOR=tls`。用 `MCP_NODE_VERSION=0.3.0` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
 
 手动安装（Linux x86_64）：
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
 其他平台见 [Releases 页面](https://github.com/alexchen-sys/mcp-node-zig/releases)：`aarch64-linux`、`aarch64-macos`、`x86_64-windows`。每个版本都附带 `SHA256SUMS.txt`。
@@ -34,7 +34,7 @@ curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mc
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.2.1-x86_64-linux/mcp-node &
+./mcp-node-v0.3.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows（PowerShell）</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.2.1/mcp-node-v0.2.1-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.2.1-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.3.0-x86_64-windows\mcp-node.exe
 ```
 
 在另一个窗口中执行：
@@ -110,7 +110,7 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 
 私有 CA 请加 `MCP_NODE_CONNECT_CA_FILE`；按 IP 连接时设置 `MCP_NODE_CONNECT_SERVER_NAME`。终结器配置和可信局域网下的明文 TCP 方式见 [docs/reverse-connect.md](docs/reverse-connect.md)。
 
-用 `-Dtls-server` 构建的二进制可以在节点链路端口上直接提供 TLS（`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`），无需前置终结器；此时枢纽能看到真实的对端地址，按来源的握手限制完全生效。
+`-tls` 发布版本（或任何用 `-Dtls-server` 构建的二进制）可以在节点链路端口上直接提供 TLS（`MCP_NODE_HUB_TLS_CERT_FILE` / `MCP_NODE_HUB_TLS_KEY_FILE`），无需前置终结器；此时枢纽能看到真实的对端地址，按来源的握手限制完全生效。
 
 ## 工具
 
