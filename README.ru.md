@@ -20,7 +20,7 @@ mcp-node-zig — один статический бинарь, который г
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-Скрипт сам определяет платформу, скачивает свежий релиз, сверяет его с `SHA256SUMS.txt` и ставит в `/usr/local/bin` (или `~/.local/bin`). Хаб со встроенным TLS-сервером на Linux: `MCP_NODE_FLAVOR=tls`. Зафиксировать версию: `MCP_NODE_VERSION=0.3.0`, другой каталог: `PREFIX=/some/dir`.
+Скрипт сам определяет платформу, скачивает свежий релиз, сверяет его с `SHA256SUMS.txt` и ставит в `/usr/local/bin` (или `~/.local/bin`). Хаб со встроенным TLS-сервером: `MCP_NODE_FLAVOR=tls` (релизы Linux и macOS). Зафиксировать версию: `MCP_NODE_VERSION=0.3.0`, другой каталог: `PREFIX=/some/dir`.
 
 Ручная установка, Linux x86_64:
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/inst
 curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
-Для Linux ARM64, macOS (Apple Silicon) и Windows замените имя архива: `aarch64-linux.tar.gz`, `aarch64-macos.tar.gz`, `x86_64-windows.zip`. Все архивы и `SHA256SUMS.txt` лежат на [странице релиза](https://github.com/alexchen-sys/mcp-node-zig/releases).
+Для Linux ARM64, macOS (Apple Silicon) и Windows замените имя архива: `aarch64-linux.tar.gz`, `aarch64-macos.tar.gz`, `x86_64-windows.zip`. Все архивы и `SHA256SUMS.txt` лежат на [странице релиза](https://github.com/alexchen-sys/mcp-node-zig/releases); манифест подписан [cosign](https://github.com/sigstore/cosign) без ключей (Sigstore), и `install.sh` проверяет подпись, если cosign есть в PATH.
 
 ## Быстрый старт
 
@@ -170,9 +170,9 @@ mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
 
 ## Дорожная карта
 
-Уже в коде: обратное подключение со взаимным HMAC-рукопожатием, TLS на канале ноды, лимиты рукопожатий по источнику, аудит-лог с защитой от подделки.
+Уже в коде: обратное подключение со взаимным HMAC-рукопожатием, TLS на канале ноды (на всех платформах), лимиты рукопожатий по источнику, аудит-лог с защитой от подделки, подписанные cosign релизы с provenance-аттестацией.
 
-Дальше: подписанные релизные артефакты, права по инструментам, сессии, которые переживают рестарт ноды, и PTY для интерактивных TUI. Версия `0.x`, контракт может меняться до 1.0.
+Дальше: права по инструментам, сессии, которые переживают рестарт ноды, и PTY для интерактивных TUI. Версия `0.x`, контракт может меняться до 1.0.
 
 ## Ссылки
 

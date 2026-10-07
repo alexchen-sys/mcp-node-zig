@@ -59,6 +59,22 @@ jobs:
             native: false
             flags: -Dtls-server
             suffix: -tls
+          - target: aarch64-macos
+            runner: macos-latest
+            zig_key: aarch64-macos
+            archive: tar
+            binary: mcp-node
+            native: true
+            flags: -Dtls-server
+            suffix: -tls
+          - target: x86_64-windows
+            runner: windows-latest
+            zig_key: x86_64-windows
+            archive: zip
+            binary: mcp-node.exe
+            native: true
+            flags: -Dtls-server
+            suffix: -tls
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -137,6 +153,10 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # keyless signing (Sigstore) and provenance
+      attestations: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v7
@@ -151,6 +171,25 @@ jobs:
           rm ./*.sha256
           cat SHA256SUMS.txt
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign checksum manifest (keyless, Sigstore)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle SHA256SUMS.txt.sigstore.json SHA256SUMS.txt
+          cosign verify-blob SHA256SUMS.txt \
+            --bundle SHA256SUMS.txt.sigstore.json \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            *.tar.gz
+            *.zip
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
@@ -158,4 +197,5 @@ jobs:
             *.tar.gz
             *.zip
             SHA256SUMS.txt
+            SHA256SUMS.txt.sigstore.json
           generate_release_notes: true

@@ -23,11 +23,12 @@ The default setup runs the link over TLS. Two ways to terminate it:
 
 ### Built-in TLS server
 
-Linux releases ship it as a separate `-tls` asset
-(`mcp-node-v<version>-x86_64-linux-tls.tar.gz`, also for aarch64), or
-install it with `MCP_NODE_FLAVOR=tls` in front of `install.sh`. Elsewhere,
-build from source with `zig build -Dtls-server`. Either way mbedTLS 3.6 LTS
-is compiled in (Apache-2.0). The default binaries stay without it. Then:
+Releases ship it as a separate `-tls` asset for every platform
+(`mcp-node-v<version>-<target>-tls.tar.gz`/`.zip`); on Linux and macOS
+`MCP_NODE_FLAVOR=tls` in front of `install.sh` fetches it, on Windows grab
+the `-tls` zip from the release page. To build it yourself, use
+`zig build -Dtls-server`. Either way mbedTLS 3.6 LTS is compiled in
+(Apache-2.0). The default binaries stay without it. Then:
 
 ```sh
 # hub serves TLS 1.3 on the public port itself

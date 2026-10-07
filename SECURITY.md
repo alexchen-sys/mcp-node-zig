@@ -42,4 +42,12 @@ Out of scope:
 - Keep the token file at `0600` and rotate it if exposed.
 - Leave `MCP_NODE_ALLOWED_HOSTS` and `MCP_NODE_ALLOWED_ORIGINS` at their defaults unless you need more.
 - Run as a dedicated, unprivileged user. Root isn't needed.
+- Verify what you install. `SHA256SUMS.txt` is signed keyless by the release workflow (Sigstore bundle `SHA256SUMS.txt.sigstore.json`), and every archive carries a GitHub build provenance attestation. With cosign installed, `MCP_NODE_VERIFY=require` makes `install.sh` refuse anything unsigned. By hand:
+
+  ```sh
+  cosign verify-blob SHA256SUMS.txt --bundle SHA256SUMS.txt.sigstore.json \
+    --certificate-identity "https://github.com/alexchen-sys/mcp-node-zig/.github/workflows/release.yml@refs/tags/v<version>" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  gh attestation verify mcp-node-v<version>-<target>.tar.gz --repo alexchen-sys/mcp-node-zig
+  ```
 - Turn on the audit log (`MCP_NODE_AUDIT_FILE`) and keep its key off the audited machine where you can.

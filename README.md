@@ -20,7 +20,7 @@ mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your 
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server on Linux, add `MCP_NODE_FLAVOR=tls`. Pin a version with `MCP_NODE_VERSION=0.3.0`, change the target directory with `PREFIX=/some/dir`.
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server, add `MCP_NODE_FLAVOR=tls` (Linux and macOS releases). Pin a version with `MCP_NODE_VERSION=0.3.0`, change the target directory with `PREFIX=/some/dir`.
 
 Manual install, Linux x86_64:
 
@@ -28,7 +28,7 @@ Manual install, Linux x86_64:
 curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
-Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`.
+Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`, signed with [cosign](https://github.com/sigstore/cosign) keyless (Sigstore); `install.sh` verifies the signature when cosign is on your PATH.
 
 ## Quickstart
 
@@ -290,9 +290,9 @@ Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 
 ## Roadmap
 
-Shipped: reverse connect with a mutual HMAC handshake, TLS on the node link, per-source handshake limits, the tamper-evident audit log.
+Shipped: reverse connect with a mutual HMAC handshake, TLS on the node link (every platform), per-source handshake limits, the tamper-evident audit log, cosign-signed releases with build provenance.
 
-Next: signed release artifacts, per-tool scopes, sessions that survive a node restart, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
+Next: per-tool scopes, sessions that survive a node restart, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
 
 ## Build from source
 

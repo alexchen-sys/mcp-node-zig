@@ -20,7 +20,7 @@ mcp-node-zig 是一个支持 MCP 的静态二进制文件。把它放到机器�
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。Linux 上需要内置 TLS 服务器的枢纽，加上 `MCP_NODE_FLAVOR=tls`。用 `MCP_NODE_VERSION=0.3.0` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
+脚本会检测平台，下载最新版本，用 `SHA256SUMS.txt` 校验后安装到 `/usr/local/bin`（或 `~/.local/bin`）。需要内置 TLS 服务器的枢纽，加上 `MCP_NODE_FLAVOR=tls`（Linux 和 macOS 版本）。用 `MCP_NODE_VERSION=0.3.0` 固定版本，用 `PREFIX=/some/dir` 更改安装目录。
 
 手动安装（Linux x86_64）：
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/inst
 curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.3.0/mcp-node-v0.3.0-x86_64-linux.tar.gz | tar xz
 ```
 
-其他平台见 [Releases 页面](https://github.com/alexchen-sys/mcp-node-zig/releases)：`aarch64-linux`、`aarch64-macos`、`x86_64-windows`。每个版本都附带 `SHA256SUMS.txt`。
+其他平台见 [Releases 页面](https://github.com/alexchen-sys/mcp-node-zig/releases)：`aarch64-linux`、`aarch64-macos`、`x86_64-windows`。每个版本都附带 `SHA256SUMS.txt`，并用 [cosign](https://github.com/sigstore/cosign) 无密钥（Sigstore）签名；当 PATH 中有 cosign 时，`install.sh` 会校验签名。
 
 ## 快速上手
 
@@ -252,9 +252,9 @@ mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
 
 ## 路线图
 
-已发布：带双向 HMAC 握手的反向连接、节点链路 TLS、按来源的握手限制、防篡改审计日志。
+已发布：带双向 HMAC 握手的反向连接、节点链路 TLS（全平台）、按来源的握手限制、防篡改审计日志、带构建溯源的 cosign 签名发布。
 
-下一步：签名的发布产物、按工具的权限、在节点重启后仍存活的会话，以及支持交互式 TUI 的 PTY。API 版本为 `0.x`，1.0 之前仍可能变动。
+下一步：按工具的权限、在节点重启后仍存活的会话，以及支持交互式 TUI 的 PTY。API 版本为 `0.x`，1.0 之前仍可能变动。
 
 ## 从源码构建
 
