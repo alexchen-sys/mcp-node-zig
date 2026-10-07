@@ -558,12 +558,14 @@ fn serveHubRoute(ra: Allocator, cfg: *const config.Config, io: Io, fd: std.posix
         .node => |name| {
             // The relay record: who asked which node for what, joined to the
             // node's tool.call by req_id and the link stream id.
-            const peek = audit.relayPeek(ra, body);
+            const aw = audit.fromCfg(cfg);
+            // relayPeek parses the body JSON; skip that work when audit is
+            // off so the hot relay path stays byte- and cpu-identical.
+            const peek: audit.RelayPeek = if (aw != null) audit.relayPeek(ra, body) else .{};
             const started = Io.Clock.awake.now(io);
             var sid: u32 = 0;
             const res = try hub_mod.forward(hub, ra, name, body, hub_mod.forwardDeadlineMs(cfg), &sid);
             const dur_ms: u64 = @intCast(@max(0, started.untilNow(io, .awake).toMilliseconds()));
-            const aw = audit.fromCfg(cfg);
             switch (res) {
                 .unknown_node => {
                     audit.relay(aw, client, name, peek.method, peek.tool, peek.req_id_rendered, 0, false, "unknown_node", dur_ms, body.len, 0);

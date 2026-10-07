@@ -449,13 +449,20 @@ pub fn renderReqId(buf: *Buf, id: Value) void {
         if (cut >= 2) {
             // inside \uXXXX? walk back over hex digits preceded by \u
             var k = cut;
-            while (k >= 2 and k > cut - 6 and std.ascii.isHex(rendered[k - 1])) k -= 1;
+            while (k >= 2 and k > cut -| 6 and std.ascii.isHex(rendered[k - 1])) k -= 1;
             if (k >= 2 and rendered[k - 1] == 'u' and rendered[k - 2] == '\\') cut = k - 2;
         }
         buf.len = id_start + cut;
         buf.append("~\"");
     } else {
-        buf.len = id_start + REQ_ID_MAX;
+        // A number cut on a plain byte boundary can end mid-exponent and
+        // stop being a valid literal; render a truncated non-string as null.
+        if (id == .integer or id == .bool or id == .null) {
+            buf.len = id_start + REQ_ID_MAX;
+        } else {
+            buf.len = id_start;
+            buf.append("null");
+        }
     }
 }
 
@@ -528,15 +535,20 @@ pub const Writer = struct {
     thread: ?std.Thread = null,
 
     fn nowMs(self: *const Writer) i64 {
-        return self.now_ms_override orelse Io.Clock.awake.now(self.io).toMilliseconds();
+        return self.now_ms_override orelse Io.Clock.real.now(self.io).toMilliseconds();
     }
 
     /// Enqueue a preformatted event inner. Hot path: one mutex, one memcpy,
     /// no allocation. Null writer = audit off (single branch at call site).
     pub fn enqueueInner(self: *Writer, inner: []const u8) void {
-        if (inner.len == 0 or inner.len > MAX_INNER) return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (inner.len == 0 or inner.len > MAX_INNER) {
+            // Oversize inners must not vanish silently: count them so the
+            // drain side emits the chained `dropped` marker.
+            self.dropped += 1;
+            return;
+        }
         if (self.stopping) return;
         if (self.count >= self.ring_cap) {
             switch (self.on_full) {
@@ -583,6 +595,12 @@ pub const Writer = struct {
             self.not_full.broadcast(self.io);
         }
         if (n == 0 and dropped_here == 0) return;
+        // Snapshot the chain state: a failed write rolls seq/prev/pos back
+        // so the on-disk chain keeps exact continuity, and the lost records
+        // surface as a chained `dropped` record on the next good batch.
+        const seq0 = self.seq;
+        const prev0 = self.prev;
+        const pos0 = self.log.pos;
         var batch: [BATCH_MAX * MAX_RECORD + MAX_RECORD]u8 = undefined;
         var blen: usize = 0;
         var line: Buf = undefined;
@@ -602,6 +620,13 @@ pub const Writer = struct {
         }
         os.fd.appendWrite(self.io, &self.log, batch[0..blen]) catch |err| {
             self.io_failed = true;
+            self.seq = seq0;
+            self.prev = prev0;
+            self.dropped += n + dropped_here;
+            // A partial write leaves a torn tail; cut back to the last good
+            // offset so the next batch never glues onto garbage.
+            os.fd.truncFile(self.log.fd, pos0) catch {};
+            self.log.pos = pos0;
             std.debug.print("audit: write failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -615,24 +640,40 @@ pub const Writer = struct {
     /// Size rotation, called by the draining side only, between batches so
     /// the cut lands on a record boundary. The old file is renamed to
     /// `<path>.<first-seq>` and the chain continues in a fresh file whose
-    /// first record is `rotate` (its `prev` links the two files). Failures
-    /// keep the current fd: the log keeps growing past the limit instead of
-    /// losing records, and the next batch retries.
+    /// first record is `rotate` (its `prev` links the two files). The old fd
+    /// is closed before the rename because Windows forbids renaming an open
+    /// file; a failed reopen renames back and reopens, so failures keep the
+    /// current fd: the log grows past the limit instead of losing records,
+    /// and the next batch retries.
     fn rotate(self: *Writer) void {
         var name_buf: [512]u8 = undefined;
         const rotated = std.fmt.bufPrint(&name_buf, "{s}.{d}", .{ self.path, self.file_first_seq }) catch return;
         os.fd.syncFile(self.log.fd) catch {};
-        os.fd.renamePath(self.io, self.path, rotated) catch return;
-        const new_log = os.fd.appendOpen(self.io, self.path) catch {
-            // Reopen failed: put the old name back; records keep flowing to
-            // the still-open old fd either way.
-            os.fd.renamePath(self.io, rotated, self.path) catch {};
+        const old_fd = self.log.fd;
+        os.closeFd(old_fd);
+        os.fd.renamePath(self.io, self.path, rotated) catch {
+            // Rename failed with the fd already closed: reopen the live file
+            // so the next batch still has somewhere to write.
+            self.log = os.fd.appendOpen(self.io, self.path) catch {
+                self.io_failed = true;
+                return;
+            };
             return;
         };
-        const old_fd = self.log.fd;
+        const new_log = os.fd.appendOpen(self.io, self.path) catch {
+            // Reopen failed: put the old name back and reopen it; records
+            // keep flowing to the same file either way.
+            os.fd.renamePath(self.io, rotated, self.path) catch {};
+            self.log = os.fd.appendOpen(self.io, self.path) catch {
+                self.io_failed = true;
+                return;
+            };
+            return;
+        };
         self.log = new_log;
         self.file_first_seq = self.seq;
-        os.closeFd(old_fd);
+        const seq0 = self.seq;
+        const prev0 = self.prev;
         var inner: Buf = undefined;
         inner.reset();
         inner.append("\"event\":\"rotate\",\"rotated\":");
@@ -640,6 +681,8 @@ pub const Writer = struct {
         var line: Buf = undefined;
         self.composeLine(inner.slice(), &line);
         os.fd.appendWrite(self.io, &self.log, line.slice()) catch {
+            self.seq = seq0;
+            self.prev = prev0;
             self.io_failed = true;
             return;
         };
@@ -679,6 +722,9 @@ pub const Writer = struct {
         }
         out.append("}\n");
         self.seq += 1;
+        // A truncated line would fail verification and look like tampering;
+        // the budget is sized so this never fires — assert it loudly.
+        std.debug.assert(!out.overflow);
     }
 };
 
@@ -713,7 +759,10 @@ pub fn start(gpa: Allocator, io: Io, opts: Options) !*Writer {
     const w = try gpa.create(Writer);
     errdefer gpa.destroy(w);
     var log = try os.fd.appendOpen(io, opts.path);
-    errdefer os.closeFd(log.fd);
+    // The corrupt-tail path closes and reopens the fd by hand; the flag
+    // keeps the errdefer from double-closing a dead descriptor.
+    var log_open = true;
+    errdefer if (log_open) os.closeFd(log.fd);
     w.* = .{
         .gpa = gpa,
         .io = io,
@@ -736,10 +785,12 @@ pub fn start(gpa: Allocator, io: Io, opts: Options) !*Writer {
     if (broke) {
         // Move the damaged file aside for forensics and start a new chain.
         os.closeFd(w.log.fd);
+        log_open = false;
         var name_buf: [512]u8 = undefined;
-        const aside = std.fmt.bufPrint(&name_buf, "{s}.corrupt-{d}", .{ opts.path, Io.Clock.awake.now(io).toMilliseconds() }) catch return error.NameTooLong;
+        const aside = std.fmt.bufPrint(&name_buf, "{s}.corrupt-{d}", .{ opts.path, Io.Clock.real.now(io).toMilliseconds() }) catch return error.NameTooLong;
         try os.fd.renamePath(io, opts.path, aside);
         log = try os.fd.appendOpen(io, opts.path);
+        log_open = true;
         w.log = log;
         w.seq = 0;
         w.prev = ZERO_PREV.*;
@@ -844,6 +895,11 @@ fn recoverTail(gpa: Allocator, io: Io, w: *Writer) !void {
             rec = .{ .seq = meta.seq + 1, .prev = undefined };
             @memcpy(&rec.?.prev, mac);
         } else {
+            // Keyless now but the tail is mac'd: the key was removed between
+            // runs. Mixing chained and unchained lines in one file would
+            // fail every later verify, so refuse the tail and start a fresh
+            // chain (the caller renames the old file aside with chain.break).
+            if (meta.mac != null) return error.CorruptTail;
             if (rec) |r| {
                 if (meta.seq != r.seq) return error.CorruptTail;
             }
@@ -966,6 +1022,7 @@ pub const Reason = enum {
     mac_mismatch,
     mixed_chain_mode,
     key_required,
+    chain_required,
     oversize_record,
 };
 
@@ -1015,6 +1072,11 @@ pub fn verifyFiles(gpa: Allocator, io: Io, files: []const []const u8, key: ?[]co
                     return .{ .broken = .{ .file_index = file_index, .seq = meta.seq, .reason = .mixed_chain_mode } };
                 if (macd and key == null)
                     return .{ .broken = .{ .file_index = file_index, .seq = meta.seq, .reason = .key_required } };
+                // Fail closed in the other direction too: with a key, a
+                // keyless file is a downgrade (an attacker without the key
+                // could strip prev/mac tails and pass), not a valid chain.
+                if (!macd and key != null)
+                    return .{ .broken = .{ .file_index = file_index, .seq = meta.seq, .reason = .chain_required } };
 
                 const at_boundary = first_in_file;
                 if (first_in_file) {
@@ -1363,6 +1425,10 @@ pub fn configFingerprint(cfg: *const config.Config) [MAC_HEX_LEN]u8 {
         h.update(",");
     }
     h.update(cfg.token_file);
+    // Secret material never enters the fingerprint; the file PATHS do, so a
+    // rotated link secret or token file shows up in the next start record.
+    h.update(cfg.connect_secret_file);
+    h.update(cfg.hub_secret_file);
     if (cfg.connect) |ep| {
         h.update(ep.host);
         h.update(std.fmt.bufPrint(&nb, "{d}", .{ep.port}) catch "");
@@ -2085,4 +2151,222 @@ test "audit rotation chains files by prev across the rename" {
     };
     try testing.expectEqual(names.items.len - 1, ok.chained_files);
     try testing.expect(ok.records > 41); // 40 calls + at least one rotate
+}
+
+test "audit renderReqId survives a backslash-heavy id" {
+    // A crafted id whose escaped form is mostly backslashes once panicked the
+    // truncation walk-back (usize underflow). Regression test for it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var id_bytes: std.ArrayList(u8) = .empty;
+    // JSON source: "ab" + 60 backslashes + "cd" -> id is ab + 30 real
+    // backslashes + cd; the escaped rendering is ~66 bytes of nearly pure
+    // backslash run, so truncation walks back to cut < 6.
+    try id_bytes.appendSlice(arena, "\"ab");
+    for (0..60) |_| try id_bytes.append(arena, '\\');
+    try id_bytes.appendSlice(arena, "cd\"");
+    const parsed = try std.json.parseFromSliceLeaky(Value, arena, id_bytes.items, .{});
+    var buf: Buf = undefined;
+    buf.reset();
+    renderReqId(&buf, parsed);
+    const out = buf.slice();
+    // Valid JSON string literal, within the byte cap, escape-safe.
+    try testing.expect(out.len <= REQ_ID_MAX + 1);
+    try testing.expect(out[0] == '"' and out[out.len - 1] == '"');
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    // A huge float-ish id degrades to null rather than a broken literal.
+    var buf2: Buf = undefined;
+    buf2.reset();
+    renderReqId(&buf2, .{ .number_string = "1.5e123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890" });
+    try testing.expectEqualStrings("null", buf2.slice());
+}
+
+test "audit tail recovery truncates a torn final line" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "torn.log");
+
+    const w = try start(arena, testIo(), .{
+        .path = path,
+        .key = "k",
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+        .now_ms_override = 1759742400123,
+    });
+    w.enqueueInner("\"event\":\"a\"");
+    w.enqueueInner("\"event\":\"b\"");
+    w.drainOnce();
+    const clean_seq = w.seq;
+    w.mutex.lockUncancelable(w.io);
+    w.stopping = true;
+    w.mutex.unlock(w.io);
+    os.closeFd(w.log.fd);
+
+    // Simulate a kill mid-write: half a record glued onto the file end.
+    var al = try os.fd.appendOpen(testIo(), path);
+    try os.fd.appendWrite(testIo(), &al, "{\"v\":1,\"seq\":2,\"torn");
+    os.closeFd(al.fd);
+
+    const w2 = try start(arena, testIo(), .{
+        .path = path,
+        .key = "k",
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+        .now_ms_override = 1759742400456,
+    });
+    // The torn tail is gone and the chain continues where the good lines left.
+    try testing.expectEqual(clean_seq, w2.seq);
+    w2.enqueueInner("\"event\":\"c\"");
+    w2.drainOnce();
+    w2.mutex.lockUncancelable(w2.io);
+    w2.stopping = true;
+    w2.mutex.unlock(w2.io);
+    os.closeFd(w2.log.fd);
+
+    const verdict = try verifyFiles(arena, testIo(), &.{path}, "k");
+    switch (verdict) {
+        .ok => |ok| try testing.expectEqual(@as(u64, 3), ok.records),
+        .broken => |b| return std.debug.panic("torn tail verify broken at seq {?d}: {s}", .{ b.seq, @tagName(b.reason) }),
+    }
+    // No torn fragment survives in the file.
+    const data = try readAll(arena, path);
+    try testing.expect(std.mem.indexOf(u8, data, "torn") == null);
+}
+
+test "audit verify with a key refuses a keyless file" {
+    // Fail closed against a downgrade: an attacker without the key could
+    // strip prev/mac from every line and otherwise pass verification.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "kl.log");
+
+    const w = try start(arena, testIo(), .{
+        .path = path,
+        .key = null,
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+        .now_ms_override = 1759742400123,
+    });
+    w.enqueueInner("\"event\":\"a\"");
+    w.drainOnce();
+    w.mutex.lockUncancelable(w.io);
+    w.stopping = true;
+    w.mutex.unlock(w.io);
+    os.closeFd(w.log.fd);
+
+    // Keyless verify passes; keyed verify of the same file must fail.
+    const plain = try verifyFiles(arena, testIo(), &.{path}, null);
+    try testing.expect(plain == .ok);
+    const keyed = try verifyFiles(arena, testIo(), &.{path}, "k");
+    try testing.expect(keyed == .broken);
+    try testing.expectEqual(Reason.chain_required, keyed.broken.reason);
+}
+
+test "audit removing the key between runs starts a new chain" {
+    // Keyless writer + mac'd tail: recovery refuses the mixed file, the old
+    // file moves aside and the new file opens with a chain.break record.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "mix.log");
+
+    const w = try start(arena, testIo(), .{
+        .path = path,
+        .key = "k",
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+        .now_ms_override = 1759742400123,
+    });
+    w.enqueueInner("\"event\":\"a\"");
+    w.drainOnce();
+    w.mutex.lockUncancelable(w.io);
+    w.stopping = true;
+    w.mutex.unlock(w.io);
+    os.closeFd(w.log.fd);
+
+    const w2 = try start(arena, testIo(), .{
+        .path = path,
+        .key = null,
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+        .now_ms_override = 1759742400999,
+    });
+    w2.drainOnce();
+    w2.mutex.lockUncancelable(w2.io);
+    w2.stopping = true;
+    w2.mutex.unlock(w2.io);
+    os.closeFd(w2.log.fd);
+
+    // The old file is renamed aside; the new file's first record is chain.break.
+    var it = tmp.dir.iterate();
+    var aside: usize = 0;
+    while (try it.next(testIo())) |ent| {
+        if (std.mem.startsWith(u8, ent.name, "mix.log.corrupt-")) aside += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), aside);
+    const lines = try linesOf(arena, try readAll(arena, path));
+    try testing.expect(lines.len == 1);
+    try testing.expect(std.mem.indexOf(u8, lines[0], "\"event\":\"chain.break\"") != null);
+    // Keyless lines carry no chain fields.
+    try testing.expect(std.mem.indexOf(u8, lines[0], "\"prev\":") == null);
+}
+
+test "audit session hash is a stable 16 hex prefix" {
+    var out: [16]u8 = undefined;
+    _ = sessionHashHex("sess-abc-123", &out);
+    for (out) |c| try testing.expect(std.ascii.isHex(c));
+    var again: [16]u8 = undefined;
+    _ = sessionHashHex("sess-abc-123", &again);
+    try testing.expectEqualSlices(u8, &out, &again);
+    var other: [16]u8 = undefined;
+    _ = sessionHashHex("sess-abc-124", &other);
+    try testing.expect(!std.mem.eql(u8, &out, &other));
+}
+
+test "audit wall clock ts is a plausible UTC epoch" {
+    // Pins the clock choice: a monotonic source would render a 1970 date.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(arena, &tmp, "clock.log");
+    const w = try start(arena, testIo(), .{
+        .path = path,
+        .key = "k",
+        .host = "t",
+        .role = "node",
+        .spawn_thread = false,
+        .skip_start_record = true,
+    });
+    w.enqueueInner("\"event\":\"a\"");
+    w.drainOnce();
+    w.mutex.lockUncancelable(w.io);
+    w.stopping = true;
+    w.mutex.unlock(w.io);
+    os.closeFd(w.log.fd);
+    const data = try readAll(arena, path);
+    // 2026-01-01T00:00:00Z in epoch ms: any CI runner is newer than that.
+    const cutoff: i64 = 1767225600000;
+    try testing.expect(w.nowMs() > cutoff);
+    try testing.expect(std.mem.indexOf(u8, data, "\"ts\":\"202") != null);
 }

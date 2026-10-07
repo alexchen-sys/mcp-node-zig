@@ -64,6 +64,10 @@ pub const Config = struct {
     /// node mode: hub address to dial and the shared secret for HELLO.
     connect: ?Endpoint = null,
     connect_secret: []const u8 = "",
+    // Paths (not values) of the link secret files: the audit config
+    // fingerprint hashes them so a rotated secret shows up in start.
+    connect_secret_file: []const u8 = "",
+    hub_secret_file: []const u8 = "",
     /// node mode: wrap the link in TLS (MCP_NODE_CONNECT_TLS=1). The server
     /// certificate is always verified against `connect_ca_file` (PEM bundle)
     /// or, when null, the system bundle, for host `connect_server_name`.
@@ -265,6 +269,7 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 std.debug.print("MCP_NODE_CONNECT_SECRET_FILE is required in connect mode\n", .{});
                 return error.InvalidConfig;
             };
+            cfg.connect_secret_file = path;
             const raw = try readSecretFile(arena, io, "MCP_NODE_CONNECT_SECRET_FILE", path);
             cfg.connect_secret = link.parseNodeSecret(raw) catch {
                 std.debug.print("MCP_NODE_CONNECT_SECRET_FILE is empty\n", .{});
@@ -301,6 +306,7 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 std.debug.print("MCP_NODE_HUB_SECRET_FILE is required in hub mode\n", .{});
                 return error.InvalidConfig;
             };
+            cfg.hub_secret_file = path;
             const raw = try readSecretFile(arena, io, "MCP_NODE_HUB_SECRET_FILE", path);
             cfg.hub_secrets = link.parseSecretFile(arena, raw) catch |err| {
                 std.debug.print("MCP_NODE_HUB_SECRET_FILE is invalid: {s}\n", .{@errorName(err)});
@@ -330,6 +336,15 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
     // material must be 0600 on POSIX (fail-closed, with the variable named).
     if (getEnv(arena, "MCP_NODE_AUDIT_FILE")) |af| {
         if (af.len != 0) cfg.audit_file = af;
+    }
+    if (cfg.audit_file) |af| {
+        // An existing log file must already be 0600 (it is created with
+        // that mode; a pre-existing group/other-readable file is a config
+        // error, not something to silently keep writing to).
+        os.fd.checkPrivateFileMode(io, af) catch {
+            std.debug.print("MCP_NODE_AUDIT_FILE '{s}' must not grant group/other access (0600)\n", .{af});
+            return error.InvalidConfig;
+        };
     }
     const audit_key_path = blk: {
         const p = getEnv(arena, "MCP_NODE_AUDIT_KEY_FILE") orelse break :blk null;

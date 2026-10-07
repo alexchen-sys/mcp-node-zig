@@ -59,7 +59,9 @@ two files join.
 
 Both roles log `start` (with a sha256 fingerprint of the effective config;
 secrets are replaced by their file paths, so a changed allowlist shows up)
-and `stop`.
+and `stop`. `stop` is written on a clean in-process exit (stdio mode on
+stdin EOF); a daemon killed by SIGTERM exits without it — an absent `stop`
+after a restart is normal, not tampering.
 
 Argument summaries are an allowlist, per tool:
 
@@ -86,7 +88,11 @@ HMAC-SHA256(key, line without the `,"mac":"..."}` suffix). The writer
 emits fields in a fixed order with no optional whitespace, so the verifier
 recomputes over the exact bytes on disk without re-serializing JSON.
 
-Writes are `O_APPEND`, mode `0600`, batched fsync (50 ms or 64 records).
+Writes are `O_APPEND`, mode `0600`, batched fsync (up to 64 records per
+write+fsync, plus a 5 ms settle beat so a trickle-burst shares one fsync).
+A write failure rolls the chain state back and counts the lost records
+into the next batch's chained `dropped` record; a torn partial write is
+truncated back to the last good offset.
 On startup the daemon reads the tail of an existing file, verifies the
 chain over the tail window and continues `seq`/`prev`, so a restart —
 including kill -9 between batches — continues the same chain. A torn final
@@ -106,10 +112,26 @@ Rotated files verify together when passed oldest-first; the chain crosses
 the rename.
 
 Exit 0 when the chain is intact, 1 when broken, printing the seq of the
-first broken record. The key comes from `MCP_NODE_AUDIT_KEY_FILE`, same as
-the daemon; verifying a chained file without the key fails closed.
+first broken record, 2 on usage or I/O errors (missing file, unreadable
+key). The key comes from `MCP_NODE_AUDIT_KEY_FILE`, same as the daemon.
+Verification fails closed in both directions: a chained file without the
+key, and a keyless file with the key set, are both broken. Verify old
+keyless logs with the key unset.
 `--anchor` prints `seq mac` of the last record: store that pair off-box
 (ticket, chat, another machine) to pin the chain.
+
+Pass rotated files oldest-first (the live file last). The verifier accepts
+a file list in any order — a wrong order can hide a gap between files.
+
+Changing the audit key starts a new chain: verification of lines written
+under the old key fails from the key change on. Rename the old file away
+and anchor the change off-box; in-band key rotation records are not
+implemented yet.
+
+One narrow window stays uncaught by a restart: a kill between a rotation's
+rename and its first `rotate` record leaves an empty live file, and the
+restart starts a fresh chain in it (the rotated sibling stays intact and
+still verifies).
 
 ## Threat model
 
@@ -120,6 +142,11 @@ Detected only against an off-box anchor: truncating the *tail* of the log
 (the attacker rewrites history from some point and the new chain verifies
 end to end). An anchor pins a `(seq, mac)` pair; any rewrite before it
 breaks the comparison.
+
+Also only against an anchor: replacing the earliest rotated files (the
+first file of a list is the trust root — a zero-prev boundary is accepted
+as a legitimate fresh chain), and swapping in a complete attacker-grown
+chain when the key is compromised.
 
 Not covered: a root attacker on the machine can stop logging, delete the
 file, or — with the audit key — forge a fresh chain from scratch. Keep the

@@ -18,7 +18,7 @@ ZIG_BIN="${ZIG:-zig}"
 "$ZIG_BIN" build test
 
 # --- test count floor ------------------------------------------------------
-MIN_TESTS=142
+MIN_TESTS=148
 TEST_COUNT=$(grep -rh 'test "' src/ --include='*.zig' | wc -l | tr -d ' ')
 if [ "$TEST_COUNT" -lt "$MIN_TESTS" ]; then
     echo "check_tests: test block count $TEST_COUNT is below floor $MIN_TESTS" >&2
@@ -63,6 +63,12 @@ audit start and stop records frame a run
 audit req_id truncation keeps valid json
 audit relay and link event shapes stay inside the record budget
 audit rotation chains files by prev across the rename
+audit renderReqId survives a backslash-heavy id
+audit tail recovery truncates a torn final line
+audit verify with a key refuses a keyless file
+audit removing the key between runs starts a new chain
+audit session hash is a stable 16 hex prefix
+audit wall clock ts is a plausible UTC epoch
 config audit env parsing and the key/file pairing rule
 command line: audit-verify subcommand'
 

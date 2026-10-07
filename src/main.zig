@@ -59,7 +59,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cli = switch (try parseArgs(try init.args.toSlice(arena))) {
+    const arg_slice = try init.args.toSlice(arena);
+    const cli_parsed = parseArgs(arg_slice) catch |err| {
+        // audit-verify has a 0/1/2 contract (clean/broken/usage): route its
+        // usage errors to exit 2 instead of the generic error exit.
+        if (arg_slice.len >= 2 and std.mem.eql(u8, arg_slice[1], "audit-verify")) {
+            std.debug.print("audit-verify: {s}\nusage: mcp-node audit-verify [--anchor] <log-file>...\n", .{@errorName(err)});
+            std.process.exit(2);
+        }
+        return err;
+    };
+    const cli = switch (cli_parsed) {
         .run => |c| c,
         .version => return printOut("mcp-node " ++ VERSION ++ "\n"),
         .help => return printOut(USAGE),

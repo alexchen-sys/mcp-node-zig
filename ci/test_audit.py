@@ -123,6 +123,11 @@ def case_tool_call_and_relay_join(env):
     calls = [r for r in node_recs if r.get('event') == 'tool.call' and r.get('tool') == 'exec']
     check(calls, 'no exec tool.call in node log')
     call = calls[-1]
+    # ts is wall clock UTC: compare with the test runner's own clock.
+    from datetime import datetime
+    ts = datetime.fromisoformat(call['ts'].replace('Z', '+00:00'))
+    check(abs(ts.timestamp() - time.time()) < 300,
+          ('audit ts not wall clock', call['ts'], time.time()))
     check(call.get('ok') is True and call.get('exit_code') == 0, call)
     check(call.get('transport') == 'link', call)
     check(call.get('req_id') == 4242, call)

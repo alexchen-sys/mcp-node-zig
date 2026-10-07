@@ -238,7 +238,7 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 - **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. A binary built with `-Dtls-server` serves TLS on the hub's link port itself (see [Reverse connect](#reverse-connect-no-inbound-ports)); otherwise terminate TLS in front of that port and keep it on loopback.
 - **Plain TCP links are for the same host or a trusted LAN.**
 - **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. 127.0.0.1 and ::1 are exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can. With the built-in TLS server the hub sees the real peer address, so these limits work fully.
-- **Out of scope:** per-tool or per-path permissions, sandboxing, audit logs, and a compromised hub or node host. The node runs with the full rights of its OS user.
+- **Out of scope:** per-tool or per-path permissions, sandboxing, and a compromised hub or node host. The node runs with the full rights of its OS user. (The audit log detects record tampering; it cannot defend against an attacker who controls the host.)
 
 ## Configuration
 
