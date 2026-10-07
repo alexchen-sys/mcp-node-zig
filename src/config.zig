@@ -1094,6 +1094,19 @@ test "config audit env parsing and the key/file pairing rule" {
         try os.fd.writeFile(io, akey_path, "audit-key-material\n", 0o600);
     }
 
+    // A pre-existing group/other-readable log file is refused on POSIX too.
+    if (comptime builtin.os.tag != .windows) {
+        const alog_path = try tmpRelPath(arena, &tmp, "audit.log");
+        try os.fd.writeFile(io, alog_path, "", 0o644);
+        env_state.process_environ = try makeEnviron(arena, &.{ token, afile, akey });
+        try testing.expectError(error.InvalidConfig, loadConfig(arena, io));
+        try tmp.dir.deleteFile(io, "audit.log");
+        try os.fd.writeFile(io, alog_path, "", 0o600);
+        const ok_mode = try loadConfig(arena, io);
+        try testing.expect(ok_mode.audit_file != null);
+        try tmp.dir.deleteFile(io, "audit.log");
+    }
+
     // Enum typos are startup errors, never silent defaults.
     env_state.process_environ = try makeEnviron(arena, &.{
         token, afile, .{ .key = "MCP_NODE_AUDIT_ARGS", .value = "everything" },

@@ -526,6 +526,10 @@ pub const Writer = struct {
     dropped: u64 = 0,
     stopping: bool = false,
     io_failed: bool = false,
+    /// Set when a rotate cascade closed the fd and every reopen failed: the
+    /// descriptor number is dead and could be recycled by accept(), so
+    /// writes must never touch it; each batch retries the reopen.
+    fd_poisoned: bool = false,
 
     seq: u64 = 0,
     prev: [MAC_HEX_LEN]u8 = ZERO_PREV.*,
@@ -618,15 +622,28 @@ pub const Writer = struct {
             @memcpy(batch[blen..][0..line.len], line.slice());
             blen += line.len;
         }
+        // A poisoned fd (a rotate failure cascade) tries to reopen first.
+        if (self.fd_poisoned) {
+            self.log = os.fd.appendOpen(self.io, self.path) catch {
+                self.mutex.lockUncancelable(self.io);
+                self.dropped += n + dropped_here;
+                self.mutex.unlock(self.io);
+                return;
+            };
+            self.fd_poisoned = false;
+            self.log.pos = os.fd.fileLength(self.io, self.log.fd) catch 0;
+        }
         os.fd.appendWrite(self.io, &self.log, batch[0..blen]) catch |err| {
             self.io_failed = true;
             self.seq = seq0;
             self.prev = prev0;
-            self.dropped += n + dropped_here;
             // A partial write leaves a torn tail; cut back to the last good
             // offset so the next batch never glues onto garbage.
             os.fd.truncFile(self.log.fd, pos0) catch {};
             self.log.pos = pos0;
+            self.mutex.lockUncancelable(self.io);
+            self.dropped += n + dropped_here;
+            self.mutex.unlock(self.io);
             std.debug.print("audit: write failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -655,7 +672,11 @@ pub const Writer = struct {
             // Rename failed with the fd already closed: reopen the live file
             // so the next batch still has somewhere to write.
             self.log = os.fd.appendOpen(self.io, self.path) catch {
+                // The closed descriptor number can be recycled by accept();
+                // poison the state so nothing writes through it, and let the
+                // next batch retry the reopen.
                 self.io_failed = true;
+                self.fd_poisoned = true;
                 return;
             };
             return;
@@ -666,6 +687,7 @@ pub const Writer = struct {
             os.fd.renamePath(self.io, rotated, self.path) catch {};
             self.log = os.fd.appendOpen(self.io, self.path) catch {
                 self.io_failed = true;
+                self.fd_poisoned = true;
                 return;
             };
             return;
@@ -684,6 +706,10 @@ pub const Writer = struct {
             self.seq = seq0;
             self.prev = prev0;
             self.io_failed = true;
+            // A partial rotate record leaves a torn tail in the fresh file;
+            // cut it back so the next batch never glues onto garbage.
+            os.fd.truncFile(self.log.fd, 0) catch {};
+            self.log.pos = 0;
             return;
         };
         os.fd.syncFile(self.log.fd) catch {};
@@ -1146,16 +1172,16 @@ pub fn verifyCli(arena: Allocator, io: Io, anchor: bool, files: []const []const 
         if (kf.len > 0) {
             os.fd.checkPrivateFileMode(io, kf) catch {
                 std.debug.print("audit-verify: {s} must not grant group/other access (0600)\n", .{kf});
-                return 1;
+                return 2;
             };
             const raw = os.fd.readFileAlloc(arena, io, kf, 64 * 1024) catch |err| {
                 std.debug.print("audit-verify: cannot read key file: {s}\n", .{@errorName(err)});
-                return 1;
+                return 2;
             };
             const trimmed = std.mem.trim(u8, raw, " \t\r\n");
             if (trimmed.len == 0) {
                 std.debug.print("audit-verify: key file is empty\n", .{});
-                return 1;
+                return 2;
             }
             key = trimmed;
         }
@@ -1406,42 +1432,69 @@ pub fn configFingerprint(cfg: *const config.Config) [MAC_HEX_LEN]u8 {
     var h = Sha256.init(.{});
     var nb: [24]u8 = undefined;
     h.update(cfg.name);
+    h.update("\x00");
     h.update(@tagName(cfg.mode));
+    h.update("\x00");
     h.update(cfg.host);
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.port}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.max_out}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.socket_timeout_s}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.max_conn}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.max_sessions}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.session_ttl_s}) catch "");
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.max_inflight_bytes}) catch "");
+    h.update("\x00");
     h.update(if (cfg.text_mirror) "1" else "0");
+    h.update("\x00");
     for (cfg.allowed_hosts) |ho| {
         h.update(ho);
+        h.update("\x00");
         h.update(",");
+        h.update("\x00");
     }
     for (cfg.allowed_origins) |o| {
         h.update(o);
+        h.update("\x00");
         h.update(",");
+        h.update("\x00");
     }
     h.update(cfg.token_file);
+    h.update("\x00");
     // Secret material never enters the fingerprint; the file PATHS do, so a
     // rotated link secret or token file shows up in the next start record.
     h.update(cfg.connect_secret_file);
+    h.update("\x00");
     h.update(cfg.hub_secret_file);
+    h.update("\x00");
     if (cfg.connect) |ep| {
         h.update(ep.host);
+        h.update("\x00");
         h.update(std.fmt.bufPrint(&nb, "{d}", .{ep.port}) catch "");
+        h.update("\x00");
     }
     if (cfg.hub_listen) |ep| {
         h.update(ep.host);
+        h.update("\x00");
         h.update(std.fmt.bufPrint(&nb, "{d}", .{ep.port}) catch "");
+        h.update("\x00");
     }
     if (cfg.hub_tls_cert_file) |f| h.update(f);
+    h.update("\x00");
     if (cfg.audit_file) |f| h.update(f);
+    h.update("\x00");
     h.update(@tagName(cfg.audit_args));
+    h.update("\x00");
     h.update(@tagName(cfg.audit_on_full));
+    h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.audit_max_bytes}) catch "");
+    h.update("\x00");
     const digest = h.finalResult();
     var out: [MAC_HEX_LEN]u8 = undefined;
     const alphabet = "0123456789abcdef";
