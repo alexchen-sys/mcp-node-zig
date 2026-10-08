@@ -180,6 +180,31 @@ Details and the threat model: [docs/audit-log.md](docs/audit-log.md).
 
 Full schemas via `tools/list`. `exec` and `exec_shell` timeouts default to 120 s, clamped to 1–1800 s.
 
+## Durable sessions
+
+Exec sessions live in the node process, not in any connection. A session
+survives a hub<->node link drop, a hub restart and any client disconnect:
+capture keeps running while nobody polls, and after a reconnect the same
+`session_id` continues from the byte offsets of your last reply (no gaps,
+no duplicates). `exec_list` recovers ids when a reply was lost.
+
+Honest limits: sessions do **not** survive a node process restart (crash,
+OOM kill, reboot) — state is in-memory and every old id then answers
+`unknown_session`. Output per stream is capped at `MCP_NODE_MAX_OUT`
+bytes; once the cap is hit the head is kept, the flag `truncated_*` is set
+and the counter `lost_*_bytes` reports exactly how many later bytes were
+dropped — never a silent loss. Finished sessions are reaped
+`MCP_NODE_SESSION_TTL_S` after they finish; live ones are never reaped by
+time.
+
+An unknown or expired `session_id` answers
+`{"ok": false, "error": "unknown_session", "session_id": ..., "expired": ..., "message": ...}` —
+a structured tool result, never a bare JSON-RPC `-32602`. `expired: true`
+means this node previously held the session and closed, reaped or evicted
+it; `expired: false` means it never existed here (or pre-dates a node
+restart — indistinguishable, and the message says so). `exec_close` keeps
+its idempotent `{"ok": true, "already_closed": true}` for the same case.
+
 ## Clients
 
 Every client below uses the same URL and token. `Authorization: Bearer <token>` works everywhere; `X-Node-Token: <token>` is accepted for clients that can't set `Authorization`.
@@ -254,7 +279,7 @@ Environment variables only.
 | `MCP_NODE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` |
 | `MCP_NODE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` |
 | `MCP_NODE_NAME` | `mcp-node` (serverInfo name) |
-| `MCP_NODE_MAX_OUT` | `400000` bytes per output stream, then `truncated_*` |
+| `MCP_NODE_MAX_OUT` | `400000` bytes per output stream, then `truncated_*` + `lost_*_bytes` |
 | `MCP_NODE_MAX_CONN` | `128` concurrent connections, then 503 |
 | `MCP_NODE_MAX_SESSIONS` | `64` live sessions |
 | `MCP_NODE_SESSION_TTL_S` | `600`, reap delay for finished sessions |
@@ -292,7 +317,7 @@ Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 
 Shipped: reverse connect with a mutual HMAC handshake, TLS on the node link (every platform), per-source handshake limits, the tamper-evident audit log, cosign-signed releases with build provenance.
 
-Next: per-tool scopes, sessions that survive a node restart, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
+Next: per-tool scopes, sessions that survive a node restart (on-disk state), and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
 
 ## Build from source
 
