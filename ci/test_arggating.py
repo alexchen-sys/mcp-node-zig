@@ -93,7 +93,9 @@ class Case:
         (self.dir / 'ws').mkdir()
         (self.dir / 'ws' / 'allow').mkdir()
         (self.dir / 'ws' / 'outside').mkdir()
+        (self.dir / 'ws' / 'allow' / 'denybox').mkdir()
         write0600(self.dir / 'ws' / 'allow' / 'readable.txt', 'inside\n')
+        write0600(self.dir / 'ws' / 'allow' / 'denybox' / 'hidden.txt', 'hidden\n')
         write0600(self.dir / 'ws' / 'outside' / 'secret.txt', 'secret\n')
         # Symlink escape: allow/esc -> ../outside
         os.symlink('..\\outside' if os.name == 'nt' else '../outside',
@@ -119,6 +121,7 @@ class Case:
                               'read_file', 'write_file', 'list_dir'],
                     'exec_argv0': ['sh', '/bin/sh', 'cat', 'touch'],
                     'exec_cwd': [str(self.dir / 'ws')],
+                    'cwd_deny': [str(self.dir / 'ws' / 'outside')],
                     'max_timeout_s': 10,
                     'read_paths': [str(self.dir / 'ws')],
                     'write_paths': [str(self.dir / 'ws' / 'allow')],
@@ -228,6 +231,11 @@ def case_reader_token(env):
     out = tool(port, env.token_reader, 'read_file',
                {'path': str(allow / 'esc' / '..' / 'secret.txt')})
     expect_deny(out, 'path_not_allowed')
+    # read_deny: inside the allow prefix but inside a deny prefix — allow
+    # does not win (deny is evaluated first)
+    out = tool(port, env.token_reader, 'read_file',
+               {'path': str(allow / 'denybox' / 'hidden.txt')})
+    expect_deny(out, 'denied_path')
     # write: denied at tool level
     out = tool(port, env.token_reader, 'write_file',
                {'path': str(allow / 'nope.txt'), 'content_b64': 'aGk='})
@@ -281,6 +289,11 @@ def case_build_token(env):
     out = tool(port, env.token_build, 'exec',
                {'argv': ['sh', '-c', 'pwd'], 'cwd': str(ws), 'timeout': 5})
     check(out.get('ok'), out)
+    # cwd_deny: inside an allowed prefix but inside a deny prefix -> the
+    # explicit deny wins (denied_path), not cwd_not_allowed
+    out = tool(port, env.token_build, 'exec',
+               {'argv': ['sh', '-c', 'true'], 'cwd': str(ws / 'outside'), 'timeout': 5})
+    expect_deny(out, 'denied_path')
     # write inside allow tree: ok at mode 0644
     target = allow / 'written.txt'
     out = tool(port, env.token_build, 'write_file',
@@ -362,6 +375,33 @@ def case_session_ownership(env):
     # close by owner
     out = tool(port, env.token_build, 'exec_close', {'session_id': sid})
     check(out.get('ok'), out)
+    # concurrency: a foreign token polling in parallel with the owner's
+    # close must never observe or drive the session (thread-per-connection
+    # model; the threadlocal owner is per request).
+    out = tool(port, env.token_build, 'exec_start',
+               {'argv': ['sh', '-c', 'sleep 30'], 'timeout': 10})
+    check(out.get('ok') and out.get('session_id'), out)
+    sid2 = out['session_id']
+    import threading
+    results = {}
+
+    def owner_close():
+        results['owner'] = tool(port, env.token_build, 'exec_close',
+                                {'session_id': sid2})
+
+    def foreign_poll():
+        try:
+            results['foreign'] = tool(port, env.token_admin, 'exec_poll',
+                                      {'session_id': sid2})
+        except Exception as exc:  # noqa: BLE001
+            results['foreign'] = {'error': str(exc)}
+    t1 = threading.Thread(target=owner_close)
+    t2 = threading.Thread(target=foreign_poll)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    check(results.get('owner', {}).get('ok'), results)
+    foreign = results.get('foreign')
+    check(not (isinstance(foreign, dict) and foreign.get('ok')),
+          'foreign token drove the session concurrently: %r' % (foreign,))
 
 
 def case_audit_records(env):
@@ -372,7 +412,8 @@ def case_audit_records(env):
     reasons = {r.get('reason') for r in denies}
     for want in ('tool_not_allowed', 'argv0_not_allowed', 'path_not_allowed',
                  'cwd_not_allowed', 'timeout_exceeds_cap',
-                 'write_mode_exceeds_cap'):
+                 'write_mode_exceeds_cap', 'denied_path',
+                 'bad_argument_type'):
         check(want in reasons, 'missing policy.deny reason %r in %r' % (want, reasons))
     blob = env.audit_file.read_text()
     check(env.token_reader not in blob, 'reader token value leaked into audit log')

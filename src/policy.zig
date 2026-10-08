@@ -271,21 +271,25 @@ fn parseEntry(a: Allocator, io: Io, tv: Value, idx: usize) LoadError!TokenPolicy
         if (exec_argv0.len == 0)
             return policyErr("tokens[{d}]: exec tools are listed but 'exec_argv0' is empty", .{idx});
         // exec_shell with no shell allowlisted would deny every call; that
-        // is a config mistake, fail it at load.
+        // is a config mistake, fail it at load. The check is platform-aware:
+        // the tool's comptime allowlist decides which shells this build can
+        // actually spawn (POSIX: bash/sh/zsh/fish; Windows: cmd/powershell).
         if (pol.toolAllowed("exec_shell")) {
+            const is_windows = @import("builtin").os.tag == .windows;
             var any_shell = false;
             for (exec_argv0) |e| {
-                if (std.mem.eql(u8, e.text, "bash") or std.mem.eql(u8, e.text, "sh") or
-                    std.mem.eql(u8, e.text, "zsh") or std.mem.eql(u8, e.text, "fish") or
-                    std.mem.eql(u8, e.text, "cmd") or std.mem.eql(u8, e.text, "powershell") or
-                    std.mem.eql(u8, e.text, "/bin/bash") or std.mem.eql(u8, e.text, "/bin/sh"))
-                {
+                const is_shell = if (is_windows)
+                    std.mem.eql(u8, e.text, "cmd") or std.mem.eql(u8, e.text, "powershell")
+                else
+                    std.mem.eql(u8, e.text, "bash") or std.mem.eql(u8, e.text, "sh") or
+                        std.mem.eql(u8, e.text, "zsh") or std.mem.eql(u8, e.text, "fish");
+                if (is_shell) {
                     any_shell = true;
                     break;
                 }
             }
             if (!any_shell)
-                return policyErr("tokens[{d}]: exec_shell is listed but no shell is in exec_argv0", .{idx});
+                return policyErr("tokens[{d}]: exec_shell is listed but no shell this build can spawn is in exec_argv0", .{idx});
         }
     }
     if (pol.needsRead() and read_paths.len == 0)

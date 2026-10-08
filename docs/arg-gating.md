@@ -127,7 +127,7 @@ guessing another token's session id and driving it via `exec_write`.
 A denied call returns the normal tool-error envelope with `isError: true`:
 
 ```json
-{"ok": false, "error": "PolicyDenied", "message": "timeout exceeds this token's cap", "field": "timeout"}
+{"ok": false, "error": "PolicyDenied", "message": "timeout exceeds this token's cap", "reason": "timeout_exceeds_cap", "field": "timeout"}
 ```
 
 The denial happens **before dispatch**: a denied exec never spawns, a denied

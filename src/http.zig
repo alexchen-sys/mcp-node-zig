@@ -455,6 +455,13 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
             return false;
         }
     }
+    // Defence in depth (config already refuses a policy with an empty
+    // classic token): a policy with no client token would mean unauthenticated
+    // AND ungated calls; fail closed here rather than trust the invariant.
+    if (cfg.policy != null and cfg.token.len == 0) {
+        try sendHttpError(ra, fd, 500, "server_misconfigured", "token required when a policy is active", timeout_ms);
+        return false;
+    }
     if (cfg.token.len != 0) {
         // Conflicting credentials count as a failed login, not as a choice.
         const presented = presentedToken(info) catch null;
