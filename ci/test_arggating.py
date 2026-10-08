@@ -19,6 +19,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -152,6 +153,20 @@ class Case:
         lines = self.audit_file.read_text().splitlines()
         return [json.loads(x) for x in lines if x.strip()]
 
+    def wait_denies(self, timeout_s=10):
+        """The audit ring flushes asynchronously; wait for the file."""
+        deadline = time.monotonic() + timeout_s
+        recs = []
+        while time.monotonic() < deadline:
+            try:
+                recs = self.audit_records()
+            except (OSError, json.JSONDecodeError):
+                recs = []
+            if any(r.get('event') == 'policy.deny' for r in recs):
+                return recs
+            time.sleep(0.1)
+        return recs
+
 
 def expect_deny(out, reason):
     check(out.get('error') == 'PolicyDenied',
@@ -188,11 +203,11 @@ def case_reader_token(env):
     outside = env.dir / 'ws' / 'outside'
     # read inside: ok
     out = tool(port, env.token_reader, 'read_file', {'path': str(allow / 'readable.txt')})
-    check(out.get('ok') and out['content'] == 'inside', out)
+    check(out.get('ok') and out['content'] == 'inside\n', out)
     # list_dir inside: ok
     out = tool(port, env.token_reader, 'list_dir', {'path': str(allow)})
     check(out.get('ok'), out)
-    names = [e['name'] for e in out['entries']]
+    names = [e['name'] for e in out['items']]
     check('readable.txt' in names, names)
     # read outside: denied
     out = tool(port, env.token_reader, 'read_file', {'path': str(outside / 'secret.txt')})
@@ -215,9 +230,10 @@ def case_reader_token(env):
                {'argv': ['touch', str(marker)], 'timeout': 5})
     expect_deny(out, 'tool_not_allowed')
     check(not marker.exists(), 'denied exec ran anyway (marker created)')
-    # sys_info: allowed (read-only connectivity check)
+    # sys_info: allowed (read-only connectivity check; no 'ok' field in
+    # its response shape)
     out = tool(port, env.token_reader, 'sys_info')
-    check(out.get('ok'), out)
+    check('node' in out and 'mem' in out, out)
 
 
 def case_build_token(env):
@@ -271,8 +287,11 @@ def case_build_token(env):
                 'mode': 2533})
     expect_deny(out, 'write_mode_exceeds_cap')
     check(not (allow / 'setuid.txt').exists(), 'denied write created the file')
-    # exec_shell: 'sh' is in exec_argv0 -> allowed and runs
-    out = tool(port, env.token_build, 'exec_shell', {'script': 'echo shell-ok', 'timeout': 5})
+    # exec_shell: explicit sh is in the allowlist -> allowed and runs.
+    # (The platform default is bash; the policy gates the shell actually
+    # spawned, so an unspecified shell would be argv0-denied here.)
+    out = tool(port, env.token_build, 'exec_shell',
+               {'script': 'echo shell-ok', 'shell': 'sh', 'timeout': 5})
     check(out.get('ok') and out['stdout'] == 'shell-ok\n', out)
     # exec_shell with disallowed shell: denied
     out = tool(port, env.token_build, 'exec_shell', {'script': 'x', 'shell': 'zsh'})
@@ -282,8 +301,10 @@ def case_build_token(env):
 def case_session_ownership(env):
     """Sessions are token-owned: build starts, reader cannot drive it."""
     port = env.port
+    # An explicit timeout at/below the cap: without one the tool default
+    # (120s) exceeds this token's cap and the call is refused.
     out = tool(port, env.token_build, 'exec_start',
-               {'argv': ['sh', '-c', 'sleep 30']})
+               {'argv': ['sh', '-c', 'sleep 30'], 'timeout': 10})
     check(out.get('ok') and out.get('session_id'), out)
     sid = out['session_id']
     # owner can poll and close
@@ -309,8 +330,9 @@ def case_session_ownership(env):
 
 def case_audit_records(env):
     """policy.deny lines exist with reasons and no token values."""
-    recs = env.audit_records()
+    recs = env.wait_denies()
     denies = [r for r in recs if r.get('event') == 'policy.deny']
+    check(denies, 'no policy.deny records in the audit log')
     reasons = {r.get('reason') for r in denies}
     for want in ('tool_not_allowed', 'argv0_not_allowed', 'path_not_allowed',
                  'cwd_not_allowed', 'timeout_exceeds_cap',
@@ -387,9 +409,11 @@ def case_startup_failures(tmp):
     alive, logs, _ = try_start(
         {'version': 1, 'tokens': [{'file': str(tok), 'allow_all': True}]},
         tok, extra={'MCP_NODE_INSECURE': '1'}, tag='insecure')
-    # insecure only matters when the token is EMPTY; with a valid token the
-    # combination is legal, so that case must START. Use an empty token file.
-    check(alive, 'insecure with a valid token should start (empty-token rule not triggered)')
+    # INSECURE is refused outright next to a policy file, even when the
+    # classic token is valid and the flag would be inert: the strictness is
+    # the point (docs/arg-gating.md).
+    check(not alive, 'insecure+policy started despite the strict rule')
+    check('MCP_NODE_INSECURE' in logs, logs[-800:])
     tok_empty = tmp / 'st-empty'
     write0600(tok_empty, '\n')
     alive2, logs2, _ = try_start(
