@@ -8,7 +8,7 @@
   "binary_mib": 10.6,
   "runtime_bytes": 0,
   "runtime_mib": 0.0,
-  "notes": "static binary, no runtime to install (Linux: no libc dependency)"
+  "notes": "single binary, no runtime to install (dynamically linked: system libc)"
  },
  "tumf": {
   "participant": "tumf/mcp-shell-server",

@@ -9,7 +9,7 @@ Benchmark suite for mcp-node-zig against stdio MCP servers launched through `uvx
 BENCH_PROFILE=quick ./bench/run_all.sh  # quick profile (~10 min)
 ```
 
-Requires bash, `python3` (stdlib only), `zig` 0.16.x, `uvx`, `npx`, `openssl`, `du`, `/usr/bin/time`. Binds only `127.0.0.1` in the 183xx port range; every process and temp file is cleaned up on exit.
+Requires bash, `python3` (stdlib only), `zig` 0.16.x, `uvx`, `npx`, `openssl`, `du`, `/usr/bin/time`. Binds only `127.0.0.1` in the 183xx port range; every process and temp file is cleaned up on exit. Unless `MCPNZ_BIN` points at a prebuilt binary, `run_all.sh` builds with `-Dtls-server` (the publication evidence uses that build — b02 needs it; the first such build fetches mbedTLS through `zig fetch`, so it needs network once) and falls back to the plain build with a loud note if the TLS build fails, in which case b02 skips cleanly.
 
 The publication profile (default) runs N=10000 for every timed series — cold start, exec latency, TLS handshakes — plus 1000 node-link cycles, with the same N for ours and both rivals; expect roughly five hours, dominated by rival cold starts. The quick profile (200 cold / 1000 latency / 500 TLS / 100 node cycles) fits dev iteration in about ten minutes.
 
@@ -59,10 +59,11 @@ All knobs live in `config.sh` and can be overridden from the environment; indivi
 - One harness (`harness/mcp_probe.py`) for every participant, each on its native transport; samples time the child only.
 - Rival installer caches are warmed before any cold series, so cold start measures the server, not the network.
 - Every exec is `argv ["uname", "-a"]` with no shell: `exec` (ours), `shell_execute` with `ALLOW_COMMANDS=uname` (tumf), `run_process` (g0t4).
-- Every timed series streams one flat JSON object per sample to `raw/<series>_<participant>.jsonl` as the sample completes; each line carries `series` and `participant`. b01 lines carry `boot_listen_ms`/`initialize_handshake_ms` (http only — stdio spawn→first-response is atomic over pipes, the fields are null there); b02 lines carry `tcp_connect_ms`/`tls_handshake_ms`/`total_ms` (client) or `link_established_ms` (node); b03/b07 stream their memory samples/steps.
+- Every timed series streams one flat JSON object per sample to `raw/<series>_<participant>.jsonl` as the sample completes; each line carries `series` and `participant`. b01 lines carry `boot_listen_ms`/`initialize_handshake_ms` (http only — stdio spawn→first-response is atomic over pipes, the fields are null there); b02 lines carry `tcp_connect_ms`/`tls_handshake_ms`/`total_ms` (client) or `link_established_ms` (node; timed from just before the spawn call, so the spawn itself is included); b03/b07 stream their memory samples/steps.
 - N, σ, min…max and percentiles (p50/p90/p95/p99) are always reported; series with CV > 10% are flagged `(!)`; latency summaries carry a fixed log2-bucket histogram.
 - The machine passport is written at start and end; governor and observed CPU frequency drift between them is flagged, never tuned.
-- b02 needs the `-Dtls-server` build; with a default build it skips cleanly (exit 0, reason recorded in the aggregate).
+- b02 needs the `-Dtls-server` build (the default, see above); without it b02 skips cleanly (exit 0, reason recorded in the aggregate).
+- JSONL files are append-only: re-running into the same `RESULTS` directory appends new samples to the existing files (aggregates are rewritten). Use a fresh `RESULTS` for a clean series.
 
 ## Committed evidence
 

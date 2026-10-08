@@ -3,7 +3,8 @@
 # (keep-alive HTTP for ours, stdio pipes for the rivals — each agent's native
 # transport; the asymmetry is disclosed in BENCHMARKS.md caveats).
 # Same child work for everyone: tools/call with argv ["uname", "-a"].
-# N=200 samples -> p50/p95/p99 + mean/sigma/min/max.
+# N samples (profile default: publication = 10000) -> p50/p90/p95/p99 +
+# mean/sigma/min/max + log2 histogram; raw samples stream to JSONL.
 set -euo pipefail
 . "$(dirname "$0")/config.sh"
 

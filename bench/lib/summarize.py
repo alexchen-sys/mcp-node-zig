@@ -354,7 +354,7 @@ def render_summary(results):
 
 
 def render_benchmarks_block(results):
-    out = [TABLES_START, "## Results", ""]
+    out = [TABLES_START, ""]
     out += b01_table(results, public=True)
     out += b01_decomposition_table(results)
     out += [""]

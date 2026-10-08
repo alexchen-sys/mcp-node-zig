@@ -113,6 +113,7 @@ def stdio_probe(args, env):
     resp_b, _ = b.request("initialize", pl.initialize_params())
     if resp_b is None:
         b.close()
+        a.close()
         return {"error": "instance B initialize failed"}
     time.sleep(1.0)
     rss_b = rss_now_kib(b.p.pid)

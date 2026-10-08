@@ -1,6 +1,6 @@
 # Benchmarks
 
-mcp-node-zig answers its first MCP response from one static binary in single-digit milliseconds and idles below one MiB of RSS; the same command served through `uvx` and `npx` needs hundreds of milliseconds and well over a hundred MiB before the first tool call. Every table below carries the full distribution — p50/p90/p95/p99, min/max, mean ± σ, exact N and failure counts — and the raw samples for every series are committed under `bench/results/` as JSONL (one object per sample), so any number can be re-derived or challenged without re-running anything.
+mcp-node-zig answers its first MCP response in single-digit milliseconds and idles at a couple of MiB of RSS, from one self-contained binary with no runtime to install; the same command served through `uvx` and `npx` needs hundreds of milliseconds and well over a hundred MiB before the first tool call. Every table below carries the full distribution — p50/p90/p95/p99, min/max, mean ± σ, exact N and failure counts — and the raw samples for every series are committed under `bench/results/` as JSONL (one object per sample), so any number can be re-derived or challenged without re-running anything.
 
 ## Methodology
 
@@ -19,7 +19,7 @@ mcp-node-zig answers its first MCP response from one static binary in single-dig
 BENCH_PROFILE=quick ./bench/run_all.sh  # quick profile (~10 min)
 ```
 
-Builds ReleaseSafe, warms the rivals' installer caches, runs every series and writes `bench/results/` (summary, per-metric aggregates, raw JSONL/JSON, machine passports at start and end). Requirements and options: [bench/README.md](bench/README.md). To regenerate the tables below from a results directory:
+Builds ReleaseSafe with `-Dtls-server` (the evidence binary in the tables below is that build; the first one fetches mbedTLS through `zig fetch`, so it needs network once — on failure it falls back to the plain build with a loud note and b02 skips), warms the rivals' installer caches, runs every series and writes `bench/results/` (summary, per-metric aggregates, raw JSONL/JSON, machine passports at start and end). Requirements and options: [bench/README.md](bench/README.md). To regenerate the tables below from a results directory:
 
 ```sh
 python3 bench/lib/summarize.py <results-dir> --benchmarks --update BENCHMARKS.md
@@ -28,7 +28,6 @@ python3 bench/lib/summarize.py <results-dir> --benchmarks --update BENCHMARKS.md
 ## Results
 
 <!-- bench:tables:start -->
-## Results
 
 ### Cold start → first MCP response (b01)
 _spawn -> first MCP response (initialize), full shutdown between runs_

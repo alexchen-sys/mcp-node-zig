@@ -27,9 +27,17 @@ MCPNZ_BIN="${MCPNZ_BIN:-}" MCPNZ_BUILD_MODE="$MCPNZ_BUILD_MODE" ZIG_BIN="$ZIG_BI
     python3 "$BENCH_DIR/lib/env_report.py" > "$RESULTS/env.json" || true
 
 if [ -z "$MCPNZ_BIN" ]; then
-    echo "== building mcp-node ($MCPNZ_BUILD_MODE) ==" >&2
-    (cd "$REPO_DIR" && "$ZIG_BIN" build -Doptimize="$MCPNZ_BUILD_MODE")
-    MCPNZ_BIN="$REPO_DIR/zig-out/bin/mcp-node"
+    echo "== building mcp-node ($MCPNZ_BUILD_MODE, with -Dtls-server) ==" >&2
+    # b02 needs the TLS build; it skips cleanly without it, but the published
+    # tables include b02 — so the documented default build includes it.
+    if (cd "$REPO_DIR" && "$ZIG_BIN" build -Dtls-server -Doptimize="$MCPNZ_BUILD_MODE"); then
+        MCPNZ_BIN="$REPO_DIR/zig-out/bin/mcp-node"
+    else
+        echo "== -Dtls-server build failed (offline?); falling back to the plain build;" >&2
+        echo "== b02 will SKIP. Get mbedtls via zig fetch and retry for full evidence. ==" >&2
+        (cd "$REPO_DIR" && "$ZIG_BIN" build -Doptimize="$MCPNZ_BUILD_MODE")
+        MCPNZ_BIN="$REPO_DIR/zig-out/bin/mcp-node"
+    fi
     # refresh the passport now that the binary exists
     MCPNZ_BIN="$MCPNZ_BIN" MCPNZ_BUILD_MODE="$MCPNZ_BUILD_MODE" ZIG_BIN="$ZIG_BIN" \
         python3 "$BENCH_DIR/lib/env_report.py" > "$RESULTS/env.json" || true
