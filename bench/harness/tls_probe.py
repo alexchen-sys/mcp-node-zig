@@ -260,7 +260,10 @@ def node_runs(args, workdir, secret_file, ca_path, token, js):
             env.update({
                 "MCP_NODE_NAME": name,
                 "MCP_NODE_SOCKET_TIMEOUT_S": "5",
-                "MCP_NODE_CONNECT": f"127.0.0.1:{args.link_port}",
+                # 'localhost', not 127.0.0.1: the node verifies the hub
+                # certificate hostname (SAN DNS:localhost), same as the e2e
+                # suite's targets. Dialing the bare IP fails verification.
+                "MCP_NODE_CONNECT": f"localhost:{args.link_port}",
                 "MCP_NODE_CONNECT_TLS": "1",
                 "MCP_NODE_CONNECT_CA_FILE": str(ca_path),
                 "MCP_NODE_CONNECT_SECRET_FILE": str(secret_file),
