@@ -1,5 +1,5 @@
 {
- "description": "exec_poll: byte-offset deltas over a session's captured output. Polled here on a finished session so every field is deterministic: full delta, offset slicing, and offset==len giving an empty delta. exec_poll shares the renderSessionState payload with exec_wait: ok, done, exit_code, stdout, stderr, stdout_offset, stderr_offset, truncated_stdout, truncated_stderr, duration_ms, duration_us. Like exec_wait, the session is resolved before optional-argument types are validated: an unknown session_id beats a bad stdout_offset type and answers the structured unknown_session payload.",
+ "description": "exec_poll: byte-offset deltas over a session's captured output. Polled here on a finished session so every field is deterministic: full delta, offset slicing, and offset==len giving an empty delta. exec_poll shares the renderSessionState payload with exec_wait: ok, done, exit_code, stdout, stderr, stdout_offset, stderr_offset, truncated_stdout, truncated_stderr, lost_stdout_bytes, lost_stderr_bytes, duration_ms, duration_us. Like exec_wait, the session is resolved before optional-argument types are validated: an unknown session_id beats a bad stdout_offset type and answers the structured unknown_session payload.",
  "platforms": [
   "posix"
  ],

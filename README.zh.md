@@ -132,6 +132,29 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret MCP_NODE_CONNECT_TLS=1 
 
 完整 schema 可通过 `tools/list` 获取。`exec` 和 `exec_shell` 的超时默认 120 s，取值限制在 1–1800 s。
 
+## 持久会话
+
+Exec 会话存在于节点进程中，不属于任何连接。会话能挺过枢纽<->节点
+链路断开、枢纽重启以及任意客户端断连：没有人轮询时捕获照常进行，
+重连后同一个 `session_id` 从你上次回复的字节 offset 继续（无空洞、
+无重复）。回复丢失时用 `exec_list` 找回 id。
+
+诚实的限制：会话**不**跨越节点进程重启（崩溃、OOM-kill、重启机器）
+——状态在内存里，重启后所有旧 id 都回答 `unknown_session`。每个
+输出流上限为 `MCP_NODE_MAX_OUT` 字节；到顶后保留头部，置位
+`truncated_*` 标志，计数器 `lost_*_bytes` 精确报告之后丢弃了多少
+字节——绝不静默丢失。已结束的会话在 `MCP_NODE_SESSION_TTL_S` 之后
+回收；存活会话永远不会按时间回收。
+
+未知或过期的 `session_id` 回答
+`{"ok": false, "error": "unknown_session", "session_id": ..., "expired": ..., "message": ...}` —
+一个结构化工具结果，而不是裸的 JSON-RPC `-32602`。`expired: true`
+表示本节点最近持有过该会话并关闭/回收/驱逐了它（新鲜度窗口有界：
+很久以前移除的 id 会被遗忘而回答 `expired: false`，本节点从未持有
+的 id、或早于节点重启的 id 同样如此——消息里写明了这一点）。同一
+情况下 `exec_close` 保持幂等的
+`{"ok": true, "already_closed": true}`。
+
 ## 客户端
 
 下面所有客户端都使用相同的 URL 和 token。`Authorization: Bearer <token>` 在所有客户端中都可用；对于无法设置 `Authorization` 的客户端，也接受 `X-Node-Token: <token>`。
@@ -205,7 +228,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 | `MCP_NODE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` |
 | `MCP_NODE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` |
 | `MCP_NODE_NAME` | `mcp-node`（serverInfo 名称） |
-| `MCP_NODE_MAX_OUT` | 每个输出流 `400000` 字节，超出后标记为 `truncated_*` |
+| `MCP_NODE_MAX_OUT` | 每个输出流 `400000` 字节，超出后标记为 `truncated_*` 并用 `lost_*_bytes` 计数 |
 | `MCP_NODE_MAX_CONN` | `128` 个并发连接，超出后返回 503 |
 | `MCP_NODE_MAX_SESSIONS` | `64` 个存活会话 |
 | `MCP_NODE_SESSION_TTL_S` | `600`，已结束会话的回收延迟 |

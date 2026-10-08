@@ -67,13 +67,25 @@ def case_reattach_after_client_disconnect():
         assert_check(second['ok'], second)
         assert_check(second['stdout_offset'] > off, second)
         # The delta continues exactly at the old offset: no gap, no replay.
-        assert_check('line' in second['stdout'], second)
-        # Write, kill and close from the reattached connection.
-        assert_check(node.tool('exec_kill', {'session_id': sid})['ok'], 'kill failed')
-        waited = node.tool('exec_wait', {'session_id': sid, 'timeout': 5})
+        # Pin it hard and deterministically: drain the tail after the child
+        # is done, then a full poll from offset 0 equals first + second + tail.
+        waited = node.tool('exec_wait', {'session_id': sid, 'timeout': 15})
         assert_check(waited['done'], waited)
+        tail = node.tool('exec_poll', {'session_id': sid,
+                                        'stdout_offset': second['stdout_offset']})
+        assert_check(tail['ok'], tail)
+        full = node.tool('exec_poll', {'session_id': sid, 'stdout_offset': 0})
+        assert_check(full['ok'], full)
+        assert_check(full['stdout'] == first['stdout'] + second['stdout'] + tail['stdout'],
+                     {'first_len': len(first['stdout']),
+                      'second_len': len(second['stdout']),
+                      'tail_len': len(tail['stdout']),
+                      'full_len': len(full['stdout'])})
+        # Close from a later connection, then close again: the idempotent
+        # already_closed path still answers ok for the same session_id.
+        assert_check(node.tool('exec_close', {'session_id': sid})['ok'], 'close failed')
         closed = node.tool('exec_close', {'session_id': sid})
-        assert_check(closed['ok'], closed)
+        assert_check(closed['ok'] and closed.get('already_closed'), closed)
     finally:
         node.close()
 
@@ -92,7 +104,8 @@ def case_overflow_counts_lost_bytes():
         assert_check(len(waited['stdout']) <= 2048, waited['stdout'][:64])
         # Explicit truncation flag and the exact lost count.
         assert_check(waited['truncated_stdout'], waited)
-        assert_check(waited['lost_stdout_bytes'] >= 5000 - 2048, waited)
+        assert_check(waited['lost_stdout_bytes'] == 5000 - 2048, waited)
+        assert_check(len(waited['stdout']) == 2048, waited['stdout'][:64])
         assert_check(waited['lost_stderr_bytes'] == 0, waited)
         node.tool('exec_close', {'session_id': sid})
     finally:
@@ -150,8 +163,6 @@ def case_unknown_session_never_existed():
 
 
 def main():
-    import unittest
-    suite = unittest.TestSuite()
     cases = [
         ('reattach_after_client_disconnect', case_reattach_after_client_disconnect),
         ('overflow_counts_lost_bytes', case_overflow_counts_lost_bytes),
