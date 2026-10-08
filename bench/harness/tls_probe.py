@@ -22,6 +22,7 @@ Output: one JSON document (--out or stdout); progress to stderr; raw
 samples stream to --jsonl-client / --jsonl-node as they complete.
 """
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -147,6 +148,33 @@ def start_hub(args, workdir, token_file, secret_file):
         if NO_TLS_SERVER_NOTE in tail:
             return None, f"skip:{NO_TLS_SERVER_NOTE}"
         return None, f"error:hub did not start: {tail[-400:]}"
+    # Anti-contamination: prove the TLS listener on the link port serves the
+    # certificate this run just generated. A stale hub from an earlier crashed
+    # run would own the port and silently poison every sample.
+    cert_pem = os.path.join(workdir, "server.pem")
+    try:
+        with open(cert_pem) as f:
+            want = hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
+        got_pem = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                got_pem = ssl.get_server_certificate(("127.0.0.1", args.link_port), timeout=3)
+                break
+            except OSError:
+                if p.poll() is not None:
+                    break
+                time.sleep(0.05)
+        if got_pem is None:
+            raise OSError("no TLS listener on the link port")
+        got = hashlib.sha256(ssl.PEM_cert_to_DER_cert(got_pem)).hexdigest()
+        if got != want:
+            pl.kill_tree(p)
+            return None, ("error:link port %d serves a foreign certificate "
+                          "(stale hub from a previous run?); refusing to measure" % args.link_port)
+    except OSError as e:
+        pl.kill_tree(p)
+        return None, f"error:link port cert check failed: {e}"
     # wait for the TLS announcement so handshakes hit a ready listener
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
