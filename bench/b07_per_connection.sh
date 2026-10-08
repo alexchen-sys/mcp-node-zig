@@ -11,6 +11,7 @@ echo "== b07 per-connection RSS: ours (http, $B07_CONNECTIONS connections) ==" >
 $NICE_CMD python3 "$HARNESS/agents_probe.py" --transport http \
     --port "$MCPNZ_PORT" --token-file "$TOKEN_FILE" \
     --connections "$B07_CONNECTIONS" --step "$B07_STEP" \
+    --jsonl "$RAW/b07_ours.jsonl" --series b07 --participant ours \
     --out "$RAW/b07_ours.json" -- "${MCPNZ_BIN:?set MCPNZ_BIN}"
 
 echo "== b07 per-agent cost: tumf/mcp-shell-server (second instance) ==" >&2

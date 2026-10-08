@@ -9,6 +9,10 @@ inside the same process.
 stdio transport (rivals): each agent runs its own server process, so the
 "cost of the second agent" is a full second instance; we spawn two instances
 side by side and report each tree's RSS.
+
+JSONL streaming (b07 schema: step, connections_open, rss_kib,
+delta_per_conn_kib) applies to the http mode, where the per-step series
+exists; the stdio two-instance comparison has no step series to stream.
 """
 import argparse
 import json
@@ -34,7 +38,7 @@ def rss_now_kib(root_pid, n=5, interval=0.2):
     return median(vals)
 
 
-def http_probe(args, env, token):
+def http_probe(args, env, token, js=None):
     p = pl.spawn(args.argv, env_extra=env)
     _, ok = pl.wait_port(args.port)
     if not ok:
@@ -63,6 +67,12 @@ def http_probe(args, env, token):
         time.sleep(0.5)
         rss = rss_now_kib(p.pid)
         steps.append({"connections": len(conns), "rss_kib": rss})
+        if js:
+            # b07 schema: one flat line per step, streamed as it lands.
+            delta = (rss - base) if (rss is not None and base is not None) else None
+            js.emit(step=step, connections_open=len(conns), rss_kib=rss,
+                    delta_per_conn_kib=round(delta / len(conns), 1)
+                    if delta is not None else None)
 
     for c in conns:
         c.close()
@@ -123,6 +133,7 @@ def stdio_probe(args, env):
 
 
 def main():
+    head, server_argv = pl.split_server_argv(sys.argv[1:])
     ap = argparse.ArgumentParser(description="per-connection / per-agent memory probe")
     ap.add_argument("--transport", choices=["stdio", "http"], default="http")
     ap.add_argument("--port", type=int, default=18341)
@@ -130,9 +141,20 @@ def main():
     ap.add_argument("--connections", type=int, default=20)
     ap.add_argument("--step", type=int, default=5)
     ap.add_argument("-E", "--env", action="append")
+    ap.add_argument("--jsonl", default=None,
+                    help="append one JSON object per step as it lands (http mode)")
+    ap.add_argument("--series", default="b07",
+                    help="series tag stamped on every JSONL line")
+    ap.add_argument("--participant", default="unknown",
+                    help="participant tag stamped on every JSONL line")
     ap.add_argument("--out", default=None)
-    ap.add_argument("argv", nargs="*")
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args(head)
+    if not server_argv:
+        bad = [a for a in extra if a.startswith("-")]
+        if bad:
+            ap.error("unrecognized arguments: " + " ".join(bad))
+        server_argv = extra
+    args.argv = server_argv
     if not args.argv:
         ap.error("server command is required")
 
@@ -145,14 +167,21 @@ def main():
         with open(args.token_file) as f:
             token = f.read().strip()
 
-    if args.transport == "http":
-        env.setdefault("MCP_NODE_PORT", str(args.port))
-        env.setdefault("MCP_NODE_HOST", "127.0.0.1")
-        if args.token_file:
-            env.setdefault("MCP_NODE_TOKEN_FILE", args.token_file)
-        out = http_probe(args, env, token)
-    else:
-        out = stdio_probe(args, env)
+    js = None
+    if args.jsonl and args.transport == "http":
+        js = pl.JsonlWriter(args.jsonl, args.series, args.participant)
+    try:
+        if args.transport == "http":
+            env.setdefault("MCP_NODE_PORT", str(args.port))
+            env.setdefault("MCP_NODE_HOST", "127.0.0.1")
+            if args.token_file:
+                env.setdefault("MCP_NODE_TOKEN_FILE", args.token_file)
+            out = http_probe(args, env, token, js)
+        else:
+            out = stdio_probe(args, env)
+    finally:
+        if js:
+            js.close()
 
     out["phase"] = "per_connection"
     payload = json.dumps(out, indent=1)

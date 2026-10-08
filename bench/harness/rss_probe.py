@@ -42,8 +42,12 @@ def tree_snapshot(root_pid):
     return m
 
 
-def run_clean(args, env, token):
-    """Measurement run: nothing but the server in the tree."""
+def run_clean(args, env, token, js=None):
+    """Measurement run: nothing but the server in the tree.
+
+    When js is given, every memory sample streams to JSONL as it lands
+    (b03 schema: sample index, rss_kib, pss_kib, tree_pids count).
+    """
     if args.transport == "http":
         p = pl.spawn(args.argv, env_extra=env)
         _, ok = pl.wait_port(args.port)
@@ -69,9 +73,15 @@ def run_clean(args, env, token):
         root_pid = cli.p.pid
         globals()["_keep_cli"] = cli  # keep pipes open while sampling
 
+    def on_sample(i, m):
+        if js:
+            js.emit(sample=i, rss_kib=m["rss_kib"], pss_kib=m["pss_kib"],
+                    tree_pids=len(m["pids"]))
+
     time.sleep(args.settle)
     snap = tree_snapshot(root_pid)
-    mem = pl.sample_tree_memory(root_pid, samples=args.samples, interval_s=args.interval)
+    mem = pl.sample_tree_memory(root_pid, samples=args.samples,
+                                interval_s=args.interval, on_sample=on_sample)
     end = tree_snapshot(root_pid)
 
     if args.transport == "http":
@@ -129,6 +139,7 @@ def run_time_v(args, env, token):
 
 
 def main():
+    head, server_argv = pl.split_server_argv(sys.argv[1:])
     ap = argparse.ArgumentParser(description="idle RSS probe")
     ap.add_argument("--transport", choices=["stdio", "http"], default="stdio")
     ap.add_argument("--port", type=int, default=18341)
@@ -139,9 +150,20 @@ def main():
     ap.add_argument("--time-v-out", default=None,
                     help="also run /usr/bin/time -v into this file (http, single-process)")
     ap.add_argument("-E", "--env", action="append")
+    ap.add_argument("--jsonl", default=None,
+                    help="append one JSON object per memory sample as it lands")
+    ap.add_argument("--series", default="b03",
+                    help="series tag stamped on every JSONL line")
+    ap.add_argument("--participant", default="unknown",
+                    help="participant tag stamped on every JSONL line")
     ap.add_argument("--out", default=None)
-    ap.add_argument("argv", nargs="*")
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args(head)
+    if not server_argv:
+        bad = [a for a in extra if a.startswith("-")]
+        if bad:
+            ap.error("unrecognized arguments: " + " ".join(bad))
+        server_argv = extra
+    args.argv = server_argv
     if not args.argv:
         ap.error("server command is required")
 
@@ -160,7 +182,14 @@ def main():
         if args.token_file:
             env.setdefault("MCP_NODE_TOKEN_FILE", args.token_file)
 
-    clean, err = run_clean(args, env, token)
+    js = None
+    if args.jsonl:
+        js = pl.JsonlWriter(args.jsonl, args.series, args.participant)
+    try:
+        clean, err = run_clean(args, env, token, js)
+    finally:
+        if js:
+            js.close()
     if err or clean is None:
         print(json.dumps({"phase": "rss_idle", "error": err or "no result"}))
         return 1

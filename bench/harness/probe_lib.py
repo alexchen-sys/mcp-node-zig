@@ -178,6 +178,76 @@ def wait_port(port, host="127.0.0.1", deadline_s=30.0, poll_ms=1.0):
     return attempts, False
 
 
+def wait_port_timed(port, host="127.0.0.1", deadline_s=30.0, poll_ms=1.0):
+    """Like wait_port, but returns (t_first_success_ns, attempts, ok).
+
+    t_first_success_ns is perf_counter_ns at the moment the port first
+    accepted a connection — the marker that splits cold start into
+    boot_listen (spawn -> listening) and the initialize handshake
+    (listening -> first MCP response). None when the port never came up.
+    """
+    deadline = time.monotonic() + deadline_s
+    attempts = 0
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.25)
+        try:
+            s.connect((host, port))
+            s.close()
+            return time.perf_counter_ns(), attempts, True
+        except OSError:
+            attempts += 1
+            time.sleep(poll_ms / 1000.0)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return None, attempts, False
+
+
+def split_server_argv(argv):
+    """Split a command line at the first bare '--' separator.
+
+    Everything after '--' is the server command, taken verbatim; everything
+    before goes to argparse. argparse's own '--' handling after option
+    arguments is unreliable across Python minor versions (regressed in
+    3.12.0-3.12.3), so the probes normalize it here.
+    Returns (head, server_argv).
+    """
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, []
+
+
+class JsonlWriter:
+    """Append-only JSONL sample stream (crash-safe for multi-hour runs).
+
+    One flat JSON object per line, flushed as each sample lands, so a crash
+    mid-series keeps every completed sample on disk. Every line carries
+    `series` and `participant`, so raw files keep their provenance no matter
+    where they are copied. Schema per series: bench/README.md.
+    """
+
+    def __init__(self, path, series, participant):
+        self.f = open(path, "a", encoding="utf-8")
+        self.series = series
+        self.participant = participant
+
+    def emit(self, **fields):
+        rec = {"series": self.series, "participant": self.participant}
+        rec.update(fields)
+        self.f.write(json.dumps(rec) + "\n")
+        self.f.flush()
+
+    def close(self):
+        try:
+            self.f.close()
+        except OSError:
+            pass
+
+
 class HttpMcpClient:
     """JSON-RPC over POST /mcp with a persistent (keep-alive) connection."""
 
@@ -315,13 +385,19 @@ def tree_memory_kib(root_pid):
     return {"rss_kib": rss, "pss_kib": pss, "pids": pids}
 
 
-def sample_tree_memory(root_pid, samples=20, interval_s=0.5):
-    """Timed samples of tree RSS/PSS -> median + max (psutil-style protocol)."""
+def sample_tree_memory(root_pid, samples=20, interval_s=0.5, on_sample=None):
+    """Timed samples of tree RSS/PSS -> median + max (psutil-style protocol).
+
+    on_sample(index, measurement) fires as each sample lands, so callers can
+    stream the series to JSONL while it runs.
+    """
     out = []
-    for _ in range(samples):
+    for i in range(samples):
         m = tree_memory_kib(root_pid)
         if m["pids"]:
             out.append(m)
+            if on_sample:
+                on_sample(i, m)
         time.sleep(interval_s)
     rss = [m["rss_kib"] for m in out]
     pss = [m["pss_kib"] for m in out]

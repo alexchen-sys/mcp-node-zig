@@ -12,6 +12,7 @@ run_participant() {
     $NICE_CMD python3 "$HARNESS/mcp_probe.py" bootstrap \
         --transport "$transport" --runs "$B01_RUNS" \
         --out "$out" \
+        --jsonl "$RAW/b01_${name}.jsonl" --series b01 --participant "$name" \
         --port "$MCPNZ_PORT" \
         "$@"
 }
