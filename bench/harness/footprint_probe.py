@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Delivery footprint probe (methodology b08).
 
-mcp-node-zig: the shipped artifact is one static binary; we stat it.
+mcp-node-zig: the shipped artifact is one self-contained binary; we stat it
+and record (from ldd) whether the measured build is fully static or links
+the system libc (the -Dtls-server build does, for mbedTLS).
 
 Rivals: a "standard install" via their documented channels (uvx / npx) puts
 a package environment on the machine plus a language runtime to interpret
