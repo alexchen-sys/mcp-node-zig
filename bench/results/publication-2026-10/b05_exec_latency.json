@@ -1,0 +1,196 @@
+{
+ "metric": "b05_exec_latency",
+ "label": "warm server, tools/call exec argv [uname -a], N=10000 round-trips",
+ "participants": {
+  "ours": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_ours.json",
+   "argv": [
+    "/root/repo/zig-out/bin/mcp-node"
+   ],
+   "transport": "http",
+   "server_info": {
+    "name": "mcp-node",
+    "version": "0.3.1"
+   },
+   "runs": 10000,
+   "failures": 0,
+   "summary": {
+    "n": 10000,
+    "unit": "ms",
+    "mean": 1.521,
+    "sigma": 0.428,
+    "min": 0.836,
+    "max": 4.459,
+    "median": 1.615,
+    "p90": 2.007,
+    "p95": 2.204,
+    "p99": 2.518,
+    "cv_pct": 28.16,
+    "ci95_half": 0.008,
+    "p50": 1.615,
+    "histogram": {
+     "unit": "ms",
+     "n": 10000,
+     "buckets": [
+      {
+       "floor": 0.0,
+       "ceil": 1.0,
+       "count": 1732,
+       "share_pct": 17.32
+      },
+      {
+       "floor": 1.0,
+       "ceil": 2.0,
+       "count": 7240,
+       "share_pct": 72.4
+      },
+      {
+       "floor": 2.0,
+       "ceil": 4.0,
+       "count": 1026,
+       "share_pct": 10.26
+      },
+      {
+       "floor": 4.0,
+       "ceil": 8.0,
+       "count": 2,
+       "share_pct": 0.02
+      }
+     ]
+    }
+   }
+  },
+  "tumf": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_tumf.json",
+   "argv": [
+    "uvx",
+    "mcp-shell-server"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-shell-server",
+    "version": "1.30.0"
+   },
+   "runs": 10000,
+   "failures": 0,
+   "summary": {
+    "n": 10000,
+    "unit": "ms",
+    "mean": 2.572,
+    "sigma": 0.388,
+    "min": 2.006,
+    "max": 18.593,
+    "median": 2.462,
+    "p90": 3.026,
+    "p95": 3.203,
+    "p99": 3.779,
+    "cv_pct": 15.1,
+    "ci95_half": 0.008,
+    "p50": 2.462,
+    "histogram": {
+     "unit": "ms",
+     "n": 10000,
+     "buckets": [
+      {
+       "floor": 0.0,
+       "ceil": 1.0,
+       "count": 0,
+       "share_pct": 0.0
+      },
+      {
+       "floor": 1.0,
+       "ceil": 2.0,
+       "count": 0,
+       "share_pct": 0.0
+      },
+      {
+       "floor": 2.0,
+       "ceil": 4.0,
+       "count": 9931,
+       "share_pct": 99.31
+      },
+      {
+       "floor": 4.0,
+       "ceil": 8.0,
+       "count": 68,
+       "share_pct": 0.68
+      },
+      {
+       "floor": 8.0,
+       "ceil": 16.0,
+       "count": 0,
+       "share_pct": 0.0
+      },
+      {
+       "floor": 16.0,
+       "ceil": 32.0,
+       "count": 1,
+       "share_pct": 0.01
+      }
+     ]
+    }
+   }
+  },
+  "g0t4": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_g0t4.json",
+   "argv": [
+    "npx",
+    "-y",
+    "mcp-server-commands"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-server-commands",
+    "version": "0.8.2",
+    "description": "Run commands on this linux machine"
+   },
+   "runs": 10000,
+   "failures": 0,
+   "summary": {
+    "n": 10000,
+    "unit": "ms",
+    "mean": 2.407,
+    "sigma": 0.604,
+    "min": 1.297,
+    "max": 5.943,
+    "median": 2.437,
+    "p90": 3.127,
+    "p95": 3.309,
+    "p99": 3.737,
+    "cv_pct": 25.11,
+    "ci95_half": 0.012,
+    "p50": 2.437,
+    "histogram": {
+     "unit": "ms",
+     "n": 10000,
+     "buckets": [
+      {
+       "floor": 0.0,
+       "ceil": 1.0,
+       "count": 0,
+       "share_pct": 0.0
+      },
+      {
+       "floor": 1.0,
+       "ceil": 2.0,
+       "count": 2745,
+       "share_pct": 27.45
+      },
+      {
+       "floor": 2.0,
+       "ceil": 4.0,
+       "count": 7208,
+       "share_pct": 72.08
+      },
+      {
+       "floor": 4.0,
+       "ceil": 8.0,
+       "count": 47,
+       "share_pct": 0.47
+      }
+     ]
+    }
+   }
+  }
+ }
+}

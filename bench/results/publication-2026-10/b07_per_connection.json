@@ -1,0 +1,52 @@
+{
+ "metric": "b07_per_connection",
+ "label": "ours: 1 process x N connections; rivals: N processes x full RSS",
+ "participants": {
+  "ours": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b07_ours.json",
+   "argv": [
+    "/root/repo/zig-out/bin/mcp-node"
+   ],
+   "transport": "http",
+   "server_info": {
+    "name": "mcp-node",
+    "version": "0.3.1"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": null
+  },
+  "tumf": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b07_tumf.json",
+   "argv": [
+    "uvx",
+    "mcp-shell-server"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-shell-server",
+    "version": "1.30.0"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": null
+  },
+  "g0t4": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b07_g0t4.json",
+   "argv": [
+    "npx",
+    "-y",
+    "mcp-server-commands"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-server-commands",
+    "version": "0.8.2",
+    "description": "Run commands on this linux machine"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": null
+  }
+ }
+}

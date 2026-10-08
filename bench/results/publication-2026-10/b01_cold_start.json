@@ -1,0 +1,225 @@
+{
+ "metric": "b01_cold_start",
+ "label": "spawn -> first MCP response (initialize), full shutdown between runs",
+ "participants": {
+  "ours": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b01_ours.json",
+   "argv": [
+    "/root/repo/zig-out/bin/mcp-node"
+   ],
+   "transport": "http",
+   "server_info": {
+    "name": "mcp-node",
+    "version": "0.3.1"
+   },
+   "runs": 10000,
+   "failures": [],
+   "summary": {
+    "cold_first_response_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 2.025,
+     "sigma": 0.32,
+     "min": 0.65,
+     "max": 8.56,
+     "median": 1.983,
+     "p90": 2.348,
+     "p95": 2.422,
+     "p99": 3.001,
+     "cv_pct": 15.82,
+     "ci95_half": 0.006
+    },
+    "boot_listen_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 1.229,
+     "sigma": 0.16,
+     "min": 0.078,
+     "max": 5.019,
+     "median": 1.21,
+     "p90": 1.289,
+     "p95": 1.306,
+     "p99": 1.574,
+     "cv_pct": 13.04,
+     "ci95_half": 0.003
+    },
+    "initialize_handshake_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 0.796,
+     "sigma": 0.24,
+     "min": 0.448,
+     "max": 4.796,
+     "median": 0.763,
+     "p90": 1.083,
+     "p95": 1.145,
+     "p99": 1.286,
+     "cv_pct": 30.15,
+     "ci95_half": 0.005
+    },
+    "ready_to_serve_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 4.242,
+     "sigma": 0.801,
+     "min": 2.228,
+     "max": 13.357,
+     "median": 4.159,
+     "p90": 5.277,
+     "p95": 5.48,
+     "p99": 6.001,
+     "cv_pct": 18.87,
+     "ci95_half": 0.016
+    },
+    "rtt_exec_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 1.754,
+     "sigma": 0.49,
+     "min": 0.996,
+     "max": 5.872,
+     "median": 1.641,
+     "p90": 2.405,
+     "p95": 2.541,
+     "p99": 2.778,
+     "cv_pct": 27.95,
+     "ci95_half": 0.01
+    }
+   }
+  },
+  "tumf": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b01_tumf.json",
+   "argv": [
+    "uvx",
+    "mcp-shell-server"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-shell-server",
+    "version": "1.30.0"
+   },
+   "runs": 10000,
+   "failures": [],
+   "summary": {
+    "cold_first_response_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 658.216,
+     "sigma": 18.272,
+     "min": 611.1,
+     "max": 804.812,
+     "median": 656.411,
+     "p90": 680.658,
+     "p95": 689.174,
+     "p99": 712.748,
+     "cv_pct": 2.78,
+     "ci95_half": 0.36
+    },
+    "boot_listen_ms": {
+     "n": 0,
+     "unit": "ms"
+    },
+    "initialize_handshake_ms": {
+     "n": 0,
+     "unit": "ms"
+    },
+    "ready_to_serve_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 663.639,
+     "sigma": 18.262,
+     "min": 616.595,
+     "max": 810.268,
+     "median": 661.924,
+     "p90": 685.959,
+     "p95": 694.669,
+     "p99": 717.539,
+     "cv_pct": 2.75,
+     "ci95_half": 0.359
+    },
+    "rtt_exec_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 3.871,
+     "sigma": 0.569,
+     "min": 2.722,
+     "max": 15.717,
+     "median": 3.845,
+     "p90": 4.457,
+     "p95": 4.625,
+     "p99": 5.439,
+     "cv_pct": 14.7,
+     "ci95_half": 0.011
+    }
+   }
+  },
+  "g0t4": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b01_g0t4.json",
+   "argv": [
+    "npx",
+    "-y",
+    "mcp-server-commands"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-server-commands",
+    "version": "0.8.2",
+    "description": "Run commands on this linux machine"
+   },
+   "runs": 10000,
+   "failures": [],
+   "summary": {
+    "cold_first_response_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 509.181,
+     "sigma": 24.304,
+     "min": 455.738,
+     "max": 774.306,
+     "median": 504.174,
+     "p90": 541.298,
+     "p95": 554.343,
+     "p99": 580.588,
+     "cv_pct": 4.77,
+     "ci95_half": 0.478
+    },
+    "boot_listen_ms": {
+     "n": 0,
+     "unit": "ms"
+    },
+    "initialize_handshake_ms": {
+     "n": 0,
+     "unit": "ms"
+    },
+    "ready_to_serve_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 514.706,
+     "sigma": 24.42,
+     "min": 460.57,
+     "max": 779.88,
+     "median": 509.689,
+     "p90": 546.797,
+     "p95": 560.207,
+     "p99": 586.435,
+     "cv_pct": 4.74,
+     "ci95_half": 0.481
+    },
+    "rtt_exec_ms": {
+     "n": 10000,
+     "unit": "ms",
+     "mean": 4.867,
+     "sigma": 0.694,
+     "min": 3.831,
+     "max": 10.974,
+     "median": 4.696,
+     "p90": 5.782,
+     "p95": 6.038,
+     "p99": 7.024,
+     "cv_pct": 14.25,
+     "ci95_half": 0.014
+    }
+   }
+  }
+ }
+}

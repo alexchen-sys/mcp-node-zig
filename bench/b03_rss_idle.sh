@@ -9,6 +9,7 @@ echo "== b03 idle RSS: ours ==" >&2
 $NICE_CMD python3 "$HARNESS/rss_probe.py" --transport http \
     --port "$MCPNZ_PORT" --token-file "$TOKEN_FILE" \
     --settle 2.0 --samples "$B03_SAMPLES" --interval "$B03_INTERVAL" \
+    --jsonl "$RAW/b03_ours.jsonl" --series b03 --participant ours \
     --time-v-out "$RAW/b03_ours_time_v.txt" \
     --out "$RAW/b03_ours.json" -- "${MCPNZ_BIN:?set MCPNZ_BIN}"
 
@@ -17,11 +18,13 @@ tumf_env=()
 for e in "${TUMF_ENV[@]}"; do tumf_env+=(-E "$e"); done
 $NICE_CMD python3 "$HARNESS/rss_probe.py" --transport stdio \
     --settle 2.0 --samples "$B03_SAMPLES" --interval "$B03_INTERVAL" \
+    --jsonl "$RAW/b03_tumf.jsonl" --series b03 --participant tumf \
     "${tumf_env[@]}" --out "$RAW/b03_tumf.json" -- "${TUMF_ARGV[@]}"
 
 echo "== b03 idle RSS: g0t4/mcp-server-commands ==" >&2
 $NICE_CMD python3 "$HARNESS/rss_probe.py" --transport stdio \
     --settle 2.0 --samples "$B03_SAMPLES" --interval "$B03_INTERVAL" \
+    --jsonl "$RAW/b03_g0t4.jsonl" --series b03 --participant g0t4 \
     --out "$RAW/b03_g0t4.json" -- "${G0T4_ARGV[@]}"
 
 python3 "$BENCH_DIR/lib/collect.py" \

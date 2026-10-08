@@ -1,0 +1,19 @@
+{
+ "mode": "one process per agent (two instances side by side)",
+ "transport": "stdio",
+ "argv": [
+  "npx",
+  "-y",
+  "mcp-server-commands"
+ ],
+ "server_info": {
+  "name": "mcp-server-commands",
+  "version": "0.8.2",
+  "description": "Run commands on this linux machine"
+ },
+ "instance_a_rss_kib": 158688,
+ "instance_b_rss_kib": 159896,
+ "second_agent_cost_kib": 159896,
+ "two_agents_total_kib": 318584,
+ "phase": "per_connection"
+}

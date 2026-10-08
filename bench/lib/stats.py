@@ -3,7 +3,9 @@
 
 Conventions follow the methodology doc (bench/README.md):
 - every point metric is reported as mean +/- sigma with min..max
-- latency distributions report p50/p95/p99
+- latency distributions report p50/p90/p95/p99 plus a fixed log2-bucket
+  histogram so the distribution shape is inspectable without re-reading
+  the raw JSONL
 - 95% CI of the mean uses Student's t (df = N-1)
 - series with CV > 10% are flagged, never silently dropped
 """
@@ -48,7 +50,7 @@ def t95(n):
 
 
 def summarize_samples(xs, unit="ms"):
-    """Point-metric summary: mean, sigma, min, max, median, p95, CV, 95% CI."""
+    """Point-metric summary: mean, sigma, min, max, median, p90, p95, p99, CV, 95% CI."""
     if not xs:
         return {"n": 0, "unit": unit}
     m = mean(xs)
@@ -61,19 +63,52 @@ def summarize_samples(xs, unit="ms"):
         "min": round(min(xs), 3),
         "max": round(max(xs), 3),
         "median": round(percentile(xs, 50), 3),
+        "p90": round(percentile(xs, 90), 3),
         "p95": round(percentile(xs, 95), 3),
+        "p99": round(percentile(xs, 99), 3),
         "cv_pct": round(100.0 * s / m, 2) if m else None,
         "ci95_half": round(t95(len(xs)) * s / math.sqrt(len(xs)), 3) if len(xs) > 1 else 0.0,
     }
 
 
+def histogram_log2(xs, unit="ms"):
+    """Fixed log2-bucket histogram of a latency sample set.
+
+    Bucket 0 covers [0, 2^0) in the given unit; bucket k (k >= 1) covers
+    [2^(k-1), 2^k). Bounds are exact powers of two, deterministic given the
+    data, so the shape of the distribution is inspectable from the aggregate
+    without re-reading the raw JSONL.
+    """
+    if not xs:
+        return {"unit": unit, "n": 0, "buckets": []}
+    kmax = 0
+    for x in xs:
+        if x >= 1:
+            kmax = max(kmax, int(math.floor(math.log2(x))) + 1)
+    counts = [0] * (kmax + 1)
+    for x in xs:
+        if x < 1:
+            k = 0
+        else:
+            k = min(int(math.floor(math.log2(x))) + 1, kmax)
+        counts[k] += 1
+    n = len(xs)
+    buckets = []
+    for k, c in enumerate(counts):
+        lo = 0.0 if k == 0 else float(2 ** (k - 1))
+        hi = float(2 ** k)
+        buckets.append({"floor": lo, "ceil": hi, "count": c,
+                        "share_pct": round(100.0 * c / n, 2)})
+    return {"unit": unit, "n": n, "buckets": buckets}
+
+
 def latency_summary(xs, unit="ms"):
-    """Distribution summary for round-trip latencies: percentiles + spread."""
+    """Distribution summary for round-trip latencies: percentiles + histogram."""
     if not xs:
         return {"n": 0, "unit": unit}
     base = summarize_samples(xs, unit)
     base["p50"] = base["median"]
-    base["p99"] = round(percentile(xs, 99), 3)
+    base["histogram"] = histogram_log2(xs, unit)
     return base
 
 

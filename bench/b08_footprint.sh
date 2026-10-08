@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # b08 — delivery footprint: what you must put on the target machine.
-# ours: one static binary (stat). rivals: package environment laid down by
-# their documented install channel (uvx venv / npx cache) + the language
-# runtime that interprets them; paths are resolved from a live process.
+# ours: one self-contained binary (stat; the note records whether the
+# measured build is fully static or links the system libc for mbedTLS).
+# rivals: package environment laid down by their documented install channel
+# (uvx venv / npx cache) + the language runtime that interprets them; paths
+# are resolved from a live process.
 set -euo pipefail
 . "$(dirname "$0")/config.sh"
 

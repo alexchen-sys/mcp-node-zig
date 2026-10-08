@@ -1,0 +1,132 @@
+{
+ "phase": "rss_idle",
+ "transport": "http",
+ "argv": [
+  "/root/repo/zig-out/bin/mcp-node"
+ ],
+ "settle_s": 2.0,
+ "samples": 20,
+ "interval_s": 0.5,
+ "server_info": {
+  "name": "mcp-node",
+  "version": "0.3.1"
+ },
+ "process_tree_start": {
+  "rss_kib": 2352,
+  "pss_kib": 1912,
+  "pids": [
+   955380
+  ],
+  "breakdown": {
+   "955380": {
+    "name": "mcp-node",
+    "rss_kib": 2352
+   }
+  },
+  "names": [
+   "mcp-node"
+  ]
+ },
+ "process_tree_end": {
+  "rss_kib": 2352,
+  "pss_kib": 1912,
+  "pids": [
+   955380
+  ],
+  "breakdown": {
+   "955380": {
+    "name": "mcp-node",
+    "rss_kib": 2352
+   }
+  },
+  "names": [
+   "mcp-node"
+  ]
+ },
+ "memory": {
+  "samples_taken": 20,
+  "rss_kib": {
+   "median": 2352,
+   "max": 2352,
+   "series": [
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352,
+    2352
+   ]
+  },
+  "pss_kib": {
+   "median": 1912,
+   "max": 1912,
+   "series": [
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912,
+    1912
+   ]
+  }
+ },
+ "summary": {
+  "rss_mib_median": 2.3,
+  "rss_mib_max": 2.3,
+  "pss_mib_median": 1.87,
+  "pss_mib_max": 1.87
+ },
+ "time_v": {
+  "Command being timed": "\"/root/repo/zig-out/bin/mcp-node\"",
+  "User time (seconds)": "0.00",
+  "System time (seconds)": "0.00",
+  "Percent of CPU this job got": "0%",
+  "Elapsed (wall clock) time (h": "mm:ss or m:ss): 0:02.00",
+  "Average shared text size (kbytes)": "0",
+  "Average unshared data size (kbytes)": "0",
+  "Average stack size (kbytes)": "0",
+  "Average total size (kbytes)": "0",
+  "Maximum resident set size (kbytes)": "2700",
+  "Average resident set size (kbytes)": "0",
+  "Major (requiring I/O) page faults": "0",
+  "Minor (reclaiming a frame) page faults": "323",
+  "Voluntary context switches": "4",
+  "Involuntary context switches": "0",
+  "Swaps": "0",
+  "File system inputs": "0",
+  "File system outputs": "0",
+  "Socket messages sent": "0",
+  "Socket messages received": "0",
+  "Signals delivered": "0",
+  "Page size (bytes)": "4096",
+  "Exit status": "0"
+ }
+}

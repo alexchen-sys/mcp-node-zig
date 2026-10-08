@@ -3,7 +3,8 @@
 # Full cycle per run: spawn -> initialize -> tools/list -> one exec -> shutdown.
 # No warmup BY DESIGN (this is the cold metric); installer caches of the
 # rivals must be warmed beforehand (run_all.sh does this before calling us).
-# N runs per participant; reports median/mean/sigma/min/max/p95 + 95% CI.
+# N runs per participant (profile default: publication = 10000); reports
+# p50/p90/p95/p99, mean/sigma/min/max + 95% CI, raw samples stream to JSONL.
 set -euo pipefail
 . "$(dirname "$0")/config.sh"
 
@@ -12,6 +13,7 @@ run_participant() {
     $NICE_CMD python3 "$HARNESS/mcp_probe.py" bootstrap \
         --transport "$transport" --runs "$B01_RUNS" \
         --out "$out" \
+        --jsonl "$RAW/b01_${name}.jsonl" --series b01 --participant "$name" \
         --port "$MCPNZ_PORT" \
         "$@"
 }

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Delivery footprint probe (methodology b08).
 
-mcp-node-zig: the shipped artifact is one static binary; we stat it.
+mcp-node-zig: the shipped artifact is one self-contained binary; we stat it
+and record (from ldd) whether the measured build is fully static or links
+the system libc (the -Dtls-server build does, for mbedTLS).
 
 Rivals: a "standard install" via their documented channels (uvx / npx) puts
 a package environment on the machine plus a language runtime to interpret
@@ -49,6 +51,18 @@ def mib(b):
 
 def probe_ours(bin_path, build_mode):
     st = os.stat(bin_path)
+    # Honesty: the default build is fully static; the -Dtls-server build
+    # (which the publication evidence uses, for b02) links the system libc
+    # for mbedTLS. Derive the note from the actual binary instead of
+    # hardcoding either claim.
+    dyn = False
+    try:
+        r = subprocess.run(["ldd", str(bin_path)], capture_output=True, text=True, timeout=10)
+        dyn = r.returncode == 0 and "=>" in r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    note = ("single binary, no runtime to install (dynamically linked: system libc)"
+            if dyn else "static binary, no runtime to install (Linux: no libc dependency)")
     return {
         "participant": "mcp-node-zig",
         "artifact": bin_path,
@@ -57,7 +71,7 @@ def probe_ours(bin_path, build_mode):
         "binary_mib": mib(st.st_size),
         "runtime_bytes": 0,
         "runtime_mib": 0.0,
-        "notes": "static binary, no runtime to install (Linux: no libc dependency)",
+        "notes": note,
     }
 
 
