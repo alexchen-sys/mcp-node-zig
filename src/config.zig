@@ -419,6 +419,16 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with node/stdio mode: there is no client token to gate\n", .{});
                 return error.InvalidConfig;
             }
+            if (mode == .hub) {
+                // The relay route (/n/<name>/mcp) forwards the raw body to
+                // connected nodes, where no policy exists: a hub-side policy
+                // would gate only the hub's own tools/call and silently
+                // pass everything else — a false sense of security. Refuse
+                // at startup; run policies on listen nodes instead (review
+                // F5).
+                std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with hub mode: relayed calls run on nodes that have no policy; run the policy on each node's listen listener instead\n", .{});
+                return error.InvalidConfig;
+            }
             if (std.mem.eql(u8, getEnv(arena, "MCP_NODE_INSECURE") orelse "0", "1")) {
                 std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with MCP_NODE_INSECURE=1\n", .{});
                 return error.InvalidConfig;

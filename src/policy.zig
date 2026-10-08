@@ -30,6 +30,7 @@ pub const DenyReason = enum {
     denied_path,
     timeout_exceeds_cap,
     write_mode_exceeds_cap,
+    bad_argument_type,
     session_not_owned,
 
     pub fn text(self: DenyReason) []const u8 {
@@ -41,6 +42,7 @@ pub const DenyReason = enum {
             .denied_path => "path is in this token's deny list",
             .timeout_exceeds_cap => "timeout exceeds this token's cap",
             .write_mode_exceeds_cap => "mode exceeds this token's write mode cap",
+            .bad_argument_type => "argument has a type this token's policy refuses",
             .session_not_owned => "session belongs to another token",
         };
     }
@@ -413,10 +415,15 @@ fn normalizeLexical(arena: Allocator, path: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Canonicalise a path for policy matching: expand "~", anchor relatives to
-/// the daemon cwd, normalise lexically, then realpath the deepest existing
-/// ancestor so symlinks are followed wherever they exist (see design §4 for
-/// the TOCTOU statement). Returns an absolute, prefix-comparable path.
+/// Canonicalise a path for policy matching. The order matters and mirrors
+/// the kernel: symlink resolution FIRST (realpath on the raw path), lexical
+/// ".." collapse SECOND — collapsing first would let "symlink/../x" hide the
+/// symlink from realpath while the kernel still resolves it (review F2).
+/// For a path whose tail does not exist yet we realpath the deepest
+/// existing ancestor OF THE RAW FORM, then lexically normalise the joined
+/// result, so a symlinked segment can never smuggle ".." past the check.
+/// TOCTOU remains: the gate canonicalises, then the tool opens the RAW
+/// path; a local racer can swap components in between (design §4).
 pub fn canonicalizePath(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
     var p = path;
     // "~"/"~/x" expansion, same semantics as tools.expandPath.
@@ -431,29 +438,30 @@ pub fn canonicalizePath(arena: Allocator, io: Io, path: []const u8) ![]const u8 
         const cwd = try std.process.currentPathAlloc(io, arena);
         p = try std.mem.concat(arena, u8, &.{ cwd, "/", p });
     }
-    const norm = try normalizeLexical(arena, p);
 
-    // Full path exists -> one realpath resolves everything, symlinks and all.
-    if (realPathOf(arena, io, norm)) |rp| {
+    // Kernel order, step 1: the full raw path exists -> one realpath
+    // resolves every symlink exactly like the open will.
+    if (realPathOf(arena, io, p)) |rp| {
         return rp;
     } else |_| {}
 
-    // Walk up to the deepest existing ancestor, realpath that, re-append
-    // the (lexically normal) tail. A fresh path inside an allowed tree then
-    // passes on the strength of its real ancestor — the intended semantics
-    // for creating new files. Failure to resolve anything (e.g. every parent
-    // missing) leaves the lexical form: the prefix check still applies to
-    // it, and an allowlist root that does not exist would be a policy the
-    // operator cannot use anyway.
-    var dir = std.fs.path.dirname(norm) orelse return norm;
+    // Step 2: the tail is new (write_file creating a file). Realpath the
+    // deepest existing ancestor OF THE RAW PATH — symlinked segments stay
+    // visible — then re-attach the raw tail and collapse ".." lexically on
+    // the REALPATHED prefix, never on the raw form.
+    var dir = std.fs.path.dirname(p) orelse return try normalizeLexical(arena, p);
     while (dir.len > 1) {
         if (realPathOf(arena, io, dir)) |rp| {
-            const tail = norm[dir.len..]; // keeps its leading '/'
-            return try std.mem.concat(arena, u8, &.{ rp, tail });
+            const tail = p[dir.len..]; // keeps its leading '/'
+            const joined = try std.mem.concat(arena, u8, &.{ rp, tail });
+            return try normalizeLexical(arena, joined);
         } else |_| {}
-        dir = std.fs.path.dirname(dir) orelse return norm;
+        dir = std.fs.path.dirname(dir) orelse return try normalizeLexical(arena, p);
     }
-    return norm;
+    // Nothing exists up the chain: lexical form only. The prefix check
+    // still applies; an allowlist root that does not exist is unusable
+    // anyway.
+    return try normalizeLexical(arena, p);
 }
 
 fn realPathOf(arena: Allocator, io: Io, absolute: []const u8) ![]const u8 {
@@ -556,6 +564,9 @@ pub fn checkPath(arena: Allocator, io: Io, policy: *const TokenPolicy, path: []c
 pub fn checkWriteMode(policy: *const TokenPolicy, mode: i64) DenyError!void {
     if (policy.allow_all) return;
     if (policy.write_max_mode) |cap| {
+        // i64 space end to end: a negative mode can never pass the cast
+        // (review F3 — @intCast of a negative panicked in ReleaseSafe).
+        if (mode < 0) return error.PolicyDenied;
         const m: u64 = @intCast(mode);
         if (m > cap) return error.PolicyDenied;
     }
@@ -919,10 +930,138 @@ test "policy: canonicalizePath anchors relatives and follows symlinks" {
     // Relative path anchors to the daemon cwd; the result is absolute.
     const rel = try canonicalizePath(arena, io, "some/rel/path");
     try testing.expect(std.fs.path.isAbsolute(rel));
-    // "~" expands via the environ snapshot when HOME is set; without HOME
-    // it stays a lexical path (still absolute after anchoring? no: a
-    // leading '~' path without HOME expands to nothing, anchors as a
-    // relative "~..." path under cwd — acceptable and still prefix-checked).
+    // "The kernel resolves a symlinked segment and '..' in the OPPOSITE
+    // order of a lexical pre-collapse" (review F2): "allow/esc/../outside"
+    // must canonicalise OUTSIDE the allow tree, because the kernel would
+    // open it there.
+    const smuggle = try std.mem.concat(arena, u8, &.{ root, "/allow/esc/../outside" });
+    const canon4 = try canonicalizePath(arena, io, smuggle);
+    try testing.expect(std.mem.endsWith(u8, canon4, "/outside"));
+    try testing.expect(std.mem.indexOf(u8, canon4, "/allow") == null);
+    // The same smuggle against a non-existing tail (write_file shape):
+    // realpath of the raw existing ancestor resolves esc, the tail is
+    // re-attached, then collapsed — still outside.
+    const smuggle2 = try std.mem.concat(arena, u8, &.{ root, "/allow/esc/../outside/new.txt" });
+    const canon5 = try canonicalizePath(arena, io, smuggle2);
+    try testing.expect(std.mem.endsWith(u8, canon5, "/outside/new.txt"));
+    try testing.expect(std.mem.indexOf(u8, canon5, "/allow") == null);
+}
+
+test "policy: argument-type grammar matches the tool layer" {
+    // F1/F3/F6: a present-but-wrong-type or float-typed mode/timeout must
+    // be DENIED (or converted exactly like the tool), never skipped.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    const pol = TokenPolicy{
+        .file = "f",
+        .token_hash = [_]u8{0} ** 32,
+        .tools = &.{ "write_file", "exec", "exec_wait", "exec_shell" },
+        .exec_argv0 = &.{.{ .text = "sh", .has_slash = false }},
+        .max_timeout_s = 10,
+        .write_max_mode = 0o644,
+        .read_paths = &.{},
+        .write_paths = &.{"/srv"},
+        .read_deny = &.{},
+        .write_deny = &.{},
+        .cwd_deny = &.{},
+        .exec_cwd = &.{},
+    };
+
+    // mode as an integral float converts and is checked (420.0 == 0o644 ok;
+    // 2533.0 == 0o4755 over the cap -> denied).
+    var args_ok: std.json.ObjectMap = .empty;
+    try args_ok.put(arena, "path", .{ .string = "/srv/f" });
+    try args_ok.put(arena, "content_b64", .{ .string = "aGk=" });
+    try args_ok.put(arena, "mode", .{ .float = 420.0 });
+    try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_ok }) == null);
+
+    var args_setuid: std.json.ObjectMap = .empty;
+    try args_setuid.put(arena, "path", .{ .string = "/srv/f" });
+    try args_setuid.put(arena, "content_b64", .{ .string = "aGk=" });
+    try args_setuid.put(arena, "mode", .{ .float = 2533.0 });
+    if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_setuid })) |d| {
+        try testing.expectEqualStrings("write_mode_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // negative mode: denied, never a @intCast panic (F3).
+    var args_neg: std.json.ObjectMap = .empty;
+    try args_neg.put(arena, "path", .{ .string = "/srv/f" });
+    try args_neg.put(arena, "content_b64", .{ .string = "aGk=" });
+    try args_neg.put(arena, "mode", .{ .integer = -1 });
+    if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_neg })) |d| {
+        try testing.expectEqualStrings("write_mode_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // wrong-type mode: bad_argument_type, not a silent skip.
+    var args_str: std.json.ObjectMap = .empty;
+    try args_str.put(arena, "path", .{ .string = "/srv/f" });
+    try args_str.put(arena, "content_b64", .{ .string = "aGk=" });
+    try args_str.put(arena, "mode", .{ .string = "0644" });
+    if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_str })) |d| {
+        try testing.expectEqualStrings("bad_argument_type", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // omitted mode: the tool default 0644 is cap-checked (F8); a 0600 cap
+    // refuses an omitted mode, 0644 passes.
+    var args_nomode: std.json.ObjectMap = .empty;
+    try args_nomode.put(arena, "path", .{ .string = "/srv/f" });
+    try args_nomode.put(arena, "content_b64", .{ .string = "aGk=" });
+    try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_nomode }) == null);
+    var pol600 = pol;
+    pol600.write_max_mode = 0o600;
+    if (checkCall(arena, io, undefined, &pol600, "write_file", .{ .object = args_nomode })) |d| {
+        try testing.expectEqualStrings("write_mode_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // exec timeout as float: 5.0 converts and passes; 600.0 denied.
+    var argv_one: std.json.Array = .init(arena);
+    try argv_one.append(.{ .string = "sh" });
+    var t_ok: std.json.ObjectMap = .empty;
+    try t_ok.put(arena, "argv", .{ .array = argv_one });
+    try t_ok.put(arena, "timeout", .{ .float = 5.0 });
+    try testing.expect(checkCall(arena, io, undefined, &pol, "exec", .{ .object = t_ok }) == null);
+    var argv_two: std.json.Array = .init(arena);
+    try argv_two.append(.{ .string = "sh" });
+    var t_over: std.json.ObjectMap = .empty;
+    try t_over.put(arena, "argv", .{ .array = argv_two });
+    try t_over.put(arena, "timeout", .{ .float = 600.0 });
+    if (checkCall(arena, io, undefined, &pol, "exec", .{ .object = t_over })) |d| {
+        try testing.expectEqualStrings("timeout_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // timeout null on exec: counts as the 120s default -> over a cap of 10
+    // -> denied (F6).
+    var argv_three: std.json.Array = .init(arena);
+    try argv_three.append(.{ .string = "sh" });
+    var t_null: std.json.ObjectMap = .empty;
+    try t_null.put(arena, "argv", .{ .array = argv_three });
+    try t_null.put(arena, "timeout", Value.null);
+    if (checkCall(arena, io, undefined, &pol, "exec", .{ .object = t_null })) |d| {
+        try testing.expectEqualStrings("timeout_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+
+    // exec_wait omitted timeout: the 30s default is cap-checked (F7) —
+    // denied under a cap of 10, allowed under a cap of 60.
+    var w: std.json.ObjectMap = .empty;
+    try w.put(arena, "session_id", .{ .integer = 1 });
+    if (checkCall(arena, io, undefined, &pol, "exec_wait", .{ .object = w })) |d| {
+        try testing.expectEqualStrings("timeout_exceeds_cap", d.reason_tag);
+    } else return error.TestUnexpectedResult;
+    var pol60 = pol;
+    pol60.max_timeout_s = 60;
+    try testing.expect(checkCall(arena, io, undefined, &pol60, "exec_wait", .{ .object = w }) == null);
+
+    // exec_shell with a non-string shell: bad_argument_type, never a null
+    // unwrap (F4).
+    var sh_null: std.json.ObjectMap = .empty;
+    try sh_null.put(arena, "script", .{ .string = "x" });
+    try sh_null.put(arena, "shell", Value.null);
+    if (checkCall(arena, io, undefined, &pol, "exec_shell", .{ .object = sh_null })) |d| {
+        try testing.expectEqualStrings("bad_argument_type", d.reason_tag);
+    } else return error.TestUnexpectedResult;
 }
 
 test "policy: prefixAllowed deny wins over allow" {
@@ -957,6 +1096,7 @@ pub fn denyText(tag: []const u8) []const u8 {
     if (std.mem.eql(u8, tag, "denied_path")) return DenyReason.denied_path.text();
     if (std.mem.eql(u8, tag, "timeout_exceeds_cap")) return DenyReason.timeout_exceeds_cap.text();
     if (std.mem.eql(u8, tag, "write_mode_exceeds_cap")) return DenyReason.write_mode_exceeds_cap.text();
+    if (std.mem.eql(u8, tag, "bad_argument_type")) return DenyReason.bad_argument_type.text();
     if (std.mem.eql(u8, tag, "session_not_owned")) return DenyReason.session_not_owned.text();
     return "denied by token policy";
 }
@@ -970,6 +1110,7 @@ fn denyTag(r: DenyReason) []const u8 {
         .denied_path => "denied_path",
         .timeout_exceeds_cap => "timeout_exceeds_cap",
         .write_mode_exceeds_cap => "write_mode_exceeds_cap",
+        .bad_argument_type => "bad_argument_type",
         .session_not_owned => "session_not_owned",
     };
 }
@@ -1006,23 +1147,55 @@ pub fn checkCall(
         if (!pathAllowed(arena, io, pol, path.string, .write)) {
             return .{ .reason_tag = if (deniedExplicit(arena, io, pol, path.string, .write)) denyTag(.denied_path) else denyTag(.path_not_allowed), .field = "path" };
         }
-        if (util.objGet(args, "mode")) |m| {
-            if (m == .integer) {
-                checkWriteMode(pol, m.integer) catch {
-                    return .{ .reason_tag = denyTag(.write_mode_exceeds_cap), .field = "mode" };
-                };
-            }
-        }
+        // The gate must validate the SAME grammar the tool accepts
+        // (review F1/F3/F8): the tool turns an integral float into an
+        // integer (util.optIntArg), so the gate does too — otherwise
+        // "mode": 2533.0 skips the setuid cap. Present-but-wrong-type is a
+        // deny, not a skip. An absent mode means the tool default 0o644;
+        // check that against the cap too (review F8).
+        const mode_v = util.objGet(args, "mode");
+        const effective: i64 = if (mode_v) |m| switch (m) {
+            .integer => |i| i,
+            .float => |f| blk: {
+                const i = util.floatToI64(f) orelse
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "mode" };
+                if (@as(f64, @floatFromInt(i)) != f)
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "mode" };
+                break :blk i;
+            },
+            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch
+                return .{ .reason_tag = denyTag(.bad_argument_type), .field = "mode" },
+            else => return .{ .reason_tag = denyTag(.bad_argument_type), .field = "mode" },
+        } else 0o644;
+        if (effective < 0) return .{ .reason_tag = denyTag(.write_mode_exceeds_cap), .field = "mode" };
+        checkWriteMode(pol, effective) catch {
+            return .{ .reason_tag = denyTag(.write_mode_exceeds_cap), .field = "mode" };
+        };
         return null;
     }
     if (std.mem.eql(u8, tool, "exec_wait")) {
-        if (util.objGet(args, "timeout")) |t| {
-            if (t == .integer) {
-                checkTimeout(pol, t.integer) catch {
-                    return .{ .reason_tag = denyTag(.timeout_exceeds_cap), .field = "timeout" };
-                };
-            }
-        }
+        // Same grammar as the tool (review F1/F6); absent timeout means the
+        // tool default 30s (WAIT_DEFAULT_TIMEOUT_S) — checked against the
+        // cap like any explicit value (review F7).
+        const t_v = util.objGet(args, "timeout");
+        const wait_default: i64 = 30;
+        const effective: i64 = if (t_v) |t| switch (t) {
+            .null => wait_default,
+            .integer => |i| i,
+            .float => |f| blk: {
+                const i = util.floatToI64(f) orelse
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" };
+                if (@as(f64, @floatFromInt(i)) != f)
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" };
+                break :blk i;
+            },
+            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch
+                return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" },
+            else => return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" },
+        } else wait_default;
+        checkTimeout(pol, effective) catch {
+            return .{ .reason_tag = denyTag(.timeout_exceeds_cap), .field = "timeout" };
+        };
         return null; // session ownership checked inside the tool (owner hash)
     }
     // sys_info and the session-control tools (exec_poll/write/kill/close,
@@ -1036,11 +1209,17 @@ fn checkExecArgs(arena: Allocator, io: Io, pol: *const TokenPolicy, tool: []cons
     // exec_shell synthesizes the argv the tool will actually spawn: the
     // explicit shell or the platform default. Gating the synthesized argv
     // is what makes "shell not in exec_argv0" a real, checkable rule.
-    var argv0: ?[]const u8 = null;
+    var argv0: []const u8 = undefined;
     if (std.mem.eql(u8, tool, "exec_shell")) {
         const builtin = @import("builtin");
         const default_shell: []const u8 = if (builtin.os.tag == .windows) "cmd" else "bash";
-        argv0 = if (util.objGet(args, "shell")) |s| (if (s == .string) s.string else null) else default_shell;
+        // Present-but-wrong-type shell is a deny (review F4): the tool
+        // would reject it with InvalidParams, and the gate must never
+        // unwrap a null built from unvalidated JSON.
+        argv0 = if (util.objGet(args, "shell")) |s| switch (s) {
+            .string => |ss| ss,
+            else => return .{ .reason_tag = denyTag(.bad_argument_type), .field = "shell" },
+        } else default_shell;
     } else {
         const argv = util.objGet(args, "argv") orelse return null; // tool's own MissingArgv
         if (argv != .array or argv.array.items.len == 0) return null; // tool's own BadArgv
@@ -1048,7 +1227,7 @@ fn checkExecArgs(arena: Allocator, io: Io, pol: *const TokenPolicy, tool: []cons
         if (first != .string) return null;
         argv0 = first.string;
     }
-    checkArgv0(arena, io, pol, argv0.?) catch {
+    checkArgv0(arena, io, pol, argv0) catch {
         return .{ .reason_tag = denyTag(.argv0_not_allowed), .field = "argv[0]" };
     };
     if (util.objGet(args, "cwd")) |c| {
@@ -1058,13 +1237,29 @@ fn checkExecArgs(arena: Allocator, io: Io, pol: *const TokenPolicy, tool: []cons
             };
         }
     }
+    // Timeout grammar identical to the tool (review F1/F6): integral
+    // floats convert, anything else present-but-wrong-type is a deny, and
+    // null counts as absent (the tool's optIntArg maps null -> default).
+    const exec_default_s: i64 = 120;
     if (util.objGet(args, "timeout")) |t| {
-        if (t == .integer) {
-            checkTimeout(pol, t.integer) catch {
-                return .{ .reason_tag = denyTag(.timeout_exceeds_cap), .field = "timeout" };
-            };
-        }
-    } else if (pol.max_timeout_s != null and pol.max_timeout_s.? < 120) {
+        const effective: i64 = switch (t) {
+            .null => exec_default_s,
+            .integer => |i| i,
+            .float => |f| blk: {
+                const i = util.floatToI64(f) orelse
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" };
+                if (@as(f64, @floatFromInt(i)) != f)
+                    return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" };
+                break :blk i;
+            },
+            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch
+                return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" },
+            else => return .{ .reason_tag = denyTag(.bad_argument_type), .field = "timeout" },
+        };
+        checkTimeout(pol, effective) catch {
+            return .{ .reason_tag = denyTag(.timeout_exceeds_cap), .field = "timeout" };
+        };
+    } else if (pol.max_timeout_s != null and pol.max_timeout_s.? < exec_default_s) {
         // No explicit timeout -> the tool default (120s) would run above the
         // cap: deny rather than silently clamp (design §5).
         return .{ .reason_tag = denyTag(.timeout_exceeds_cap), .field = "timeout" };

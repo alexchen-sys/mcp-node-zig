@@ -219,6 +219,15 @@ def case_reader_token(env):
     # symlink escape: denied (the gate sees the realpath target)
     out = tool(port, env.token_reader, 'read_file', {'path': str(allow / 'esc' / 'secret.txt')})
     expect_deny(out, 'path_not_allowed')
+    # adversarial: symlink + '..' smuggling — the kernel would open the
+    # target OUTSIDE the tree; the canonicaliser resolves in kernel order
+    # (realpath first, '..' collapse second) so this denies too
+    out = tool(port, env.token_reader, 'read_file',
+               {'path': str(allow / 'esc' / '..' / 'outside' / 'secret.txt')})
+    expect_deny(out, 'path_not_allowed')
+    out = tool(port, env.token_reader, 'read_file',
+               {'path': str(allow / 'esc' / '..' / 'secret.txt')})
+    expect_deny(out, 'path_not_allowed')
     # write: denied at tool level
     out = tool(port, env.token_reader, 'write_file',
                {'path': str(allow / 'nope.txt'), 'content_b64': 'aGk='})
@@ -296,6 +305,33 @@ def case_build_token(env):
     # exec_shell with disallowed shell: denied
     out = tool(port, env.token_build, 'exec_shell', {'script': 'x', 'shell': 'zsh'})
     expect_deny(out, 'argv0_not_allowed')
+    # adversarial: integral-float mode (setuid value) is checked, not skipped
+    out = tool(port, env.token_build, 'write_file',
+               {'path': str(allow / 'floatsetuid.txt'), 'content_b64': 'aGk=',
+                'mode': 2533.0})
+    expect_deny(out, 'write_mode_exceeds_cap')
+    check(not (allow / 'floatsetuid.txt').exists(), 'float-mode denial created the file')
+    # adversarial: negative mode must not crash the node (it survived the
+    # call above if we are here) and is denied
+    out = tool(port, env.token_build, 'write_file',
+               {'path': str(allow / 'neg.txt'), 'content_b64': 'aGk=', 'mode': -1})
+    expect_deny(out, 'write_mode_exceeds_cap')
+    check(not (allow / 'neg.txt').exists(), 'negative-mode denial created the file')
+    # adversarial: wrong-type mode (string) denied
+    out = tool(port, env.token_build, 'write_file',
+               {'path': str(allow / 'strmode.txt'), 'content_b64': 'aGk=',
+                'mode': '0644'})
+    expect_deny(out, 'bad_argument_type')
+    # adversarial: null timeout counts as the 120s default -> over cap
+    out = tool(port, env.token_build, 'exec',
+               {'argv': ['sh', '-c', 'true'], 'timeout': None})
+    expect_deny(out, 'timeout_exceeds_cap')
+    # adversarial: non-string shell never crashes and is denied
+    out = tool(port, env.token_build, 'exec_shell', {'script': 'x', 'shell': 123})
+    expect_deny(out, 'bad_argument_type')
+    # node still alive after all adversarial shapes
+    out = tool(port, env.token_reader, 'sys_info')
+    check('node' in out, out)
 
 
 def case_session_ownership(env):
@@ -442,6 +478,22 @@ def case_startup_failures(tmp):
          'oops': 1}, tok, tag='unknownkey')
     check(not alive, 'node started with an unknown policy key')
     check('unknown top-level key' in logs, logs[-800:])
+    # 6. hub mode + policy -> startup error (relay route runs on nodes
+    #    with no policy; a hub-side policy would be a false sense of
+    #    security)
+    pf = tmp / 'policy-hubmode.json'
+    write0600(pf, json.dumps({'version': 1, 'tokens': [{'file': str(tok), 'allow_all': True}]}))
+    e = base_env()
+    e.update({'MCP_NODE_HUB_LISTEN': '127.0.0.1:1',
+              'MCP_NODE_HUB_SECRET_FILE': str(tmp / 'hub-secret'),
+              'MCP_NODE_TOKEN_FILE': str(tok),
+              'MCP_NODE_POLICY_FILE': str(pf)})
+    write0600(tmp / 'hub-secret', secrets.token_hex(16))
+    proc = rev.Proc(tmp, 'hubmode', e)
+    rev.wait_until(lambda: not proc.alive(), 8)
+    check(not proc.alive(), 'hub started with a policy file')
+    check('hub mode' in proc.logs(), proc.logs()[-800:])
+    proc.stop()
 
 
 def main():
