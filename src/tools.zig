@@ -225,6 +225,51 @@ fn sessionFromArgs(cfg: *const config.Config, args: Value) !*session_mod.Session
     return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
 }
 
+/// Durability contract reply for a session id that is not live on this
+/// node: a structured tool result (ok:false), never a bare JSON-RPC
+/// -32602. Carries the caller's session_id and, when this node process
+/// previously held and removed the session (TTL reap, exec_close, or
+/// overflow eviction), expired=true — a cheap "it was here, it is gone"
+/// signal distinguishing a reaped id from one this node never had (or one
+/// from before a node restart, which is indistinguishable from "never
+/// existed" and said so honestly in the message).
+fn replyUnknownSession(arena: Allocator, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
+    const store = cfg.sessions orelse return error.SessionsDisabled;
+    // sessionFromArgs already validated presence/type/positivity of
+    // session_id before failing, so this re-read cannot miss.
+    const id_i = (try util.optIntArg(args, "session_id")) orelse return error.MissingSession;
+    const expired = store.sawSession(@as(u64, @intCast(id_i)));
+    // Best-effort recency: expired=true only for ids removed within the
+    // store's bounded tombstone window; an id the node did hold but long
+    // ago (or before a node restart) answers expired=false, and the
+    // message must not overclaim which case it is.
+    const hint: []const u8 = if (expired)
+        "session was closed, reaped after the TTL, or evicted on this node; exec_list shows live sessions"
+    else
+        "no recently-live session with this id on this node (never started here, removed long ago, or the node restarted); exec_list shows live sessions";
+    try out.appendSlice(arena, "{\"ok\":false,\"error\":\"unknown_session\",\"session_id\":");
+    try out.print(arena, "{d}", .{id_i});
+    try out.appendSlice(arena, ",\"expired\":");
+    try out.appendSlice(arena, if (expired) "true" else "false");
+    try out.appendSlice(arena, ",\"message\":");
+    try util.appendJsonString(out, arena, hint);
+    try out.appendSlice(arena, "}");
+}
+
+/// sessionFromArgs + unknown_session reply in one step for the session
+/// tools whose contract answers unknown ids with the structured payload
+/// instead of a thrown error (exec_close keeps its frozen already_closed
+/// idempotency and does not use this).
+fn sessionOrUnknownReply(arena: Allocator, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !?*session_mod.Session {
+    return sessionFromArgs(cfg, args) catch |err| switch (err) {
+        error.UnknownSession => {
+            try replyUnknownSession(arena, cfg, args, out);
+            return null;
+        },
+        else => return err,
+    };
+}
+
 /// Spawn a session process (piped stdio, own process group) and publish it.
 /// Ownership: argv/cwd/stdin_fd transfer to the Session on success; on any
 /// error path the errdefers free them exactly once. The child is always
@@ -443,7 +488,7 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
 
 pub fn toolExecPoll(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
-    const session = try sessionFromArgs(cfg, args);
+    const session = (try sessionOrUnknownReply(arena, cfg, args, out)) orelse return;
     defer session_mod.sessionRelease(session);
     const stdout_offset = (try util.optIntArg(args, "stdout_offset")) orelse 0;
     const stderr_offset = (try util.optIntArg(args, "stderr_offset")) orelse 0;
@@ -452,7 +497,7 @@ pub fn toolExecPoll(arena: Allocator, io: Io, cfg: *const config.Config, args: V
 
 pub fn toolExecWait(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
     _ = io;
-    const session = try sessionFromArgs(cfg, args);
+    const session = (try sessionOrUnknownReply(arena, cfg, args, out)) orelse return;
     defer session_mod.sessionRelease(session);
     const stdout_offset = (try util.optIntArg(args, "stdout_offset")) orelse 0;
     const stderr_offset = (try util.optIntArg(args, "stderr_offset")) orelse 0;
@@ -523,7 +568,7 @@ pub fn toolExecWrite(arena: Allocator, io: Io, cfg: *const config.Config, args: 
     // happens to exist.
     const data_b64 = (try util.optStrArg(args, "data_b64")) orelse return error.MissingData;
     const eof = (try util.optBoolArg(args, "eof")) orelse false;
-    const session = try sessionFromArgs(cfg, args);
+    const session = (try sessionOrUnknownReply(arena, cfg, args, out)) orelse return;
     defer session_mod.sessionRelease(session);
     const size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
     const data = try std.heap.page_allocator.alloc(u8, size);
@@ -551,7 +596,7 @@ pub fn toolExecWrite(arena: Allocator, io: Io, cfg: *const config.Config, args: 
 }
 
 pub fn toolExecKill(arena: Allocator, io: Io, cfg: *const config.Config, args: Value, out: *std.ArrayList(u8)) !void {
-    const session = try sessionFromArgs(cfg, args);
+    const session = (try sessionOrUnknownReply(arena, cfg, args, out)) orelse return;
     defer session_mod.sessionRelease(session);
     // session_mod.killTreeGuarded serializes check+kill against the waiter's reap: the
     // kill either lands while the leader zombie still pins the process group
@@ -1266,7 +1311,12 @@ test "exec session lifecycle start write wait poll close" {
     try std.testing.expect(getBool(second_close, "already_closed"));
 
     out = .empty;
-    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, args, &out));
+    try runTool(arena, io, &cfg, toolExecPoll, args, &out);
+    const ghost = try parseArgs(arena, out.items);
+    try std.testing.expect(!getBool(ghost, "ok"));
+    try std.testing.expectEqualStrings("unknown_session", getStr(ghost, "error"));
+    try std.testing.expectEqual(sid, getInt(ghost, "session_id"));
+    try std.testing.expect(getBool(ghost, "expired"));
 }
 
 test "exec close kills a running session and frees it" {
@@ -1322,7 +1372,11 @@ test "exec close kills a running session and frees it" {
     try std.testing.expect(getBool(again, "ok"));
     try std.testing.expect(getBool(again, "already_closed"));
     out = .empty;
-    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, args, &out));
+    try runTool(arena, io, &cfg, toolExecPoll, args, &out);
+    const ghost = try parseArgs(arena, out.items);
+    try std.testing.expect(!getBool(ghost, "ok"));
+    try std.testing.expectEqualStrings("unknown_session", getStr(ghost, "error"));
+    try std.testing.expect(getBool(ghost, "expired"));
 }
 
 test "tool argument validation errors" {
@@ -1353,7 +1407,15 @@ test "tool argument validation errors" {
     cfg.sessions = store;
     try std.testing.expectError(error.BadSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":0}", &out));
     try std.testing.expectError(error.BadSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":-2}", &out));
-    try std.testing.expectError(error.UnknownSession, runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":424242}", &out));
+    // A never-existent id is a structured unknown_session result, not an
+    // error: expired=false because this node process never held it.
+    out = .empty;
+    try runTool(arena, io, &cfg, toolExecPoll, "{\"session_id\":424242}", &out);
+    const never = try parseArgs(arena, out.items);
+    try std.testing.expect(!getBool(never, "ok"));
+    try std.testing.expectEqualStrings("unknown_session", getStr(never, "error"));
+    try std.testing.expectEqual(@as(i64, 424242), getInt(never, "session_id"));
+    try std.testing.expect(!getBool(never, "expired"));
 
     // exec_write validates the protocol types before resolving the session.
     try std.testing.expectError(error.InvalidParams, runTool(arena, io, &cfg, toolExecWrite, "{\"session_id\":1,\"data_b64\":7}", &out));

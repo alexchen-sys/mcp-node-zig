@@ -43,6 +43,12 @@ pub const Session = struct {
     exit_code: ?i64 = null,
     truncated_stdout: bool = false,
     truncated_stderr: bool = false,
+    /// Total bytes read from the child but dropped because the captured
+    /// buffer had already reached max_out. Guarded by `mutex` together
+    /// with the buffers and the truncated flags, so a poll reply can never
+    /// report a lost count that lags behind the bytes it just returned.
+    lost_stdout_bytes: u64 = 0,
+    lost_stderr_bytes: u64 = 0,
     /// Session start on the real clock, in microseconds (sub-ms sessions
     /// would render duration_ms: 0; duration_us keeps the precision).
     started_us: i64,
@@ -71,6 +77,12 @@ pub const Session = struct {
     readers_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
+/// How many recently finished/removed session ids the store remembers for
+/// the unknown_session error contract. Fixed size: a full ring overwrites
+/// the oldest entry, so memory is bounded no matter how many sessions a
+/// process reaps over its lifetime.
+pub const TOMBSTONE_SLOTS: usize = 128;
+
 pub const SessionStore = struct {
     mutex: std.Io.Mutex = .init,
     io: Io,
@@ -78,9 +90,38 @@ pub const SessionStore = struct {
     next_id: u64 = 1,
     max: u16,
     ttl_ms: i64 = DEFAULT_SESSION_TTL_MS,
+    /// Ring of ids this store once held but no longer does (TTL-reaped,
+    /// closed by a client, or evicted). Lets exec_poll answer "expired"
+    /// instead of "never existed" for recent ids, in constant memory.
+    tombstones: [TOMBSTONE_SLOTS]u64 = [_]u64{0} ** TOMBSTONE_SLOTS,
+    tombstone_next: usize = 0,
 
     pub fn init(io: Io, max_sessions: u16) SessionStore {
         return .{ .io = io, .map = std.AutoHashMap(u64, *Session).init(std.heap.page_allocator), .max = max_sessions };
+    }
+
+    /// Record `id` as recently removed (tombstone). Slot 0 is the "empty"
+    /// marker, so a real id 0 can collide only with an unused slot — the
+    /// allocator starts at 1 and no real session id is ever 0.
+    fn tombstone(self: *SessionStore, id: u64) void {
+        self.tombstones[self.tombstone_next] = id;
+        self.tombstone_next = (self.tombstone_next + 1) % TOMBSTONE_SLOTS;
+    }
+
+    /// True when `id` was recently held by this store and has since been
+    /// removed (TTL reap, exec_close, or overflow eviction). Best-effort
+    /// recency signal: the ring is fixed-size, so ids removed more than
+    /// TOMBSTONE_SLOTS removals ago are forgotten and answer false. The
+    /// scan runs under the store mutex: writers (put/remove/reapDone)
+    /// mutate the ring under the same lock, so no torn or mid-write slot
+    /// is ever observed.
+    pub fn sawSession(self: *SessionStore, id: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.tombstones) |t| {
+            if (t == id and id != 0) return true;
+        }
+        return false;
     }
 
     pub fn put(self: *SessionStore, session: *Session) !void {
@@ -99,7 +140,12 @@ pub const SessionStore = struct {
                     const is_done = s.done;
                     s.mutex.unlock(self.io);
                     if (!is_done) continue;
-                    _ = self.map.fetchRemove(kv.key_ptr.*);
+                    // Capture the key before the map mutation: the iterator
+                    // pointer is invalidated by fetchRemove (reapDone does
+                    // the same).
+                    const key = kv.key_ptr.*;
+                    _ = self.map.fetchRemove(key);
+                    self.tombstone(key);
                     victim = s;
                     break;
                 }
@@ -139,6 +185,7 @@ pub const SessionStore = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const kv = self.map.fetchRemove(id) orelse return null;
+        self.tombstone(id);
         return kv.value;
     }
 
@@ -170,6 +217,7 @@ pub const SessionStore = struct {
                 }
                 if (found_key == null) break;
                 _ = self.map.fetchRemove(found_key.?);
+                self.tombstone(found_key.?);
                 victims[n] = found_s.?;
                 n += 1;
             }
@@ -233,9 +281,10 @@ fn termExitCode(term: std.process.Child.Term) i64 {
     };
 }
 
-fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usize, truncated: *bool) void {
+fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usize, truncated: *bool, lost: *u64) void {
     if (list.items.len >= max_out) {
         truncated.* = true;
+        lost.* += bytes.len;
         return;
     }
     const avail = max_out - list.items.len;
@@ -243,10 +292,14 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
     if (take > 0) {
         list.appendSlice(std.heap.page_allocator, bytes[0..take]) catch {
             truncated.* = true;
+            lost.* += bytes.len;
             return;
         };
     }
-    if (take < bytes.len) truncated.* = true;
+    if (take < bytes.len) {
+        truncated.* = true;
+        lost.* += bytes.len - take;
+    }
 }
 
 pub fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
@@ -266,9 +319,9 @@ pub fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool,
             if (n == 0) break;
             session.mutex.lockUncancelable(io);
             if (is_stdout) {
-                appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout);
+                appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout, &session.lost_stdout_bytes);
             } else {
-                appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr);
+                appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr, &session.lost_stderr_bytes);
             }
             session.mutex.unlock(io);
         }
@@ -290,9 +343,9 @@ pub fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool,
             if (n == 0) break;
             session.mutex.lockUncancelable(io);
             if (is_stdout) {
-                appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout);
+                appendSessionOutput(&session.stdout, buf[0..n], max_out, &session.truncated_stdout, &session.lost_stdout_bytes);
             } else {
-                appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr);
+                appendSessionOutput(&session.stderr, buf[0..n], max_out, &session.truncated_stderr, &session.lost_stderr_bytes);
             }
             session.mutex.unlock(io);
         }
@@ -512,6 +565,10 @@ pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Sess
     try out.appendSlice(arena, if (session.truncated_stdout) "true" else "false");
     try out.appendSlice(arena, ",\"truncated_stderr\":");
     try out.appendSlice(arena, if (session.truncated_stderr) "true" else "false");
+    try out.appendSlice(arena, ",\"lost_stdout_bytes\":");
+    try out.print(arena, "{d}", .{session.lost_stdout_bytes});
+    try out.appendSlice(arena, ",\"lost_stderr_bytes\":");
+    try out.print(arena, "{d}", .{session.lost_stderr_bytes});
     try out.appendSlice(arena, ",\"duration_ms\":");
     try out.print(arena, "{d}", .{@divTrunc(elapsed_us, std.time.us_per_ms)});
     try out.appendSlice(arena, ",\"duration_us\":");
@@ -679,6 +736,7 @@ test "render session state emits the full status snapshot" {
     session.started_us = 1_700_000_000_000_000;
     session.ended_us = session.started_us + 1_500_000;
     session.truncated_stdout = true;
+    session.lost_stdout_bytes = 4096;
     try session.stdout.appendSlice(std.heap.page_allocator, "abcdef");
     try session.stderr.appendSlice(std.heap.page_allocator, "ghijkl");
 
@@ -697,6 +755,8 @@ test "render session state emits the full status snapshot" {
     try std.testing.expectEqual(@as(i64, 6), obj.get("stderr_offset").?.integer);
     try std.testing.expect(obj.get("truncated_stdout").?.bool);
     try std.testing.expect(!obj.get("truncated_stderr").?.bool);
+    try std.testing.expectEqual(@as(i64, 4096), obj.get("lost_stdout_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("lost_stderr_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 1500), obj.get("duration_ms").?.integer);
     try std.testing.expectEqual(@as(i64, 1_500_000), obj.get("duration_us").?.integer);
 }
@@ -851,4 +911,112 @@ test "utf8 prefix and offset slicing helpers" {
     try std.testing.expectEqualStrings("", try sliceFromOffset("abcdef", 6));
     try std.testing.expectError(error.BadOffset, sliceFromOffset("abcdef", -1));
     try std.testing.expectError(error.BadOffset, sliceFromOffset("abcdef", 7));
+}
+
+test "appendSessionOutput counts dropped bytes past the cap" {
+    // Under the cap everything is kept and nothing is lost.
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(std.heap.page_allocator);
+        var truncated = false;
+        var lost: u64 = 0;
+        appendSessionOutput(&list, "abcdef", 10, &truncated, &lost);
+        try std.testing.expectEqualStrings("abcdef", list.items);
+        try std.testing.expect(!truncated);
+        try std.testing.expectEqual(@as(u64, 0), lost);
+    }
+    // A single write crossing the cap keeps the head and counts the tail.
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(std.heap.page_allocator);
+        var truncated = false;
+        var lost: u64 = 0;
+        appendSessionOutput(&list, "0123456789", 6, &truncated, &lost);
+        try std.testing.expectEqualStrings("012345", list.items);
+        try std.testing.expect(truncated);
+        try std.testing.expectEqual(@as(u64, 4), lost);
+    }
+    // Once the buffer is full every further byte is dropped and counted.
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(std.heap.page_allocator);
+        var truncated = false;
+        var lost: u64 = 0;
+        appendSessionOutput(&list, "0123456789", 6, &truncated, &lost);
+        appendSessionOutput(&list, "ab", 6, &truncated, &lost);
+        appendSessionOutput(&list, "cde", 6, &truncated, &lost);
+        try std.testing.expectEqualStrings("012345", list.items);
+        try std.testing.expect(truncated);
+        try std.testing.expectEqual(@as(u64, 9), lost); // 4 + 2 + 3
+    }
+}
+
+test "session store tombstones distinguish expired from never-existed" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+
+    // Nothing was ever removed: sawSession is false for anything.
+    try std.testing.expect(!store.sawSession(1));
+    try std.testing.expect(!store.sawSession(9999));
+
+    const first = try newSyntheticSession(io, store.allocId());
+    try store.put(first);
+    const first_id = first.id;
+    try std.testing.expect(!store.sawSession(first_id)); // live: not a tombstone
+
+    // Close-path removal marks the id.
+    const removed = store.remove(first_id).?;
+    try std.testing.expect(store.sawSession(first_id));
+    sessionRelease(removed);
+    try std.testing.expect(store.sawSession(first_id)); // still remembered after free
+
+    // TTL reap marks too.
+    const second = try newSyntheticSession(io, store.allocId());
+    try store.put(second);
+    second.done = true;
+    second.ended_us = nowUs(io) - 1_000_000;
+    store.ttl_ms = 0;
+    const second_id = second.id;
+    store.reapDone();
+    try std.testing.expect(store.sawSession(second_id));
+
+    // A never-seen id stays false.
+    try std.testing.expect(!store.sawSession(424242));
+}
+
+test "session store tombstone ring wraps at the fixed size" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 4);
+    defer store.map.deinit();
+    store.ttl_ms = 0;
+
+    // Fill and reap sessions so ids 1..135 are reaped (the last one stays
+    // live in the map): the ring must keep only the most recent
+    // TOMBSTONE_SLOTS of them, overwriting the oldest.
+    var i: u64 = 0;
+    while (i < TOMBSTONE_SLOTS + 8) : (i += 1) {
+        // max=4 and ttl=0: every put() first reaps all stale done sessions,
+        // so the map never overflows and every previous id is tombstoned.
+        const s = try newSyntheticSession(io, store.allocId());
+        s.done = true;
+        s.ended_us = nowUs(io) - 1_000_000;
+        try store.put(s);
+    }
+    // Reaped ids are 1..135 (135 > 128 slots): the ring keeps 8..135.
+    var remembered: usize = 0;
+    i = 1;
+    while (i <= TOMBSTONE_SLOTS + 7) : (i += 1) {
+        if (store.sawSession(i)) remembered += 1;
+    }
+    try std.testing.expectEqual(TOMBSTONE_SLOTS, remembered);
+    try std.testing.expect(!store.sawSession(1));
+    try std.testing.expect(!store.sawSession(7));
+    try std.testing.expect(store.sawSession(8));
+    try std.testing.expect(store.sawSession(TOMBSTONE_SLOTS + 7));
+    // The final session (id 136) is still live in the map, not a tombstone.
+    try std.testing.expect(!store.sawSession(TOMBSTONE_SLOTS + 8));
+    try std.testing.expect(store.get(TOMBSTONE_SLOTS + 8) != null);
+    sessionRelease(store.get(TOMBSTONE_SLOTS + 8).?);
+    sessionRelease(store.remove(TOMBSTONE_SLOTS + 8).?);
 }

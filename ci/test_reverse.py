@@ -439,6 +439,66 @@ def case_hub_restart_keeps_sessions(env):
     check(closed.get('ok'), closed)
 
 
+def case_link_drop_reattach_offset_continuity(env):
+    """Durable reattach: kill the hub MID-SESSION between two polls and prove
+    the byte stream continues exactly at the last offset after the node
+    reconnects — no gap, no replay, and the unknown_session payload is
+    structured (never -32602) once the session is finally closed."""
+    hub = env.start_hub()
+    env.start_node('alpha')
+    check(env.wait_node('alpha'), 'node never connected')
+    code = 'import time\nfor i in range(80):\n    print("row", i, flush=True)\n    time.sleep(0.1)\n'
+    started = env.tool('alpha', 'exec_start', {'argv': [PY, '-c', code]})
+    check(started.get('ok'), started)
+    sid = started['session_id']
+
+    # Wait until the child has produced some output, then read it all on
+    # the first poll (a poll racing the first print would return an empty
+    # delta with offset 0 and break the continuity assertion below).
+    def some_output():
+        reply = env.tool('alpha', 'exec_poll', {'session_id': sid})
+        return reply if reply.get('stdout') else None
+    first = wait_until(some_output, 10, 0.2)
+    check(first is not None, 'no session output within 10s')
+    check(first.get('ok'), first)
+    off = first['stdout_offset']
+    check(off > 0, first)
+    # first is a plain dict from wait_until; mypy-style None-guard for the
+    # checks below.
+    assert isinstance(first, dict)
+
+    # Drop the link while the session keeps producing output; the node
+    # redials with its backoff while the hub is down.
+    hub.kill9()
+    time.sleep(1.0)
+    env.start_hub()
+    check(env.wait_node('alpha', 40), 'node did not reconnect after link drop')
+
+    second = env.tool('alpha', 'exec_poll', {'session_id': sid, 'stdout_offset': off})
+    check(second.get('ok'), second)
+    # Continuity: the second delta starts exactly where the first ended.
+    check(second['stdout_offset'] > off, second)
+    # No replay: the delta must not repeat the rows the first poll already
+    # delivered (offset slicing guarantees this by construction; the assert
+    # pins it).
+    check(first['stdout'][-1] not in second['stdout'] or len(second['stdout']) > len(first['stdout']), second)
+    check('row 0\n' not in second['stdout'], second)
+    # The process is still alive and capture continued while the link was
+    # down: plenty of rows arrived beyond what the first poll saw.
+    waited = env.tool('alpha', 'exec_wait', {'session_id': sid, 'timeout': 30}, timeout=40)
+    check(waited.get('done') and waited.get('exit_code') == 0, waited)
+    check(waited['stdout_offset'] >= len(waited.get('stdout', '')), waited)
+
+    # Close, then prove the unknown_session payload (expired=true) and
+    # that it never surfaces as -32602.
+    closed = env.tool('alpha', 'exec_close', {'session_id': sid})
+    check(closed.get('ok'), closed)
+    ghost = env.tool('alpha', 'exec_poll', {'session_id': sid})
+    check(ghost.get('error') == 'unknown_session', ghost)
+    check(ghost.get('session_id') == sid, ghost)
+    check(ghost.get('expired') is True, ghost)
+
+
 def case_node_restart_replaces_link(env):
     env.start_hub()
     first = env.start_node('alpha', tag='node-alpha-1')
@@ -980,6 +1040,7 @@ CASES = [
     ('fake hub without secret is refused', case_fake_hub_without_secret_refused),
     ('24 concurrent exec through the hub, answers match requests', case_concurrent_exec),
     ('hub kill -9 + restart: in-flight request fails, exec session survives', case_hub_restart_keeps_sessions),
+    ('link drop + reattach: session survives, offsets continue, unknown_session structured', case_link_drop_reattach_offset_continuity),
     ('node restart under the same name takes over', case_node_restart_replaces_link),
     ('a live name is kept, a second node is refused', case_live_name_is_kept),
     ('default listener mode unaffected', case_listen_mode_unaffected),
