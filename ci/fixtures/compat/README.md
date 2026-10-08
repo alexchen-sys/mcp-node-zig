@@ -106,13 +106,14 @@ The matcher is a structural deep-match, deliberately minimal:
   `isError` stays `false` on the envelope for these; only an unknown tool
   name sets `isError: true` (that envelope has no `structuredContent`).
 - Domain failures (`FileNotFound`, `NotDirectory`, `BadArgv`,
-  `UnsupportedShell`, `UnknownSession`) use the same `{"ok": false,
+  `UnsupportedShell`) use the same `{"ok": false,
   "error": "..."}` payload shape.
 - Validation order is part of the frozen contract: `exec_write` validates
   argument types before session resolution (a bad `data_b64` is -32602
   even when the session is unknown), while `exec_poll`/`exec_wait`
-  resolve the session first (an unknown session answers `UnknownSession`
-  even when `stdout_offset`/`timeout` also has the wrong type). Both
+  resolve the session first (an unknown session answers the structured
+  `unknown_session` payload even when `stdout_offset`/`timeout` also has
+  the wrong type). Both
   orders are pinned by discriminating cases.
 
 ## Environment assumptions

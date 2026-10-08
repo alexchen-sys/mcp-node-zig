@@ -239,10 +239,14 @@ fn replyUnknownSession(arena: Allocator, cfg: *const config.Config, args: Value,
     // session_id before failing, so this re-read cannot miss.
     const id_i = (try util.optIntArg(args, "session_id")) orelse return error.MissingSession;
     const expired = store.sawSession(@as(u64, @intCast(id_i)));
+    // Best-effort recency: expired=true only for ids removed within the
+    // store's bounded tombstone window; an id the node did hold but long
+    // ago (or before a node restart) answers expired=false, and the
+    // message must not overclaim which case it is.
     const hint: []const u8 = if (expired)
         "session was closed, reaped after the TTL, or evicted on this node; exec_list shows live sessions"
     else
-        "no such session on this node (never started here, or the node restarted); exec_list shows live sessions";
+        "no recently-live session with this id on this node (never started here, removed long ago, or the node restarted); exec_list shows live sessions";
     try out.appendSlice(arena, "{\"ok\":false,\"error\":\"unknown_session\",\"session_id\":");
     try out.print(arena, "{d}", .{id_i});
     try out.appendSlice(arena, ",\"expired\":");

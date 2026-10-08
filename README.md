@@ -200,10 +200,11 @@ time.
 An unknown or expired `session_id` answers
 `{"ok": false, "error": "unknown_session", "session_id": ..., "expired": ..., "message": ...}` —
 a structured tool result, never a bare JSON-RPC `-32602`. `expired: true`
-means this node previously held the session and closed, reaped or evicted
-it; `expired: false` means it never existed here (or pre-dates a node
-restart — indistinguishable, and the message says so). `exec_close` keeps
-its idempotent `{"ok": true, "already_closed": true}` for the same case.
+means this node recently held the session and closed, reaped or evicted
+it (a bounded recency window: ids removed long ago are forgotten and
+answer `expired: false`, as do ids this node never had or that pre-date a
+node restart — the message says so). `exec_close` keeps its idempotent
+`{"ok": true, "already_closed": true}` for the same case.
 
 ## Clients
 

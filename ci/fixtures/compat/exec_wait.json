@@ -1,5 +1,5 @@
 {
- "description": "exec_wait: long-poll until done or timeout. Success on a finished echo session (full drained output); timeout expiry on a live /bin/sleep session reports done=false with exit_code null. The live sleep session is reaped by harness teardown. The session is resolved before optional-argument types are validated: an unknown session_id beats a bad timeout type and answers UnknownSession \u2014 the mirror image of exec_write's data_b64-first gate.",
+ "description": "exec_wait: long-poll until done or timeout. Success on a finished echo session (full drained output); timeout expiry on a live /bin/sleep session reports done=false with exit_code null. The live sleep session is reaped by harness teardown. The session is resolved before optional-argument types are validated: an unknown session_id beats a bad timeout type and answers the structured unknown_session payload \u2014 the mirror image of exec_write's data_b64-first gate.",
  "platforms": [
   "posix"
  ],
@@ -286,7 +286,7 @@
       "content": [
        {
         "type": "text",
-        "text": "{\"ok\":false,\"error\":\"unknown_session\",\"session_id\":999999,\"expired\":false,\"message\":\"no such session on this node (never started here, or the node restarted); exec_list shows live sessions\"}"
+        "text": "{\"ok\":false,\"error\":\"unknown_session\",\"session_id\":999999,\"expired\":false,\"message\":\"no recently-live session with this id on this node (never started here, removed long ago, or the node restarted); exec_list shows live sessions\"}"
        }
       ],
       "structuredContent": {
@@ -294,7 +294,7 @@
        "error": "unknown_session",
        "session_id": 999999,
        "expired": false,
-       "message": "no such session on this node (never started here, or the node restarted); exec_list shows live sessions"
+       "message": "no recently-live session with this id on this node (never started here, removed long ago, or the node restarted); exec_list shows live sessions"
       },
       "isError": false
      }

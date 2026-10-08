@@ -109,8 +109,15 @@ pub const SessionStore = struct {
     }
 
     /// True when `id` was recently held by this store and has since been
-    /// removed (TTL reap, exec_close, or overflow eviction).
+    /// removed (TTL reap, exec_close, or overflow eviction). Best-effort
+    /// recency signal: the ring is fixed-size, so ids removed more than
+    /// TOMBSTONE_SLOTS removals ago are forgotten and answer false. The
+    /// scan runs under the store mutex: writers (put/remove/reapDone)
+    /// mutate the ring under the same lock, so no torn or mid-write slot
+    /// is ever observed.
     pub fn sawSession(self: *SessionStore, id: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         for (self.tombstones) |t| {
             if (t == id and id != 0) return true;
         }
@@ -133,8 +140,12 @@ pub const SessionStore = struct {
                     const is_done = s.done;
                     s.mutex.unlock(self.io);
                     if (!is_done) continue;
-                    _ = self.map.fetchRemove(kv.key_ptr.*);
-                    self.tombstone(kv.key_ptr.*);
+                    // Capture the key before the map mutation: the iterator
+                    // pointer is invalidated by fetchRemove (reapDone does
+                    // the same).
+                    const key = kv.key_ptr.*;
+                    _ = self.map.fetchRemove(key);
+                    self.tombstone(key);
                     victim = s;
                     break;
                 }

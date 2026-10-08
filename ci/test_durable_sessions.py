@@ -4,9 +4,12 @@
 Black-box over real processes (listener mode), reusing the regression
 harness Node. Covers the durability contract:
 
-  * Client disconnect + reattach: a session started on connection A is
-    fully serviceable from connection B by session_id — poll from the old
-    offsets, write, kill, close. Capture keeps running while nobody polls.
+  * Client disconnect + reattach: a session started over one HTTP request
+    is fully serviceable from later requests by session_id alone — poll
+    from the old offsets, write, kill, close. Capture keeps running
+    while nobody polls. (The listener harness opens a fresh TCP
+    connection per tool call; the mid-link drop with a hub kill -9 is
+    covered by ci/test_reverse.py.)
   * Buffer overflow: with MCP_NODE_MAX_OUT=2048 a child printing past the
     cap keeps its first 2048 bytes, sets truncated_* and reports the exact
     lost byte count in lost_*_bytes. Never a silent loss.
