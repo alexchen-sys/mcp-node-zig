@@ -89,7 +89,18 @@ pub const CallCtx = struct {
     req_id: []const u8 = "null",
     /// Link REQ stream id (0 off-link); joins hub relay <-> node tool.call.
     link_sid: u32 = 0,
+    /// The per-token policy matched for this request (null when no policy
+    /// is configured, or on transports without a client token). Borrowed;
+    /// the PolicySet outlives every request.
+    policy: ?*const @import("policy.zig").TokenPolicy = null,
+    /// The matched token's hash prefix (8 bytes as 16 hex chars) — identifies
+    /// WHICH policy entry denied, without ever logging the token value.
+    /// Zeroes when no policy is active.
+    token_fp: [16]u8 = token_fp_default,
 };
+
+/// The token_fp value used when no policy is active (all '0' chars).
+pub const token_fp_default: [16]u8 = [_]u8{'0'} ** 16;
 
 pub fn fromCfg(cfg: *const config.Config) ?*Writer {
     return @ptrCast(@alignCast(cfg.audit));
@@ -1286,6 +1297,30 @@ pub fn toolCall(
     if (!buf.overflow) wr.enqueueInner(buf.slice());
 }
 
+/// A policy refusal. Same call fields as tool.call (client, session hash,
+/// req_id, args digest + summary) plus the deny reason and the token
+/// fingerprint — the operator sees what was attempted and why. Never the
+/// token value.
+pub fn policyDeny(
+    w: ?*Writer,
+    ctx: CallCtx,
+    tool: []const u8,
+    args: Value,
+    reason: []const u8,
+) void {
+    const wr = w orelse return;
+    var buf: Buf = undefined;
+    buf.reset();
+    buf.append("\"event\":\"policy.deny\",");
+    appendCallFields(&buf, wr, ctx, tool, args);
+    buf.append(",\"reason\":");
+    buf.jsonStrCap(reason, 64);
+    buf.append(",\"token\":\"");
+    buf.append(&ctx.token_fp);
+    buf.append("\"");
+    if (!buf.overflow) wr.enqueueInner(buf.slice());
+}
+
 pub fn linkUp(w: ?*Writer, name: []const u8, source: []const u8) void {
     const wr = w orelse return;
     var buf: Buf = undefined;
@@ -1494,6 +1529,16 @@ pub fn configFingerprint(cfg: *const config.Config) [MAC_HEX_LEN]u8 {
     h.update(@tagName(cfg.audit_on_full));
     h.update("\x00");
     h.update(std.fmt.bufPrint(&nb, "{d}", .{cfg.audit_max_bytes}) catch "");
+    h.update("\x00");
+    // Argument-gating: the policy file path plus a sha256 of its bytes, so
+    // any policy edit shows up in the next start record. Token values stay
+    // out (they live in separate files; their paths are in the policy).
+    if (cfg.policy) |p| {
+        const ps: *const @import("policy.zig").PolicySet = @ptrCast(@alignCast(p));
+        h.update(ps.file_path);
+        h.update("\x00");
+        for (ps.file_digest) |b| h.update(&[1]u8{b});
+    }
     h.update("\x00");
     const digest = h.finalResult();
     var out: [MAC_HEX_LEN]u8 = undefined;

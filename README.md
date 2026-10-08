@@ -226,6 +226,7 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 ## Security
 
 - **Token required.** The server refuses to start with a missing or empty token file. Comparison is constant-time.
+- **Per-token argument gating (optional).** `MCP_NODE_POLICY_FILE` constrains what each client token may do at the argument level — argv[0] allowlists, path prefixes for reads/writes/cwd, timeout and write-mode caps, token-owned sessions. See [argument gating](docs/arg-gating.md).
 - **Loopback by default.** It binds `127.0.0.1`. To expose it, set `MCP_NODE_HOST` and add the `host:port` clients use to `MCP_NODE_ALLOWED_HOSTS`.
 - **Host and Origin checked** before the body is parsed: unknown Host gets 421, unknown Origin gets 403.
 - **TLS on the wire.** The node link runs over TLS, served by the hub itself in a `-Dtls-server` build or by any terminator. The local HTTP API stays on loopback; to expose it, front it with a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
@@ -251,6 +252,7 @@ Environment variables only.
 | `MCP_NODE_HOST` | `127.0.0.1` (IP literal) |
 | `MCP_NODE_PORT` | `8341` |
 | `MCP_NODE_TOKEN_FILE` | `./token` |
+| `MCP_NODE_POLICY_FILE` | unset (no argument gating; see [docs/arg-gating.md](docs/arg-gating.md)) |
 | `MCP_NODE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` |
 | `MCP_NODE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` |
 | `MCP_NODE_NAME` | `mcp-node` (serverInfo name) |

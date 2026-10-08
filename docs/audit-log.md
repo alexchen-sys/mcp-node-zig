@@ -63,6 +63,15 @@ and `stop`. `stop` is written on a clean in-process exit (stdio mode on
 stdin EOF); a daemon killed by SIGTERM exits without it — an absent `stop`
 after a restart is normal, not tampering.
 
+With `MCP_NODE_POLICY_FILE` configured (see [argument gating](arg-gating.md)),
+every refusal is a `policy.deny` record: the same call fields as
+`tool.call` (tool, transport, client, session, req_id, args_digest,
+args_summary) plus `reason` (machine-readable deny reason) and `token`
+(16-hex sha256 prefix of the client token — identifies which policy entry
+denied; the token value is never logged). The policy file path and a sha256
+of its bytes enter the config fingerprint, so a policy edit shows up in the
+next `start` record.
+
 Argument summaries are an allowlist, per tool:
 
 | Tool | Logged |

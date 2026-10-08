@@ -12,6 +12,7 @@ const config = @import("config.zig");
 const rpc_mod = @import("rpc.zig");
 const hub_mod = @import("hub.zig");
 const audit = @import("audit.zig");
+const policy_mod = @import("policy.zig");
 
 const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
@@ -233,6 +234,31 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Map a presented-token hash to its policy entry (timing-safe compare of
+/// each entry's stored hash). Null when no policy is configured or the
+/// hash matches no entry (which, for an accepted request, cannot happen:
+/// the classic-token gate already passed and config guarantees coverage).
+fn policyForToken(cfg: *const config.Config, presented_hash: [32]u8) ?*const policy_mod.TokenPolicy {
+    const p = cfg.policy orelse return null;
+    const ps: *const policy_mod.PolicySet = @ptrCast(@alignCast(p));
+    for (ps.entries) |*e| {
+        if (std.crypto.timing_safe.eql([32]u8, presented_hash, e.token_hash)) return e;
+    }
+    return null;
+}
+
+/// First 8 bytes of the token hash as 16 lowercase hex chars: identifies a
+/// policy entry in the audit log without ever logging the token value.
+fn tokenFp(hash: [32]u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    const alphabet = "0123456789abcdef";
+    for (hash[0..8], 0..) |b, i| {
+        out[i * 2] = alphabet[b >> 4];
+        out[i * 2 + 1] = alphabet[b & 0x0f];
+    }
+    return out;
+}
+
 pub fn connectionCloseRequested(connection: ?[]const u8) bool {
     const raw = connection orelse return false;
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -343,6 +369,10 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
+    // The policy entry matched for this request's token (set by the auth
+    // phase below; null when no policy is configured or no token is
+    // required). Lives to the end of the request and reaches rpc via CallCtx.
+    var request_policy: ?*const policy_mod.TokenPolicy = null;
 
     const fd = stream.socket.handle;
     const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
@@ -442,6 +472,13 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
             try sendHttpError(ra, fd, 401, "unauthorized", "missing or invalid X-Node-Token header", timeout_ms);
             return false;
         }
+        // Argument gating: with a policy configured the classic token is
+        // always one of the entries (config enforces it at startup), so a
+        // second timing-safe scan maps THIS request to its policy. A miss
+        // cannot happen for the covered classic token; the scan exists for
+        // multi-token deployments where the presented value is a different
+        // entry. No policy -> null -> v0.3.1 behaviour everywhere below.
+        request_policy = policyForToken(cfg, got_hash);
     }
     const route = routeFor(cfg.mode, info.path) orelse {
         try sendHttpError(ra, fd, 404, "not_found", "not found", timeout_ms);
@@ -532,6 +569,8 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
         .transport = .http,
         .client = client,
         .session = audit.sessionHashHex(info.mcp_session_id, &sess_buf),
+        .policy = request_policy,
+        .token_fp = if (request_policy) |p| tokenFp(p.token_hash) else audit.token_fp_default,
     };
     switch (route) {
         .local => {},
