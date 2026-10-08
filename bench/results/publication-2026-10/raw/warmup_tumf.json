@@ -1,0 +1,34 @@
+{
+ "phase": "warmup",
+ "transport": "stdio",
+ "argv": [
+  "uvx",
+  "mcp-shell-server"
+ ],
+ "ok": true,
+ "boot_listen_ms": null,
+ "initialize_handshake_ms": null,
+ "cold_first_response_ms": 1114.194165,
+ "ready_to_serve_ms": 1116.285464,
+ "rtt_initialize_ms": 1114.138815,
+ "rtt_tools_list_ms": 0.997269,
+ "rtt_exec_ms": 0.98358,
+ "tools_listed": 1,
+ "exec_ok": false,
+ "server_info": {
+  "name": "mcp-shell-server",
+  "version": "1.30.0"
+ },
+ "harness": {
+  "python": "3.11.16",
+  "phase": "warmup",
+  "tool": "exec",
+  "tool_key": "argv",
+  "tool_argv": [
+   "uname",
+   "-a"
+  ],
+  "series": "mcp_probe",
+  "participant": "unknown"
+ }
+}

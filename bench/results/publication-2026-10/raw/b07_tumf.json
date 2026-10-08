@@ -1,0 +1,17 @@
+{
+ "mode": "one process per agent (two instances side by side)",
+ "transport": "stdio",
+ "argv": [
+  "uvx",
+  "mcp-shell-server"
+ ],
+ "server_info": {
+  "name": "mcp-shell-server",
+  "version": "1.30.0"
+ },
+ "instance_a_rss_kib": 98528,
+ "instance_b_rss_kib": 97940,
+ "second_agent_cost_kib": 97940,
+ "two_agents_total_kib": 196468,
+ "phase": "per_connection"
+}

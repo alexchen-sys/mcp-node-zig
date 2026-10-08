@@ -1,0 +1,120 @@
+{
+ "phase": "rss_idle",
+ "transport": "stdio",
+ "argv": [
+  "uvx",
+  "mcp-shell-server"
+ ],
+ "settle_s": 2.0,
+ "samples": 20,
+ "interval_s": 0.5,
+ "server_info": {
+  "name": "mcp-shell-server",
+  "version": "1.30.0"
+ },
+ "process_tree_start": {
+  "rss_kib": 114524,
+  "pss_kib": 111143,
+  "pids": [
+   955395,
+   955415
+  ],
+  "breakdown": {
+   "955395": {
+    "name": "uv",
+    "rss_kib": 56156
+   },
+   "955415": {
+    "name": "python",
+    "rss_kib": 58368
+   }
+  },
+  "names": [
+   "uv",
+   "python"
+  ]
+ },
+ "process_tree_end": {
+  "rss_kib": 105012,
+  "pss_kib": 99603,
+  "pids": [
+   955395,
+   955415
+  ],
+  "breakdown": {
+   "955395": {
+    "name": "uv",
+    "rss_kib": 46644
+   },
+   "955415": {
+    "name": "python",
+    "rss_kib": 58368
+   }
+  },
+  "names": [
+   "uv",
+   "python"
+  ]
+ },
+ "memory": {
+  "samples_taken": 20,
+  "rss_kib": {
+   "median": 114524,
+   "max": 114524,
+   "series": [
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    114524,
+    105012,
+    105012,
+    105012,
+    105012,
+    105012
+   ]
+  },
+  "pss_kib": {
+   "median": 111143,
+   "max": 111143,
+   "series": [
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    111143,
+    99603,
+    99603,
+    99603,
+    99603,
+    99603
+   ]
+  }
+ },
+ "summary": {
+  "rss_mib_median": 111.84,
+  "rss_mib_max": 111.84,
+  "pss_mib_median": 108.54,
+  "pss_mib_max": 108.54
+ }
+}

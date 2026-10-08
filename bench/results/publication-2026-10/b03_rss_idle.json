@@ -1,0 +1,67 @@
+{
+ "metric": "b03_rss_idle",
+ "label": "idle RSS after initialize (tree sum; median of 20 x 0.5s samples)",
+ "participants": {
+  "ours": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_ours.json",
+   "argv": [
+    "/root/repo/zig-out/bin/mcp-node"
+   ],
+   "transport": "http",
+   "server_info": {
+    "name": "mcp-node",
+    "version": "0.3.1"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": {
+    "rss_mib_median": 2.3,
+    "rss_mib_max": 2.3,
+    "pss_mib_median": 1.87,
+    "pss_mib_max": 1.87
+   }
+  },
+  "tumf": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_tumf.json",
+   "argv": [
+    "uvx",
+    "mcp-shell-server"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-shell-server",
+    "version": "1.30.0"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": {
+    "rss_mib_median": 111.84,
+    "rss_mib_max": 111.84,
+    "pss_mib_median": 108.54,
+    "pss_mib_max": 108.54
+   }
+  },
+  "g0t4": {
+   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_g0t4.json",
+   "argv": [
+    "npx",
+    "-y",
+    "mcp-server-commands"
+   ],
+   "transport": "stdio",
+   "server_info": {
+    "name": "mcp-server-commands",
+    "version": "0.8.2",
+    "description": "Run commands on this linux machine"
+   },
+   "runs": null,
+   "failures": 0,
+   "summary": {
+    "rss_mib_median": 152.6,
+    "rss_mib_max": 152.6,
+    "pss_mib_median": 109.26,
+    "pss_mib_max": 109.26
+   }
+  }
+ }
+}

@@ -1,0 +1,45 @@
+{
+ "phase": "footprint",
+ "ours": {
+  "participant": "mcp-node-zig",
+  "artifact": "/root/repo/zig-out/bin/mcp-node",
+  "build_mode": "ReleaseSafe",
+  "binary_bytes": 11142520,
+  "binary_mib": 10.6,
+  "runtime_bytes": 0,
+  "runtime_mib": 0.0,
+  "notes": "static binary, no runtime to install (Linux: no libc dependency)"
+ },
+ "tumf": {
+  "participant": "tumf/mcp-shell-server",
+  "version": "1.30.0",
+  "channel": "uvx",
+  "venv": "/root/.cache/uv/archive-v0/lu4jL_YcVmLlaALT",
+  "venv_bytes": 29676267,
+  "venv_mib": 28.3,
+  "uv_cache": "/root/.cache/uv",
+  "uv_cache_bytes": 98408686,
+  "uv_cache_mib": 93.8,
+  "interpreter": "/usr/local/bin/python3.11",
+  "interpreter_install": null,
+  "runtime_bytes": 18208,
+  "runtime_mib": 0.0,
+  "runtime_kind": "Python interpreter uvx resolved for the venv",
+  "notes": "venv is the per-package environment uvx materializes under its cache; uv cache holds the wheels; the interpreter is uv-managed CPython when no system one matches"
+ },
+ "g0t4": {
+  "participant": "g0t4/mcp-server-commands",
+  "version": "0.8.2",
+  "channel": "npx",
+  "package_env": "/root/.npm/_npx/d597531c0c0615ae/node_modules",
+  "package_env_bytes": 10685217,
+  "package_env_mib": 10.2,
+  "node_exe": "/opt/node/bin/node",
+  "node_exe_bytes": 117383456,
+  "node_stdlib_bytes": null,
+  "runtime_bytes": 117383456,
+  "runtime_mib": 111.9,
+  "runtime_kind": "Node.js (system package: node binary + bundled npm modules)",
+  "notes": "package env is the npx cache dir for this package; runtime is the system Node.js install"
+ }
+}

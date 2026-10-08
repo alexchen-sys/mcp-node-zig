@@ -1,0 +1,134 @@
+{
+ "phase": "rss_idle",
+ "transport": "stdio",
+ "argv": [
+  "npx",
+  "-y",
+  "mcp-server-commands"
+ ],
+ "settle_s": 2.0,
+ "samples": 20,
+ "interval_s": 0.5,
+ "server_info": {
+  "name": "mcp-server-commands",
+  "version": "0.8.2",
+  "description": "Run commands on this linux machine"
+ },
+ "process_tree_start": {
+  "rss_kib": 156264,
+  "pss_kib": 111887,
+  "pids": [
+   955428,
+   955440,
+   955441
+  ],
+  "breakdown": {
+   "955428": {
+    "name": "npm exec mcp-se",
+    "rss_kib": 98612
+   },
+   "955440": {
+    "name": "sh",
+    "rss_kib": 1536
+   },
+   "955441": {
+    "name": "node",
+    "rss_kib": 56116
+   }
+  },
+  "names": [
+   "npm exec mcp-se",
+   "sh",
+   "node"
+  ]
+ },
+ "process_tree_end": {
+  "rss_kib": 135644,
+  "pss_kib": 90331,
+  "pids": [
+   955428,
+   955440,
+   955441
+  ],
+  "breakdown": {
+   "955428": {
+    "name": "npm exec mcp-se",
+    "rss_kib": 78928
+   },
+   "955440": {
+    "name": "sh",
+    "rss_kib": 1536
+   },
+   "955441": {
+    "name": "node",
+    "rss_kib": 55180
+   }
+  },
+  "names": [
+   "npm exec mcp-se",
+   "sh",
+   "node"
+  ]
+ },
+ "memory": {
+  "samples_taken": 20,
+  "rss_kib": {
+   "median": 156264,
+   "max": 156264,
+   "series": [
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    156264,
+    137628,
+    136636,
+    135644,
+    135644,
+    135644,
+    135644,
+    135644,
+    135644
+   ]
+  },
+  "pss_kib": {
+   "median": 111887,
+   "max": 111887,
+   "series": [
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    111887,
+    93051,
+    91323,
+    90331,
+    90331,
+    90331,
+    90331,
+    90331,
+    90331
+   ]
+  }
+ },
+ "summary": {
+  "rss_mib_median": 152.6,
+  "rss_mib_max": 152.6,
+  "pss_mib_median": 109.26,
+  "pss_mib_max": 109.26
+ }
+}
