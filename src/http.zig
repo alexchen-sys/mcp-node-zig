@@ -12,6 +12,7 @@ const config = @import("config.zig");
 const rpc_mod = @import("rpc.zig");
 const hub_mod = @import("hub.zig");
 const audit = @import("audit.zig");
+const policy_mod = @import("policy.zig");
 
 const MAX_HEADER_BYTES: usize = 64 * 1024; // 431 territory; headers only
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // request body cap; 413 territory
@@ -233,6 +234,28 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Map a presented-token hash to its policy entry (timing-safe compare of
+/// each entry's stored hash). Null when the hash matches no entry — the
+/// caller turns that into the standard 401.
+fn policyLookup(ps: *const policy_mod.PolicySet, presented_hash: [32]u8) ?*const policy_mod.TokenPolicy {
+    for (ps.entries) |*e| {
+        if (std.crypto.timing_safe.eql([32]u8, presented_hash, e.token_hash)) return e;
+    }
+    return null;
+}
+
+/// First 8 bytes of the token hash as 16 lowercase hex chars: identifies a
+/// policy entry in the audit log without ever logging the token value.
+fn tokenFp(hash: [32]u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    const alphabet = "0123456789abcdef";
+    for (hash[0..8], 0..) |b, i| {
+        out[i * 2] = alphabet[b >> 4];
+        out[i * 2 + 1] = alphabet[b & 0x0f];
+    }
+    return out;
+}
+
 pub fn connectionCloseRequested(connection: ?[]const u8) bool {
     const raw = connection orelse return false;
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -343,6 +366,10 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
     var req_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer req_arena_state.deinit();
     const ra = req_arena_state.allocator();
+    // The policy entry matched for this request's token (set by the auth
+    // phase below; null when no policy is configured or no token is
+    // required). Lives to the end of the request and reaches rpc via CallCtx.
+    var request_policy: ?*const policy_mod.TokenPolicy = null;
 
     const fd = stream.socket.handle;
     const timeout_ms = @as(u64, cfg.socket_timeout_s) * 1000;
@@ -428,19 +455,39 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
             return false;
         }
     }
+    // Defence in depth (config already refuses a policy with an empty
+    // classic token): a policy with no client token would mean unauthenticated
+    // AND ungated calls; fail closed here rather than trust the invariant.
+    if (cfg.policy != null and cfg.token.len == 0) {
+        try sendHttpError(ra, fd, 500, "server_misconfigured", "token required when a policy is active", timeout_ms);
+        return false;
+    }
     if (cfg.token.len != 0) {
         // Conflicting credentials count as a failed login, not as a choice.
         const presented = presentedToken(info) catch null;
         const got = presented orelse "";
         var got_hash: [32]u8 = undefined;
-        var cfg_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(got, &got_hash, .{});
-        std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
-        if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
-            // Same body for a missing and for a wrong token: the message must
-            // not leak which of the two it was (constant-time semantics).
-            try sendHttpError(ra, fd, 401, "unauthorized", "missing or invalid X-Node-Token header", timeout_ms);
-            return false;
+        if (cfg.policy) |p| {
+            // Argument gating: the token set is the policy entries (the
+            // classic token is always one of them — config enforces it at
+            // startup). Timing-safe scan across every entry; the matched
+            // entry becomes this request's policy. A miss is the same 401
+            // as a wrong classic token.
+            const ps: *const policy_mod.PolicySet = @ptrCast(@alignCast(p));
+            request_policy = policyLookup(ps, got_hash) orelse {
+                try sendHttpError(ra, fd, 401, "unauthorized", "missing or invalid X-Node-Token header", timeout_ms);
+                return false;
+            };
+        } else {
+            var cfg_hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(cfg.token, &cfg_hash, .{});
+            if (!std.crypto.timing_safe.eql([32]u8, got_hash, cfg_hash)) {
+                // Same body for a missing and for a wrong token: the message must
+                // not leak which of the two it was (constant-time semantics).
+                try sendHttpError(ra, fd, 401, "unauthorized", "missing or invalid X-Node-Token header", timeout_ms);
+                return false;
+            }
         }
     }
     const route = routeFor(cfg.mode, info.path) orelse {
@@ -532,6 +579,8 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
         .transport = .http,
         .client = client,
         .session = audit.sessionHashHex(info.mcp_session_id, &sess_buf),
+        .policy = request_policy,
+        .token_fp = if (request_policy) |p| tokenFp(p.token_hash) else audit.token_fp_default,
     };
     switch (route) {
         .local => {},

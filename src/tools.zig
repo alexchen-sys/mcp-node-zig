@@ -17,6 +17,7 @@ const util = @import("util.zig");
 const session_mod = @import("session.zig");
 const config = @import("config.zig");
 const env_state = @import("env_state.zig");
+const policy = @import("policy.zig");
 
 const LIST_DIR_MAX_ENTRIES: usize = 2000;
 const WAIT_POLL_MS: u64 = 50; // exec_wait sleep tick
@@ -222,7 +223,12 @@ fn sessionFromArgs(cfg: *const config.Config, args: Value) !*session_mod.Session
     const store = cfg.sessions orelse return error.SessionsDisabled;
     const id_i = (try util.optIntArg(args, "session_id")) orelse return error.MissingSession;
     if (id_i <= 0) return error.BadSession;
-    return store.get(@as(u64, @intCast(id_i))) orelse error.UnknownSession;
+    const session = store.get(@as(u64, @intCast(id_i))) orelse return error.UnknownSession;
+    // Argument gating: with a policy active, a token may only address
+    // sessions it started (design §6). Zeroes-vs-zeroes passes without a
+    // policy, so v0.3.1 behaviour is unchanged.
+    if (!policy.sessionOwned(session.owner_hash)) return error.SessionNotOwned;
+    return session;
 }
 
 /// Durability contract reply for a session id that is not live on this
@@ -435,6 +441,7 @@ pub fn toolExecStart(arena: Allocator, io: Io, cfg: *const config.Config, args: 
         .stdin_fd = stdin_fd,
         .job = job,
         .started_us = session_mod.nowUs(io),
+        .owner_hash = policy.current_owner,
     };
     argv_owned = true;
     cwd_owned = true;
@@ -528,6 +535,11 @@ pub fn toolExecList(arena: Allocator, io: Io, cfg: *const config.Config, out: *s
     var first = true;
     while (it.next()) |kv| {
         const s = kv.value_ptr.*;
+        // Argument gating: with a policy active a token sees only the
+        // sessions it started. Skip, do not error: the listing stays
+        // useful (it recovers the caller's own ids) without leaking other
+        // tokens' session ids, argv or pids.
+        if (!policy.sessionOwned(s.owner_hash)) continue;
         s.mutex.lockUncancelable(store.io);
         const done = s.done;
         const exit_code = s.exit_code;

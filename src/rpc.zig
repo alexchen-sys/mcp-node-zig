@@ -11,7 +11,7 @@ const util = @import("util.zig");
 const config = @import("config.zig");
 const tools = @import("tools.zig");
 const audit = @import("audit.zig");
-
+const policy_mod = @import("policy.zig");
 const VERSION: []const u8 = @import("build_options").version;
 
 const RpcResponse = struct {
@@ -174,6 +174,28 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value
     id_buf.reset();
     audit.renderReqId(&id_buf, id);
     ctx2.req_id = if (id_buf.overflow) "null" else id_buf.slice();
+
+    // Argument gating: the single enforcement point, before dispatch (a
+    // denied call never reaches a tool, so it never spawns or opens) and
+    // before the long-tool tool.start trace (a denied call never started).
+    // The policy is null on every transport without a client token and when
+    // no policy is configured — v0.3.1 behaviour is untouched in both cases.
+    if (ctx.policy) |pol| {
+        if (policy_mod.checkCall(arena, io, cfg, pol, name_v.string, args)) |deny| {
+            const reason_text = policy_mod.denyText(deny.reason_tag);
+            audit.policyDeny(aw, ctx2, name_v.string, args, deny.reason_tag);
+            var deny_payload: std.ArrayList(u8) = .empty;
+            try deny_payload.appendSlice(arena, "{\"ok\":false,\"error\":\"PolicyDenied\",\"message\":");
+            try util.appendJsonString(&deny_payload, arena, reason_text);
+            try deny_payload.appendSlice(arena, ",\"reason\":");
+            try util.appendJsonString(&deny_payload, arena, deny.reason_tag);
+            try deny_payload.appendSlice(arena, ",\"field\":");
+            try util.appendJsonString(&deny_payload, arena, deny.field);
+            try deny_payload.appendSlice(arena, "}");
+            return .{ .status = 200, .body = try toolEnvelope(arena, cfg, id, deny_payload.items, true) };
+        }
+    }
+
     const long_tool = std.mem.eql(u8, name_v.string, "exec") or
         std.mem.eql(u8, name_v.string, "exec_start") or
         std.mem.eql(u8, name_v.string, "exec_shell");
@@ -181,6 +203,10 @@ fn handleToolCall(arena: Allocator, io: Io, cfg: *const config.Config, id: Value
     const started = Io.Clock.awake.now(io);
 
     var payload: std.ArrayList(u8) = .empty;
+    // Publish the request's owner for the tool layer (session ownership);
+    // balanced on every exit path below.
+    policy_mod.beginRequest(ctx.policy);
+    defer policy_mod.endRequest();
     dispatchTool(arena, io, cfg, name_v.string, args, &payload) catch |err| {
         const dur_ms: u64 = @intCast(@max(0, started.untilNow(io, .awake).toMilliseconds()));
         audit.toolCall(aw, ctx2, name_v.string, args, false, null, @errorName(err), dur_ms, payload.items.len);
@@ -341,6 +367,7 @@ fn errHint(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "InvalidPadding")) return "value is not valid standard base64 (bad length or padding)";
     if (std.mem.eql(u8, name, "InvalidCharacter")) return "value is not valid standard base64 (illegal character)";
     if (std.mem.eql(u8, name, "InvalidLength")) return "value is not valid standard base64 (bad length)";
+    if (std.mem.eql(u8, name, "SessionNotOwned")) return "session belongs to another token (argument gating)";
     return null;
 }
 

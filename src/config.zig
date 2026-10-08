@@ -11,6 +11,7 @@ const util = @import("util.zig");
 const session_mod = @import("session.zig");
 const env_state = @import("env_state.zig");
 const link = @import("link.zig");
+const policy_mod = @import("policy.zig");
 const build_options = @import("build_options");
 
 const TOKEN_FILE_MAX_BYTES: usize = 4096;
@@ -99,6 +100,12 @@ pub const Config = struct {
     /// The token file path, for the audit config fingerprint (the token
     /// itself never enters the fingerprint or the log).
     token_file: []const u8 = "",
+    /// Per-token argument-gating policies (null = v0.3.1 behaviour). Set by
+    /// main when MCP_NODE_POLICY_FILE is set; owned by main, freed after the
+    /// servers stop. Cast to *policy_mod.PolicySet at call sites like
+    /// `audit`/`hub` above (config only stores the pointer to avoid a
+    /// circular type dependency).
+    policy: ?*anyopaque = null,
 };
 
 /// Global budget of in-flight request-body bytes (default 64 MiB via
@@ -402,6 +409,61 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
             return error.InvalidConfig;
         }
         cfg.audit_max_bytes = parsed;
+    }
+    // Per-token argument-gating policy (off when MCP_NODE_POLICY_FILE is
+    // unset: v0.3.1 behaviour). Strict interplay rules, all fail at startup
+    // with the variable named (design §2).
+    if (getEnv(arena, "MCP_NODE_POLICY_FILE")) |pp| {
+        if (pp.len != 0) {
+            if (mode == .node or mode == .stdio) {
+                std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with node/stdio mode: there is no client token to gate\n", .{});
+                return error.InvalidConfig;
+            }
+            if (mode == .hub) {
+                // The relay route (/n/<name>/mcp) forwards the raw body to
+                // connected nodes, where no policy exists: a hub-side policy
+                // would gate only the hub's own tools/call and silently
+                // pass everything else — a false sense of security. Refuse
+                // at startup; run policies on listen nodes instead (review
+                // F5).
+                std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with hub mode: relayed calls run on nodes that have no policy; run the policy on each node's listen listener instead\n", .{});
+                return error.InvalidConfig;
+            }
+            if (std.mem.eql(u8, getEnv(arena, "MCP_NODE_INSECURE") orelse "0", "1")) {
+                std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with MCP_NODE_INSECURE=1\n", .{});
+                return error.InvalidConfig;
+            }
+            if (token.len == 0) {
+                std.debug.print("MCP_NODE_POLICY_FILE requires a client token: the classic MCP_NODE_TOKEN_FILE token must be one of the policy entries\n", .{});
+                return error.InvalidConfig;
+            }
+            const ps = arena.create(policy_mod.PolicySet) catch return error.OutOfMemory;
+            ps.* = policy_mod.loadPolicyFile(arena, io, pp) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.debug.print("MCP_NODE_POLICY_FILE '{s}' is invalid\n", .{pp});
+                return error.InvalidConfig;
+            };
+            // The classic token must be covered by an entry: leaving an
+            // ungated backdoor token next to a policy file is the exact
+            // accident the strict parser exists to prevent. Match on the
+            // token VALUE hash (timing-safe compare against every entry).
+            var classic_hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(token, &classic_hash, .{});
+            var covered = false;
+            for (ps.entries) |e| {
+                if (std.crypto.timing_safe.eql([32]u8, classic_hash, e.token_hash)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                std.debug.print("MCP_NODE_POLICY_FILE: the token from '{s}' matches no policy entry; list its file in a \"tokens\" entry\n", .{token_path});
+                var ps_mut = ps;
+                ps_mut.deinit();
+                return error.InvalidConfig;
+            }
+            cfg.policy = ps;
+        }
     }
     return cfg;
 }

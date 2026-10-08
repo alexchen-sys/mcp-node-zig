@@ -360,6 +360,7 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("hub.zig"));
     std.testing.refAllDecls(@import("stdio.zig"));
     std.testing.refAllDecls(@import("audit.zig"));
+    std.testing.refAllDecls(@import("policy.zig"));
     if (@import("build_options").tls_server)
         std.testing.refAllDecls(@import("tls_server.zig"));
 }

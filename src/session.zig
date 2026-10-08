@@ -30,8 +30,11 @@ pub const Session = struct {
     child: std.process.Child,
     stdin_fd: ?std.posix.fd_t,
     /// Windows: Job Object owning the whole process tree (KILL_ON_JOB_CLOSE).
-    /// void on POSIX. Closed in freeSession.
     job: proc.JobField = proc.no_job,
+    /// Argument gating: sha256 of the client token that started this
+    /// session (zeroes when no policy is active). The session-control tools
+    /// compare it against the calling request's owner; see policy.zig.
+    owner_hash: [32]u8 = [_]u8{0} ** 32,
     stdin_mutex: std.Io.Mutex = .init,
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
