@@ -198,6 +198,32 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 
 仅支持 stdio 的客户端：`npx mcp-remote http://127.0.0.1:8341/mcp --header "Authorization: Bearer <token>"`
 
+## 按令牌的权限
+
+`MCP_NODE_POLICY_FILE` 把单一共享 token 变成一组 token，每个 token 有自己的工具列表和参数边界：
+
+```json
+{
+  "version": 1,
+  "tokens": [
+    {
+      "file": "/etc/mcp-node/tokens/build",
+      "tools": ["sys_info", "exec", "read_file", "list_dir"],
+      "exec_argv0": ["/usr/bin/git", "/usr/bin/make"],
+      "exec_cwd": ["/srv/build"],
+      "max_timeout_s": 120,
+      "read_paths": ["/srv/build"],
+      "read_deny": ["/srv/build/keys"]
+    },
+    {"file": "/etc/mcp-node/tokens/admin", "allow_all": true}
+  ]
+}
+```
+
+节点在执行前检查每次调用：被拒绝的 `exec` 不会启动，被拒绝的写入不会打开文件。策略可以限制 argv[0]、`cwd`、读写路径、超时上限和新建文件的权限模式。路径先规范化（符号链接、`..`），再按完整路径段匹配。会话归启动它的 token 所有。拒绝结果为 `{"ok": false, "error": "PolicyDenied", "reason": ...}`，并以 `policy.deny` 事件写入审计日志。token 的值不会进入策略文件或日志。
+
+不设置该变量时，节点行为与之前完全相同。解析是严格的：未知键或互相矛盾的配置会让启动失败。枢纽设置了策略文件会拒绝启动，因为 `/n/<name>/mcp` 路由把请求体原样转发给节点；请在每个节点上配置策略。允许一个解释器（`python3`、`bash`）仍然等于允许任意代码。细节与限制见 [docs/arg-gating.md](docs/arg-gating.md)。
+
 ## 安全
 
 - **必须提供 token。** token 文件缺失或为空时，服务器拒绝启动。比较采用常数时间。
@@ -205,6 +231,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 - **先校验 Host 和 Origin**，再解析请求体：未知 Host 返回 421，未知 Origin 返回 403。
 - **链路走 TLS。** 节点链路使用 TLS，可由 `-Dtls-server` 构建的枢纽直接提供，也可由任意终结器提供。本地 HTTP API 只监听回环地址；如需对外暴露，请放在反向代理、隧道或 VPN 后面，例如 `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`。
 - **拿到 token 就等于拿到节点运行用户的 shell。** 请用权限只覆盖智能体所需范围的账户来运行它。
+- **按令牌的权限（可选）。** `MCP_NODE_POLICY_FILE` 为每个 token 设置工具列表和参数边界，见[按令牌的权限](#按令牌的权限)。
 
 ## 安全模型
 
@@ -214,7 +241,8 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 - **握手只做认证，不保护链路。** 双方用基于新鲜 nonce 的 HMAC-SHA256 证明密钥，但之后的帧在明文 TCP 上既不加密也没有完整性保护。
 - **跨越不受你控制的网络时使用 TLS。** `MCP_NODE_CONNECT_TLS=1` 让节点始终校验证书链和服务器名，无法关闭校验。明文 TCP 只用于同一主机或可信局域网。
 - **握手限制按来源地址计算。** 枢纽总共最多进行 16 个未认证的握手，来自同一 IPv4 地址或 IPv6 /64 的最多 4 个；同一来源一分钟内失败 8 次握手会被拒绝一分钟。127.0.0.1 和 ::1 不受此限制，所以在本机 TLS 终结器后面所有节点看起来来自同一地址：请在终结器上设置按 IP 的限制（nginx `limit_conn`），并尽量用防火墙把公网端口限制到已知来源。使用内置 TLS 服务器时枢纽能看到真实的对端地址，上述限制完全生效。
-- **不在范围内：** 按工具或路径的权限、沙箱，以及已被攻破的枢纽或节点主机。（审计日志可检测记录篡改，但无法防御控制主机的攻击者。）
+- **权限是可选的，不是沙箱。** 未设置 `MCP_NODE_POLICY_FILE` 时，任何 token 都能调用所有工具；设置后，每个 token 只能使用自己的工具和参数范围。允许的解释器仍然等于任意代码。
+- **不在范围内：** 沙箱，以及已被攻破的枢纽或节点主机。（审计日志可检测记录篡改，但无法防御控制主机的攻击者。）
 
 ## 配置
 
@@ -225,6 +253,7 @@ Claude Desktop 和其他使用 JSON 配置的客户端：与 Cursor 相同，另
 | `MCP_NODE_HOST` | `127.0.0.1`（IP 字面量） |
 | `MCP_NODE_PORT` | `8341` |
 | `MCP_NODE_TOKEN_FILE` | `./token` |
+| `MCP_NODE_POLICY_FILE` | 未设置；在此路径启用[按令牌的权限](docs/arg-gating.md) |
 | `MCP_NODE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` |
 | `MCP_NODE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` |
 | `MCP_NODE_NAME` | `mcp-node`（serverInfo 名称） |
@@ -275,9 +304,9 @@ mcp-node audit-verify --anchor /var/log/mcp-node.jsonl
 
 ## 路线图
 
-已发布：带双向 HMAC 握手的反向连接、节点链路 TLS（全平台）、按来源的握手限制、防篡改审计日志、带构建溯源的 cosign 签名发布。
+已发布：带双向 HMAC 握手的反向连接、节点链路 TLS（全平台）、按来源的握手限制、防篡改审计日志、按 token 的工具与参数权限、在链路断开和枢纽重启后仍存活的 exec 会话、带构建溯源的 cosign 签名发布。
 
-下一步：按工具的权限、在节点重启后仍存活的会话，以及支持交互式 TUI 的 PTY。API 版本为 `0.x`，1.0 之前仍可能变动。
+下一步：在节点重启后仍存活的会话、用节点密钥对取代共享密钥，以及支持交互式 TUI 的 PTY。API 版本为 `0.x`，1.0 之前仍可能变动。
 
 ## 从源码构建
 
@@ -294,4 +323,4 @@ zig build -Doptimize=ReleaseSafe   # → zig-out/bin/mcp-node
 
 ## 许可证
 
-MIT
+MIT。节点、枢纽、按令牌的权限和审计日志永远保持 MIT；如果将来出现付费产品，那会是托管的控制平面，而不是从这个二进制文件里拿走的功能。
