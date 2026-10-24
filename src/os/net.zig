@@ -294,9 +294,10 @@ pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.
 /// Set a listen socket non-blocking (POSIX): the hub accept loop polls
 /// before accepting, and a non-blocking listen fd turns the poll-to-accept
 /// race (a reset drained the pending queue) into EAGAIN instead of a
-/// parked thread. Accepted sockets do NOT inherit the flag, so link reads
-/// keep their blocking+timeout semantics. POSIX-only: the Windows accept
-/// path keeps the blocking std call and the self-connect wake.
+/// parked thread. Linux accepted sockets do not inherit O_NONBLOCK; Darwin
+/// clears the inherited flag in acceptNonBlocking before returning them.
+/// POSIX-only: the Windows accept path keeps the blocking std call and the
+/// self-connect wake.
 pub fn setListenNonBlocking(handle: Handle) SetTimeoutError!void {
     if (comptime builtin.os.tag == .windows) {
         var one: c_ulong = 1;
@@ -417,6 +418,20 @@ pub fn acceptNonBlocking(listen_fd: Handle) ?std.Io.net.Stream {
         while (true) {
             const fd = std.c.accept(listen_fd, &storage.any, &len);
             if (fd != -1) {
+                // Darwin accept() inherits O_NONBLOCK from the listener, unlike
+                // Linux. Blocking reads with per-operation deadlines are the
+                // link/TLS contract; close an unfixable socket like any other
+                // failed accept instead of exposing EAGAIN to those layers.
+                const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+                if (flags == -1) {
+                    _ = std.c.close(fd);
+                    return null;
+                }
+                const nonblock: c_int = 1 << @bitOffsetOf(std.c.O, "NONBLOCK");
+                if (flags & nonblock != 0 and std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, flags & ~nonblock)) != 0) {
+                    _ = std.c.close(fd);
+                    return null;
+                }
                 // Accepted sockets on Darwin do not inherit CLOEXEC.
                 _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
                 return .{ .socket = .{

@@ -3241,7 +3241,7 @@ test "exec swap race after the gate is refused by the pin" {
 }
 
 test "pinned exec runs the original object after a post-pin rename" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3277,7 +3277,7 @@ test "pinned exec runs the original object after a post-pin rename" {
 }
 
 test "pinned spawn exec failure reaps the child and answers the error" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest; // CI runs unit tests on Linux only
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

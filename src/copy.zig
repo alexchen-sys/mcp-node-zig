@@ -460,5 +460,7 @@ pub fn tool(a: Allocator, io: Io, cfg: *const @import("config.zig").Config, args
 }
 
 test {
-    _ = @import("copy_test.zig");
+    if (comptime builtin.os.tag != .windows) {
+        _ = @import("copy_test.zig");
+    }
 }

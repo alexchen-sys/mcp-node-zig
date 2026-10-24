@@ -1505,6 +1505,7 @@ test "hub probe deadline follows the awake clock" {
 }
 
 test "hub probe budget covers the PING write" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: Fixture = undefined;
     try fx.init(.{ .single = "s3cret" });
     defer fx.deinit();

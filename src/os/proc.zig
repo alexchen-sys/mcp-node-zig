@@ -1731,13 +1731,13 @@ pub fn spawnPidRegistryLen(io: Io) usize {
 /// comm field in parens — possibly with spaces — so parsing starts after
 /// the LAST ')' exactly like procps does) describes a zombie whose parent
 /// is `parent_pid`. Pure function, unit-tested separately.
-fn statIsZombieChild(stat: []const u8, parent_pid: std.posix.pid_t) bool {
+fn statIsZombieChild(stat: []const u8, parent_pid: i32) bool {
     const close_paren = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return false;
     var it = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
     const state = it.next() orelse return false;
     if (state.len == 0 or state[0] != 'Z') return false;
     const ppid_text = it.next() orelse return false;
-    const ppid = std.fmt.parseInt(std.posix.pid_t, ppid_text, 10) catch return false;
+    const ppid = std.fmt.parseInt(i32, ppid_text, 10) catch return false;
     return ppid == parent_pid;
 }
 

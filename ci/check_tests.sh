@@ -9,7 +9,7 @@ ZIG_BIN="${ZIG:-zig}"
 "$ZIG_BIN" build test
 
 # --- test count floor ------------------------------------------------------
-MIN_TESTS=406
+MIN_TESTS=407
 TEST_COUNT=$(grep -rho '^test "[^"]*"' src/ | sort -u | wc -l | tr -d ' ')
 if [ "$TEST_COUNT" -lt "$MIN_TESTS" ]; then
     echo "check_tests: test block count $TEST_COUNT is below floor $MIN_TESTS" >&2

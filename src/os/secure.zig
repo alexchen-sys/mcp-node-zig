@@ -107,6 +107,7 @@ pub const OpenError = std.posix.OpenError || error{
     PathDenied,
     PrefixSwapped,
     NotRegularFile,
+    UnsupportedPlatform,
 };
 
 /// Host path grammar for this module's matchers (kept local so this module
@@ -1372,8 +1373,9 @@ pub fn resolvePinnedArgv0Windows(
 // fchdir()s into and an executable fd the child execveat()s /
 // fexecve()s, both opened with the same confinement + readback contract
 // as the file-tool pins above.
-// Referenced only from POSIX-gated call sites (tools.zig/proc.zig), so
-// Windows builds never analyze these bodies.
+// Production callers use these primitives only on POSIX. Windows returns
+// UnsupportedPlatform before the Darwin arm; unit-test discovery may still
+// reference the public declarations on every target.
 // ---------------------------------------------------------------------------
 
 /// Pin the authorized child cwd: O_DIRECTORY|O_NOFOLLOW confined against
@@ -1404,6 +1406,7 @@ pub fn openPinnedDir(io: Io, canon: []const u8) OpenError!fd_t {
         if (!std.mem.eql(u8, buf[0..n], canon)) return error.PrefixSwapped;
         return fd;
     }
+    if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
     // Darwin: no O_PATH; a plain O_DIRECTORY|O_NOFOLLOW open plus the
     // F_GETPATH readback pins the same object (an execute-only cwd fails
     // EACCES here — documented boundary, CI never executes this path).
@@ -1461,6 +1464,7 @@ pub fn openPinnedExe(io: Io, canon: []const u8) OpenError!fd_t {
         if (!std.mem.eql(u8, buf[0..n], canon)) return error.PathEscape;
         return fd;
     }
+    if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
     // Darwin: O_RDONLY (fexecve ultimately execve()s the /dev/fd path, which
     // needs read access anyway). CLOEXEC here too: the pinned child
     // clears it before its execve so the interpreter can re-open the
@@ -1521,6 +1525,7 @@ pub fn openPathCandidate(io: Io, path: []const u8) OpenError!fd_t {
             0,
         );
     }
+    if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
     // Darwin PATH-candidate arm: NONBLOCK on the open — a FIFO planted
     // under a PATH entry after the pathname probe would otherwise park
     // this thread in open(2) — then S_ISREG on the OPEN
@@ -1545,7 +1550,7 @@ pub fn openPathCandidate(io: Io, path: []const u8) OpenError!fd_t {
 const testing = std.testing;
 
 test "secure: swapped prefix (symlink ancestor) is refused" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -1596,7 +1601,7 @@ test "secure: swapped prefix (symlink ancestor) is refused" {
 }
 
 test "secure: symlink escaping the allow tree is refused (EXDEV)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -1634,7 +1639,7 @@ test "secure: symlink escaping the allow tree is refused (EXDEV)" {
 }
 
 test "secure: symlink into a denied subtree is refused by the post-check" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -1667,7 +1672,7 @@ test "secure: symlink into a denied subtree is refused by the post-check" {
 }
 
 test "secure: legal reads, writes, mkdirs and listing work" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -2166,7 +2171,7 @@ fn fdHasCloexecLinux(fd: fd_t) bool {
 }
 
 test "secure: fifo target is refused promptly instead of hanging" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -2213,7 +2218,7 @@ test "secure: fifo target is refused promptly instead of hanging" {
 }
 
 test "secure: exe pin fds are cloexec in the parent" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
@@ -2245,7 +2250,7 @@ test "secure: exe pin fds are cloexec in the parent" {
 }
 
 test "secure: in-tree dangling symlink write refuses before creating" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = Io.Threaded.global_single_threaded.io();
