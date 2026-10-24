@@ -4,7 +4,7 @@
 //! failure and `fetch` itself never fails. All OSes emit the same JSON
 //! fields, filled from their native sources (loadavg_raw/uptime_raw stay
 //! empty where the OS has no analog). disk_root mirrors the python
-//! lapnode field of the same name (total/used/free bytes of the root
+//! reference implementation field of the same name (total/used/free bytes of the root
 //! filesystem).
 
 const std = @import("std");
@@ -24,7 +24,7 @@ pub const os_name: []const u8 = switch (builtin.os.tag) {
 pub const machine: []const u8 = @tagName(builtin.cpu.arch);
 
 /// Root-filesystem usage in bytes, field names mirroring the python
-/// lapnode reference (`shutil.disk_usage("/")` semantics): `total`,
+/// python reference implementation (`shutil.disk_usage("/")` semantics): `total`,
 /// `used` (total minus free-to-root; includes root-reserved blocks on
 /// POSIX), `free` (available to unprivileged users). All fields degrade
 /// independently of the rest of SysInfo to 0 when the stat call fails.
@@ -275,7 +275,11 @@ fn darwinMeminfo(info: *SysInfo) void {
     if (std.c.sysctlbyname("hw.pagesize", &pagesize, &size, null, 0) != 0 or pagesize == 0) return;
     var stats: VmStatistics64 = undefined;
     var count: c_uint = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(std.c.mach_host_self(), HOST_VM_INFO64, &stats, &count) != 0) return;
+    // mach_host_self() allocates a Mach send-right on every call; hand it
+    // back to the kernel instead of leaking one right per poll.
+    const host = std.c.mach_host_self();
+    defer _ = std.c.mach_port_deallocate(std.c.mach_task_self(), host);
+    if (host_statistics64(host, HOST_VM_INFO64, &stats, &count) != 0) return;
     // No official "available" counter on Darwin; free + inactive is the
     // standard approximation (inactive pages are reclaimable on pressure).
     info.mem_available = (@as(u64, stats.free_count) + stats.inactive_count) * pagesize;

@@ -13,6 +13,44 @@ const Io = std.Io;
 
 const posix_impl = @import("posix.zig");
 
+/// fstat the freshly opened descriptor and refuse anything but a regular
+/// file. A FIFO created by a local writer would park the calling thread
+/// forever in open(2)/read(2); directories keep the legacy IsDir
+/// taxonomy; every other kind answers
+/// NotRegularFile.
+fn fdRequireRegular(io: Io, fd: std.posix.fd_t) error{ IsDir, NotRegularFile, Unexpected }!void {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const st = file.stat(io) catch return error.Unexpected; // unverifiable: fail closed
+    return switch (st.kind) {
+        .file => {},
+        .directory => error.IsDir,
+        else => error.NotRegularFile,
+    };
+}
+
+/// Drop O_NONBLOCK (set for the open so a FIFO target cannot park the
+/// thread) before the blocking read/write loop. Regular files ignore the
+/// flag entirely.
+fn fdClearNonblock(fd: std.posix.fd_t) error{Unexpected}!void {
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.fcntl(fd, std.posix.F.GETFL, 0);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        const nonblock: usize = @as(u32, @bitCast(std.os.linux.O{ .NONBLOCK = true }));
+        if (rc & nonblock == 0) return; // already blocking
+        const rc2 = std.os.linux.fcntl(fd, std.posix.F.SETFL, rc & ~nonblock);
+        if (std.os.linux.errno(rc2) != .SUCCESS) return error.Unexpected;
+        return;
+    }
+    // Darwin (libc): the same F_GETFL/F_SETFL pair (variadic: the literal
+    // command argument needs a fixed-size type).
+    const fl = std.c.fcntl(@intCast(fd), std.posix.F.GETFL, @as(c_int, 0));
+    if (fl == -1) return error.Unexpected;
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    if (fl & nonblock == 0) return;
+    const rc2 = std.c.fcntl(@intCast(fd), std.posix.F.SETFL, fl & ~nonblock);
+    if (rc2 == -1) return error.Unexpected;
+}
+
 /// Read an entire file into `arena`, failing with `error.StreamTooLong`
 /// once the content exceeds `limit` bytes.
 ///
@@ -26,9 +64,36 @@ const posix_impl = @import("posix.zig");
 /// `Io.Dir.openFileAbsolute` calls (minus its absolute-path assert), and
 /// handles absolute paths correctly on POSIX and Windows alike, so both
 /// path shapes keep working.
+///
+/// Non-regular targets (FIFO, socket, device) are
+/// refused with `error.NotRegularFile` before the read loop instead of
+/// parking the calling thread forever; a directory still answers IsDir.
 pub fn readFileAlloc(arena: Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
+    if (comptime builtin.os.tag == .windows) {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        // Windows: only disk files reach the read loop — a named-pipe
+        // target answers NotRegularFile.
+        if (!windowsHandleIsDiskFile(file.handle)) return error.NotRegularFile;
+        return readFdLoop(arena, io, file.handle, limit);
+    }
+    // POSIX: O_NONBLOCK keeps a FIFO from parking this thread inside
+    // open(2); the fstat check refuses non-regular targets and the flag
+    // is dropped before the blocking read loop.
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    }, 0);
+    defer posix_impl.closeFd(fd);
+    try fdRequireRegular(io, fd);
+    try fdClearNonblock(fd);
+    return readFdLoop(arena, io, fd, limit);
+}
+
+/// The EOF-delimited read loop shared by both arms of readFileAlloc.
+fn readFdLoop(arena: Allocator, io: Io, fd: std.posix.fd_t, limit: usize) ![]u8 {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     var out: std.ArrayList(u8) = .empty;
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
@@ -60,7 +125,7 @@ pub fn writeFile(io: Io, path: []const u8, data: []const u8, mode: std.posix.mod
     if (comptime builtin.os.tag == .windows) {
         return writeFileWindows(io, path, data);
     }
-    return writeFilePosix(path, data, mode);
+    return writeFilePosix(io, path, data, mode);
 }
 
 /// Windows: NTFS has no POSIX permission bits; the created file inherits the
@@ -73,19 +138,36 @@ pub fn writeFile(io: Io, path: []const u8, data: []const u8, mode: std.posix.mod
 fn writeFileWindows(io: Io, path: []const u8, data: []const u8) !void {
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
+    // Windows: only disk files reach the write loop —
+    // a named-pipe target answers NotRegularFile.
+    if (!windowsHandleIsDiskFile(file.handle)) return error.NotRegularFile;
     try file.writeStreamingAll(io, data);
 }
 
 /// POSIX (Linux, macOS): openat(2) applies `mode` exactly, subject to the
 /// process umask.
-fn writeFilePosix(path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
-    const file_fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+fn writeFilePosix(io: Io, path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
+    // O_NONBLOCK keeps a FIFO target from parking this
+    // thread inside open(2); the fstat check refuses non-regular targets
+    // and the flag is dropped before the write loop (regular files ignore
+    // O_NONBLOCK, and O_TRUNC applied to them at open exactly as before).
+    const file_fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
         .TRUNC = true,
         .CLOEXEC = true,
-    }, mode);
+        .NONBLOCK = true,
+    }, mode) catch |err| switch (err) {
+        // ENXIO from O_WRONLY|O_NONBLOCK: the target exists but is a FIFO
+        // with no reader — by definition not a regular file. The refusal
+        // is prompt either way (that is the DoS fix); this keeps the
+        // taxonomy uniform with the fstat path.
+        error.NoDevice => return error.NotRegularFile,
+        else => return err,
+    };
     defer posix_impl.closeFd(file_fd);
+    try fdRequireRegular(io, file_fd);
+    try fdClearNonblock(file_fd);
     try posix_impl.writeAllFd(file_fd, data);
 }
 
@@ -111,6 +193,9 @@ pub const AppendLog = struct {
 pub fn appendOpen(io: Io, path: []const u8) !AppendLog {
     if (comptime builtin.os.tag == .windows) {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
+        // The length probe below can fail; the freshly created handle must
+        // not leak past this function on that path.
+        errdefer file.close(io);
         return .{ .fd = file.handle, .pos = try fileLength(io, file.handle) };
     }
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
@@ -119,7 +204,31 @@ pub fn appendOpen(io: Io, path: []const u8) !AppendLog {
         .APPEND = true,
         .CLOEXEC = true,
     }, 0o600);
+    // Same leak guard: fileLength hits the OS (fstat) and can fail after the
+    // open already succeeded.
+    errdefer posix_impl.closeFd(fd);
     return .{ .fd = fd, .pos = try fileLength(io, fd) };
+}
+
+/// Exclusive-create open: fails with error.PathAlreadyExists when anything
+/// already sits at `path`. Used for the fresh file after a rename (rotation,
+/// quarantine): the pathname was deliberately removed, so finding a file
+/// there means another writer — never append to a file we did not create.
+pub fn createOpenExcl(io: Io, path: []const u8) !AppendLog {
+    if (comptime builtin.os.tag == .windows) {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .read = true });
+        errdefer file.close(io);
+        return .{ .fd = file.handle, .pos = 0 };
+    }
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    errdefer posix_impl.closeFd(fd);
+    return .{ .fd = fd, .pos = 0 };
 }
 
 /// Write `bytes` at the end of the log. POSIX relies on O_APPEND; Windows
@@ -151,6 +260,22 @@ pub fn syncFile(fd: std.posix.fd_t) !void {
     } else {
         if (std.c.fsync(fd) != 0) return error.SyncFailed;
     }
+}
+
+/// fsync(2) the directory containing `path`: a rename/create of the entry
+/// is metadata and needs its own flush to survive a crash. No-op on
+/// Windows (no userspace directory sync; volume flush needs privileges).
+pub fn syncParentDir(io: Io, path: []const u8) !void {
+    _ = io;
+    if (comptime builtin.os.tag == .windows) return;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, parent, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer posix_impl.closeFd(fd);
+    return syncFile(fd);
 }
 
 /// Current size of the open file `fd` in bytes, via the Io stat vtable
@@ -216,6 +341,78 @@ pub fn renamePath(io: Io, old_path: []const u8, new_path: []const u8) !void {
     }
 }
 
+/// Rename `old_path` to `new_path`, failing with error.TargetExists when
+/// the target already exists instead of silently replacing it. Audit
+/// history files are append-only evidence: overwriting one is always a
+/// bug. Linux uses renameat2(RENAME_NOREPLACE) with a link+unlink fallback
+/// for kernels without it; Darwin uses renamex_np(RENAME_EXCL); Windows
+/// uses MoveFileExA without MOVEFILE_REPLACE_EXISTING.
+pub fn renamePathNoReplace(io: Io, old_path: []const u8, new_path: []const u8) !void {
+    _ = io;
+    var old_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var new_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (old_path.len > std.fs.max_path_bytes or new_path.len > std.fs.max_path_bytes)
+        return error.NameTooLong;
+    @memcpy(old_buf[0..old_path.len], old_path);
+    old_buf[old_path.len] = 0;
+    @memcpy(new_buf[0..new_path.len], new_path);
+    new_buf[new_path.len] = 0;
+    const old_z: [*:0]const u8 = old_buf[0..old_path.len :0];
+    const new_z: [*:0]const u8 = new_buf[0..new_path.len :0];
+    if (comptime builtin.os.tag == .windows) {
+        // flags = 0: no MOVEFILE_REPLACE_EXISTING.
+        if (MoveFileExA(old_z, new_z, 0) != 0) return;
+        return switch (std.os.windows.GetLastError()) {
+            .FILE_EXISTS, .ALREADY_EXISTS => error.TargetExists,
+            else => error.RenameFailed,
+        };
+    }
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.renameat2(std.posix.AT.FDCWD, old_z, std.posix.AT.FDCWD, new_z, .{ .NOREPLACE = true });
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return,
+            .EXIST => return error.TargetExists,
+            .NOSYS => return linkUnlinkNoReplace(old_z, new_z), // ancient kernel
+            else => return error.RenameFailed,
+        }
+    }
+    if (comptime builtin.os.tag == .macos) {
+        // RENAME_EXCL = 0x4.
+        if (renamex_np(old_z, new_z, 0x4) == 0) return;
+        return switch (std.posix.errno(-1)) {
+            .EXIST => error.TargetExists,
+            else => error.RenameFailed,
+        };
+    }
+    return linkUnlinkNoReplace(old_z, new_z);
+}
+
+/// POSIX no-replace rename via link(2)+unlink(2): link fails EEXIST when
+/// the target is taken, and the unlink only runs after the link landed.
+/// Raw syscalls on Linux (the default build links no libc), libc elsewhere.
+fn linkUnlinkNoReplace(old_z: [*:0]const u8, new_z: [*:0]const u8) !void {
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.link(old_z, new_z);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {},
+            .EXIST => return error.TargetExists,
+            else => return error.RenameFailed,
+        }
+        const uc = std.os.linux.unlink(old_z);
+        if (std.os.linux.errno(uc) != .SUCCESS) return error.RenameFailed;
+        return;
+    }
+    if (std.c.link(old_z, new_z) != 0) {
+        return switch (std.posix.errno(-1)) {
+            .EXIST => error.TargetExists,
+            else => error.RenameFailed,
+        };
+    }
+    if (std.c.unlink(old_z) != 0) return error.RenameFailed;
+}
+
+extern "c" fn renamex_np(from: [*:0]const u8, to: [*:0]const u8, flags: c_uint) c_int;
+
 /// Fail when `path` exists and grants group/other access: key material must
 /// be 0600. POSIX only; on Windows (NTFS ACLs) the check is a documented
 /// no-op, same rule as the mode parameter of writeFile.
@@ -247,12 +444,27 @@ fn checkPrivateFileModePosix(io: Io, path: []const u8) !void {
 
 extern "kernel32" fn FlushFileBuffers(hFile: std.os.windows.HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn SetEndOfFile(hFile: std.os.windows.HANDLE) callconv(.winapi) i32;
+extern "kernel32" fn GetFileType(hFile: std.os.windows.HANDLE) callconv(.winapi) u32;
 extern "kernel32" fn SetFilePointerEx(
     hFile: std.os.windows.HANDLE,
     liDistanceToMove: i64,
     lpNewFilePointer: ?*i64,
     dwMoveMethod: u32,
 ) callconv(.winapi) i32;
+
+/// FILE_TYPE_DISK (winbase.h): the only handle kind the legacy read/write
+/// loops accept (a named-pipe or char device target would park the
+/// calling thread).
+const W_FILE_TYPE_DISK: u32 = 0x0001;
+
+/// Windows-only body; the POSIX arms of readFileAlloc/writeFile never
+/// reference it (comptime-gated call sites keep the extern out of the
+/// non-Windows links).
+fn windowsHandleIsDiskFile(handle: std.posix.fd_t) bool {
+    if (comptime builtin.os.tag != .windows) return false; // unreachable
+    return GetFileType(handle) == W_FILE_TYPE_DISK;
+}
+
 extern "kernel32" fn MoveFileExA(
     lpExistingFileName: [*:0]const u8,
     lpNewFileName: [*:0]const u8,
@@ -278,4 +490,107 @@ fn windowsMoveFile(old_path: []const u8, new_path: []const u8) !void {
     // MOVEFILE_REPLACE_EXISTING = 0x1.
     if (MoveFileExA(old_buf[0..old_path.len :0], new_buf[0..new_path.len :0], 0x1) == 0)
         return error.RenameFailed;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (Linux execution; other targets skip — CI runs them on Linux)
+// ---------------------------------------------------------------------------
+
+/// mkfifo(3) via mknod(S_IFIFO) — same fixture rationale as secure.zig.
+fn mkfifoLinuxTest(path: []const u8) !void {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len > std.fs.max_path_bytes) return error.NameTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const rc = std.os.linux.mknod(buf[0..path.len :0], 0o010000 | 0o644, 0);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS, .EXIST => return,
+        else => return error.Unexpected,
+    }
+}
+
+/// Hang watchdog: true once the worker reported. A blocked open(2)/read(2)
+/// on a FIFO never completes; the watchdog turns that into a test failure
+/// instead of a wedged CI.
+const WatchOutcomeFd = struct {
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn watchReportFd(out: *WatchOutcomeFd, err: ?anyerror) void {
+    out.err = err;
+    out.done.store(true, .release);
+}
+
+fn waitOutcomeTest(out: *WatchOutcomeFd, timeout_ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < timeout_ms) {
+        if (out.done.load(.acquire)) return true;
+        posix_impl.sleepMs(5);
+        waited += 5;
+    }
+    return out.done.load(.acquire);
+}
+
+test "fd: readFileAlloc refuses a fifo promptly instead of hanging" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = Io.Threaded.global_single_threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try arena.dupe(u8, buf[0..try tmp.dir.realPathFile(io, ".", &buf)]);
+    const fifo_path = try std.mem.concat(arena, u8, &.{ root, "/pipe" });
+    try mkfifoLinuxTest(fifo_path);
+
+    // A plain open+read on a FIFO with no writer parks the calling
+    // thread forever; the reader must refuse non-regular targets
+    // promptly.
+    var outcome = WatchOutcomeFd{};
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(io_: Io, arena_: std.mem.Allocator, path: []const u8, out: *WatchOutcomeFd) void {
+            if (readFileAlloc(arena_, io_, path, 1 << 20)) |data| {
+                watchReportFd(out, error.TestUnexpectedResult);
+                _ = data;
+            } else |err| watchReportFd(out, err);
+        }
+    }.run, .{ io, arena, fifo_path, &outcome });
+    t.detach();
+    try std.testing.expect(waitOutcomeTest(&outcome, 2000)); // never a hang
+    try std.testing.expectEqual(@as(anyerror, error.NotRegularFile), outcome.err.?);
+}
+
+test "fd: writeFile refuses a fifo promptly instead of hanging" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try arena.dupe(u8, buf[0..try tmp.dir.realPathFile(io, ".", &buf)]);
+    const fifo_path = try std.mem.concat(arena, u8, &.{ root, "/pipe" });
+    try mkfifoLinuxTest(fifo_path);
+
+    // Write side of the same defect: O_WRONLY|O_CREAT on a FIFO with no
+    // reader blocks forever; the legacy writer must refuse non-regular
+    // targets promptly.
+    var outcome = WatchOutcomeFd{};
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(io_: Io, path: []const u8, out: *WatchOutcomeFd) void {
+            writeFile(io_, path, "x", 0o644) catch |err| {
+                watchReportFd(out, err);
+                return;
+            };
+            watchReportFd(out, error.TestUnexpectedResult);
+        }
+    }.run, .{ io, fifo_path, &outcome });
+    t.detach();
+    try std.testing.expect(waitOutcomeTest(&outcome, 2000)); // never a hang
+    try std.testing.expectEqual(@as(anyerror, error.NotRegularFile), outcome.err.?);
 }

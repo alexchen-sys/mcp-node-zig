@@ -9,9 +9,9 @@
   "name": "mcp-shell-server",
   "version": "1.30.0"
  },
- "instance_a_rss_kib": 98528,
- "instance_b_rss_kib": 97940,
- "second_agent_cost_kib": 97940,
- "two_agents_total_kib": 196468,
+ "instance_a_rss_kib": 127416,
+ "instance_b_rss_kib": 126856,
+ "second_agent_cost_kib": 126856,
+ "two_agents_total_kib": 254272,
  "phase": "per_connection"
 }

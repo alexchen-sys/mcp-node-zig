@@ -214,6 +214,13 @@ jobs:
           command -v "$PY" >/dev/null 2>&1 || PY=python
           "$PY" ci/test_regressions.py
 
+      - name: Benchmark evidence hygiene
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_bench_hygiene.py
+
       - name: Python lifecycle edge suite
         shell: bash
         run: |
@@ -244,6 +251,38 @@ jobs:
           PY=python3
           command -v "$PY" >/dev/null 2>&1 || PY=python
           "$PY" ci/test_durable_sessions.py
+
+      - name: Python durable restart suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_durable_restart.py
+
+      - name: Python copy_path suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_copy_path.py
+
+      - name: Python file ergonomics suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_file_ergonomics.py
+
+      - name: Python stdio transport suite
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PY=python3
+          command -v "$PY" >/dev/null 2>&1 || PY=python
+          "$PY" ci/test_stdio.py
 
       - name: Upload ReleaseSafe binary
         uses: actions/upload-artifact@v6

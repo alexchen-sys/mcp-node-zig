@@ -5,13 +5,12 @@ Content-Length, CL+TE), framing (bare LF / bare CR), truncation (short
 body, oversized Content-Length), pipelining (valid+valid, valid+malformed),
 and seeded PRNG mutations of the canonical request head.
 
-Base binary: mcp-node at commit c70c323.
-Expectations are the frozen observed behavior of that binary, cross-checked
-against RFC 9112 smuggling-resistant semantics. The corpus is byte-literal:
-nothing depends on the daemon's real port (Host uses the fake port 65535,
-which the default allowed-hosts wildcard `127.0.0.1:*` accepts), and the
-auth token is the fixed corpus fixture `fuzzcafe20261002c70c323`, delivered
-through `MCP_NODE_TOKEN_FILE` exactly like ci/test_regressions.py does.
+Expectations are cross-checked against RFC 9112 smuggling-resistant
+semantics. The corpus is byte-literal: nothing depends on the daemon's real
+port (Host uses the fake port 65535, which the default allowed-hosts
+wildcard `127.0.0.1:*` accepts), and the auth token is the fixed corpus
+fixture `fuzzcafe20261002c70c323`, delivered through `MCP_NODE_TOKEN_FILE`
+exactly like `ci/test_regressions.py` does.
 
 ## Running
 
@@ -95,9 +94,8 @@ Canonical head layout (136 bytes):
 ```
 
 Each mutation sends `mutated_head + canonical_body` (40 bytes), then
-half-closes. Expected outcomes are frozen observations from the probe run
-(captured in the sandbox run logs). Distribution: 44x[400], 7x[415], 7x[401],
-3x[400,400], 1x[421], 1x[405], 1x[200].
+half-closes. Distribution across the 64 deterministic cases: 44x[400],
+7x[415], 7x[401], 3x[400,400], 1x[421], 1x[405], 1x[200].
 
 Notable outcomes and what they prove:
 - `mut-flip-005` (byte 0, `P`->`9`): method stays a valid token but is not
@@ -191,32 +189,17 @@ completes; EOF after the client's half-close yields 400 BadHeaders. The body
 (40 JSON bytes) rides along as head-continuation noise — exactly the
 truncation fuzz shape the parser must survive.
 
-## Known bugs / RFC deviations
+## RFC 9112 alignment notes
 
-None found at c70c323. Every observed outcome is contract-correct:
+Every expected outcome follows strict HTTP/1.1 framing rules:
 
 - conflicting duplicate CL, CL+TE (chunked or identity), TE with chunked not
-  final: 400 — matches RFC 9112 6.1/6.3 and the smuggling-resistant stance;
+  final: 400 (matches RFC 9112 6.1/6.3 smuggling-resistant semantics);
 - identical duplicate CL accepted: permitted by RFC 9112 6.3;
 - bare LF / bare CR rejected (strict CRLF): RFC 9112 2.2 makes LF
-  recognition a MAY — refusing is the desync-resistant choice, not a bug;
-- TE refused outright (including chunked-alone where a 501 would also be
-  defensible): documented hardening ("this server speaks Content-Length
-  only"), stricter than the RFC requires — flagged here as a deliberate
-  design decision, not a defect;
+  recognition optional, so refusing bare line endings avoids framing desync;
+- TE refused outright: this server accepts `Content-Length` framing only;
 - short body / oversized CL: 400 + close; silent dribble: 408 at the
-  absolute deadline (~3.0s observed with MCP_NODE_SOCKET_TIMEOUT_S=3);
-- pipelining: answers in order, malformed second request rejected with 400
-  and connection closed — no desync window observed.
-
-## Verification trail (ephemeral CI sandboxes, Zig 0.16.0)
-
-- probe run — `zig build -Doptimize=ReleaseSafe && python3 ci/fuzz_http.py --probe`:
-  82 cases, 0 failures; the per-case observed outcomes are in the sandbox
-  run logs.
-- green run — `zig build -Doptimize=ReleaseSafe && python3 ci/fuzz_http.py`
-  + double `--list` cmp (default seed and seed 777): GREEN 82/82,
-  DETERMINISM_OK; exit 0.
-- red run — corpus copied to a sandbox temp dir, canon-002 expectation flipped
-  to [499]: runner FAILS (`canon-002: responses [400] != expected [499]`),
-  wrapped so the overall command exits 0 with MUTATION_RED_OK in the run log.
+  request deadline (~3.0s with `MCP_NODE_SOCKET_TIMEOUT_S=3`);
+- pipelining: responses arrive in order, and a malformed second request is
+  rejected with 400 before closing the connection.

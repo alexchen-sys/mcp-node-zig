@@ -14,8 +14,7 @@
           421
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-002",
@@ -27,8 +26,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-003",
@@ -40,8 +38,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-004",
@@ -53,8 +50,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-005",
@@ -66,8 +62,7 @@
           405
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-006",
@@ -79,8 +74,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-007",
@@ -92,8 +86,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-008",
@@ -105,8 +98,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-009",
@@ -118,8 +110,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-010",
@@ -131,8 +122,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-011",
@@ -144,8 +134,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-012",
@@ -157,8 +146,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-013",
@@ -170,8 +158,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-014",
@@ -183,8 +170,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-015",
@@ -196,8 +182,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-016",
@@ -209,8 +194,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-017",
@@ -222,8 +206,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-018",
@@ -235,8 +218,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-019",
@@ -248,8 +230,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-020",
@@ -261,8 +242,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-021",
@@ -274,8 +254,7 @@
           200
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-022",
@@ -287,8 +266,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-023",
@@ -301,8 +279,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-024",
@@ -314,8 +291,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-025",
@@ -327,8 +303,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-026",
@@ -340,8 +315,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-027",
@@ -353,8 +327,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-028",
@@ -366,8 +339,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-029",
@@ -379,8 +351,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-030",
@@ -392,8 +363,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-031",
@@ -405,8 +375,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-032",
@@ -418,8 +387,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-033",
@@ -432,8 +400,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-034",
@@ -445,8 +412,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-035",
@@ -459,8 +425,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-036",
@@ -472,8 +437,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-037",
@@ -485,8 +449,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-038",
@@ -498,8 +461,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-039",
@@ -511,8 +473,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-040",
@@ -524,8 +485,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-041",
@@ -537,8 +497,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-042",
@@ -550,8 +509,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-043",
@@ -563,8 +521,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-044",
@@ -576,8 +533,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-045",
@@ -589,8 +545,7 @@
           401
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-046",
@@ -602,8 +557,7 @@
           415
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-047",
@@ -615,8 +569,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-flip-048",
@@ -628,8 +581,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-001",
@@ -640,8 +592,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-002",
@@ -652,8 +603,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-003",
@@ -664,8 +614,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-004",
@@ -676,8 +625,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-005",
@@ -688,8 +636,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-006",
@@ -700,8 +647,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-007",
@@ -712,8 +658,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-008",
@@ -724,8 +669,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-009",
@@ -736,8 +680,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-010",
@@ -748,8 +691,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-011",
@@ -760,8 +702,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-012",
@@ -772,8 +713,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-013",
@@ -784,8 +724,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-014",
@@ -796,8 +735,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-015",
@@ -808,8 +746,7 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     },
     {
       "id": "mut-trunc-016",
@@ -820,9 +757,8 @@
           400
         ],
         "close_after": "yes"
-      },
-      "note": "observed at c70c323 in probe fuzz-probe-1; frozen oracle"
+      }
     }
   ],
-  "note": "Frozen LCG stream for the default seed; expected outcomes are filled from the observed behavior of the binary at c70c323 (probe run). The runner verifies this file matches the LCG byte-for-byte before trusting it."
+  "note": "Deterministic LCG mutation stream for the default seed. The runner verifies this file matches the generated byte stream before using the expected outcomes."
 }

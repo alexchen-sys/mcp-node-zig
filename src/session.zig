@@ -12,19 +12,24 @@ const Io = std.Io;
 const os = @import("os.zig");
 const proc = @import("os/proc.zig");
 const util = @import("util.zig");
+const durable = @import("durable_session.zig");
 
 const REAP_BATCH_SIZE: usize = 8; // sessions freed per SessionStore sweep
-const READER_POLL_MS: i32 = 100; // session pipe poll tick; bounds exec_close reap latency
+const READER_POLL_MS: i32 = 100; // session pipe poll tick; latency fallback only — the wake pipe (below) is the fast path
 const DRAIN_GRACE_MS: i64 = 1000; // bounded post-kill window for readers to collect available output when an escaped grandchild holds the pipes
-const READER_EXIT_MS: i64 = 10 * READER_POLL_MS; // hard cap waiting for readers to observe closing before reap closes their fds
 
 const DEFAULT_SESSION_TTL_MS: i64 = 600_000;
 
 pub const Session = struct {
+    durable: ?*durable.Backend = null,
     id: u64,
     /// Integer pid on every OS (display-only on Windows; control goes
     /// through the job/handle). See os/proc.zig.
     pid: proc.ProcessId,
+    /// Owned-child registry tag (proc.zig): the waiter removes exactly this
+    /// (pid, tag) pair after its reap is confirmed — pid reuse can never
+    /// delete a newer owner's registration. POSIX only; 0 on Windows.
+    registry_tag: u64 = 0,
     argv: [][]const u8,
     cwd: []const u8,
     child: std.process.Child,
@@ -43,6 +48,12 @@ pub const Session = struct {
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
     done: bool = false,
+    /// Level-triggered wake for exec_wait: set exactly when `done` flips
+    /// true (see `sessionFinish`). Level semantics make a lost wakeup
+    /// impossible — a waiter that checks after the set sees `is_set`
+    /// immediately, one already parked is woken by the futex wake — and
+    /// `done` is one-way, so the event is never reset.
+    done_event: std.Io.Event = .unset,
     exit_code: ?i64 = null,
     truncated_stdout: bool = false,
     truncated_stderr: bool = false,
@@ -74,11 +85,30 @@ pub const Session = struct {
     /// race: load(false) → context switch → waiter kill+reap → late kill at
     /// a recycled pgid.
     kill_mutex: std.Io.Mutex = .init,
-    /// Number of pipe-reader threads that finished draining (stdout/stderr).
-    /// The waiter gates done=true on this so `done` implies final output is
-    /// fully drained.
+    /// Number of pipe-reader threads that finished draining (stdout/stderr)
+    /// AND closed their pipe read end. The waiter gates done=true on this
+    /// (a reader's defer closes its fd first, then bumps this), so `done`
+    /// implies final output is fully drained and no reader will ever touch
+    /// a session fd again.
     readers_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Reader-wake plumbing (see `sessionRequestClose`). POSIX keeps both
+    /// ends of a CLOEXEC self-pipe: readers poll the read end alongside the
+    /// pipe, so a close request wakes a parked poll instantly instead of at
+    /// the next 100ms tick. Windows keeps a manual-reset event readers wait
+    /// alongside the pipe handle (CancelIoEx cancels a pending read; see
+    /// os/proc.zig). Null on a creation failure: readers then rely on the
+    /// poll tick / EOF alone, which costs latency, never correctness.
+    /// fd_t is HANDLE on Windows, so one field type serves both platforms.
+    wake_wfd: ?std.posix.fd_t = null,
+    wake_rfd: ?std.posix.fd_t = null,
+    wake_event: ?std.posix.fd_t = null,
 };
+
+/// Test-only hook: when non-zero, the FIRST reader that gets poll(POLLIN)
+/// sleeps this many milliseconds between poll and read (simulating a reader
+/// delayed exactly in the poll→read gap the fd-lifetime protocol must
+/// survive). `swap` semantics make it one-shot; zero in production.
+pub var test_reader_delay_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 /// How many recently finished/removed session ids the store remembers for
 /// the unknown_session error contract. Fixed size: a full ring overwrites
@@ -90,6 +120,9 @@ pub const SessionStore = struct {
     mutex: std.Io.Mutex = .init,
     io: Io,
     map: std.AutoHashMap(u64, *Session),
+    disk: ?*@import("durable.zig").Disk = null,
+    sweep_thread: ?std.Thread = null,
+    sweep_stop: std.Io.Event = .unset,
     next_id: u64 = 1,
     max: u16,
     ttl_ms: i64 = DEFAULT_SESSION_TTL_MS,
@@ -101,6 +134,86 @@ pub const SessionStore = struct {
 
     pub fn init(io: Io, max_sessions: u16) SessionStore {
         return .{ .io = io, .map = std.AutoHashMap(u64, *Session).init(std.heap.page_allocator), .max = max_sessions };
+    }
+
+    /// Start only after the store has its final address. Failure is fatal:
+    /// durable writers must never be admitted without node-side monitoring.
+    pub fn startDurableSweep(self: *SessionStore) !void {
+        if (self.sweep_thread != null) return;
+        self.sweep_stop = .unset;
+        self.sweep_thread = try std.Thread.spawn(.{}, durableSweepMain, .{self});
+    }
+
+    pub fn stopDurableSweep(self: *SessionStore) void {
+        const thread = self.sweep_thread orelse return;
+        self.sweep_stop.set(self.io);
+        thread.join();
+        self.sweep_thread = null;
+    }
+
+    fn durableSweepMain(self: *SessionStore) void {
+        while (!self.sweep_stop.isSet()) {
+            self.sweep_stop.waitTimeout(self.io, .{
+                .duration = .{ .raw = .{ .nanoseconds = std.time.ns_per_s }, .clock = .awake },
+            }) catch {};
+            if (self.sweep_stop.isSet()) return;
+            self.sweepDurableLogs();
+        }
+    }
+
+    pub fn sweepDurableLogs(self: *SessionStore) void {
+        // Collect live durable sessions under the store lock, then do ALL
+        // enforcement work outside it: refresh can sleep (the settle window)
+        // and fsync, and that must never stall unrelated connections behind
+        // the registry-wide mutex. A short ref keeps each session alive
+        // while the store lock is dropped. The batch is sized to the live
+        // map: a fixed cap with a stable hash order would starve every
+        // session past the cap.
+        var batch: []*Session = &.{};
+        var n: usize = 0;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.map.count() > 0) {
+                batch = std.heap.page_allocator.alloc(*Session, self.map.count()) catch return;
+                var it = self.map.valueIterator();
+                while (it.next()) |ptr| {
+                    const s = ptr.*;
+                    s.mutex.lockUncancelable(self.io);
+                    const take = if (s.durable) |b| !b.retired else false;
+                    s.mutex.unlock(self.io);
+                    if (!take) continue;
+                    _ = s.refs.fetchAdd(1, .acq_rel);
+                    batch[n] = s;
+                    n += 1;
+                }
+            }
+        }
+        defer {
+            for (batch[0..n]) |s| sessionRelease(s);
+            if (batch.len > 0) std.heap.page_allocator.free(batch);
+        }
+        // Stop every oversized writer before doing any completion work.
+        // No log reads: just two fstats per live durable session.
+        for (batch[0..n]) |s| {
+            s.mutex.lockUncancelable(self.io);
+            durable.enforceLogCapLocked(s, self.io) catch {};
+            s.mutex.unlock(self.io);
+        }
+        // Completion work second: a kill from the first pass lands before
+        // any finalize in the same tick.
+        for (batch[0..n]) |s| {
+            s.mutex.lockUncancelable(self.io);
+            // Refresh every unfinished durable session: since the eviction
+            // and TTL paths no longer refresh under the registry lock, this
+            // tick is what finalizes leader-dead sessions, journals
+            // completion, and keeps late growth reconciled even when the
+            // owner never polls again. A live leader costs the cap check
+            // (two fstats) plus one identity check here, with no prefix
+            // rescan; only a dying session pays the settle window.
+            if (s.durable != null and !s.done) durable.refreshLocked(s, self.io, false) catch {};
+            s.mutex.unlock(self.io);
+        }
     }
 
     /// Record `id` as recently removed (tombstone). Slot 0 is the "empty"
@@ -118,6 +231,16 @@ pub const SessionStore = struct {
     /// scan runs under the store mutex: writers (put/remove/reapDone)
     /// mutate the ring under the same lock, so no torn or mid-write slot
     /// is ever observed.
+    pub fn sawOwnedSession(self: *SessionStore, id: u64, owner: [32]u8) bool {
+        if (self.sawSession(id)) return true;
+        if (self.disk) |disk| {
+            disk.mutex.lockUncancelable(self.io);
+            defer disk.mutex.unlock(self.io);
+            return disk.index.expired(id, owner);
+        }
+        return self.sawSession(id);
+    }
+
     pub fn sawSession(self: *SessionStore, id: u64) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -140,15 +263,19 @@ pub const SessionStore = struct {
                 while (it.next()) |kv| {
                     const s = kv.value_ptr.*;
                     s.mutex.lockUncancelable(self.io);
+                    // Cheap state read only: refresh (settle sleep, fsync)
+                    // never runs under the registry lock; the 1 Hz sweep and
+                    // the poll/wait paths finalize durable sessions.
                     const is_done = s.done;
                     s.mutex.unlock(self.io);
                     if (!is_done) continue;
                     // Capture the key before the map mutation: the iterator
                     // pointer is invalidated by fetchRemove (reapDone does
                     // the same).
+                    if (s.durable != null) durable.retire(s, .evicted_capacity, self.io) catch continue;
                     const key = kv.key_ptr.*;
                     _ = self.map.fetchRemove(key);
-                    self.tombstone(key);
+                    if (s.durable == null) self.tombstone(key);
                     victim = s;
                     break;
                 }
@@ -158,7 +285,7 @@ pub const SessionStore = struct {
                 // Insert failed after an evict: don't strand the victim. Its
                 // session is done, so these joins return immediately.
                 if (victim) |s| {
-                    s.closing.store(true, .release);
+                    sessionRequestClose(s);
                     if (s.waiter_thread) |t| t.join();
                     if (s.stdout_thread) |t| t.join();
                     if (s.stderr_thread) |t| t.join();
@@ -168,12 +295,24 @@ pub const SessionStore = struct {
             };
         }
         if (victim) |s| {
-            s.closing.store(true, .release);
+            sessionRequestClose(s);
             if (s.waiter_thread) |t| t.join();
             if (s.stdout_thread) |t| t.join();
             if (s.stderr_thread) |t| t.join();
             sessionRelease(s); // drop the store's ref
         }
+    }
+
+    pub fn publishDurable(self: *SessionStore, s: *Session, gated: *proc.GatedChild, released: *bool) !void {
+        self.reapDone();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.map.count() >= self.max) return error.TooManySessions;
+        try self.map.ensureUnusedCapacity(1);
+        // No allocator or capacity failure is possible after the gate opens.
+        released.* = true;
+        try gated.release();
+        self.map.putAssumeCapacity(s.id, s);
     }
 
     pub fn get(self: *SessionStore, id: u64) ?*Session {
@@ -188,7 +327,7 @@ pub const SessionStore = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const kv = self.map.fetchRemove(id) orelse return null;
-        self.tombstone(id);
+        if (kv.value.durable == null) self.tombstone(id);
         return kv.value;
     }
 
@@ -208,25 +347,27 @@ pub const SessionStore = struct {
                 while (it.next()) |kv| {
                     const s = kv.value_ptr.*;
                     s.mutex.lockUncancelable(self.io);
+                    // Same rule as put: no refresh under the registry lock.
                     const is_done = s.done;
                     const ended = s.ended_us;
                     s.mutex.unlock(self.io);
                     if (!is_done) continue;
                     const ended_v = ended orelse continue;
                     if (nowUs(self.io) - ended_v < @as(i64, self.ttl_ms) * std.time.us_per_ms) continue;
+                    if (s.durable != null) durable.retire(s, .reaped_ttl, self.io) catch continue;
                     found_key = kv.key_ptr.*;
                     found_s = s;
                     break;
                 }
                 if (found_key == null) break;
                 _ = self.map.fetchRemove(found_key.?);
-                self.tombstone(found_key.?);
+                if (found_s.?.durable == null) self.tombstone(found_key.?);
                 victims[n] = found_s.?;
                 n += 1;
             }
         }
         for (victims[0..n]) |s| {
-            s.closing.store(true, .release);
+            sessionRequestClose(s);
             if (s.waiter_thread) |t| t.join();
             if (s.stdout_thread) |t| t.join();
             if (s.stderr_thread) |t| t.join();
@@ -250,7 +391,34 @@ pub const SessionStore = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var it = self.map.iterator();
-        while (it.next()) |kv| killTreeGuarded(kv.value_ptr.*, self.io);
+        while (it.next()) |kv| {
+            if (kv.value_ptr.*.durable == null) killTreeGuarded(kv.value_ptr.*, self.io);
+        }
+    }
+
+    /// Full teardown of every session still in the store: request close,
+    /// kill the tree, JOIN waiter+reader threads, release the store's ref.
+    /// Transports that return to main must use this, not killAll: the
+    /// threads borrow the Io that main's defers destroy right after the
+    /// transport returns. Same kill/join order as toolExecClose.
+    /// No timeout: joining is the only proof a borrower has exited.
+    pub fn shutdownAll(self: *SessionStore) void {
+        self.stopDurableSweep();
+        self.mutex.lockUncancelable(self.io);
+        var old = self.map;
+        self.map = std.AutoHashMap(u64, *Session).init(std.heap.page_allocator);
+        self.mutex.unlock(self.io);
+        defer old.deinit();
+        var it = old.iterator();
+        while (it.next()) |kv| {
+            const session = kv.value_ptr.*;
+            sessionRequestClose(session);
+            if (session.durable == null) killTreeGuarded(session, self.io);
+            if (session.waiter_thread) |t| t.join();
+            if (session.stdout_thread) |t| t.join();
+            if (session.stderr_thread) |t| t.join();
+            sessionRelease(session); // store's ref
+        }
     }
 };
 
@@ -275,7 +443,7 @@ pub fn pidJsonValue(pid: proc.ProcessId) u64 {
     return @intCast(pid);
 }
 
-fn termExitCode(term: std.process.Child.Term) i64 {
+pub fn termExitCode(term: std.process.Child.Term) i64 {
     return switch (term) {
         .exited => |code| code,
         .signal => |sig| 128 + @as(i64, @intCast(@intFromEnum(sig))),
@@ -306,42 +474,95 @@ fn appendSessionOutput(list: *std.ArrayList(u8), bytes: []const u8, max_out: usi
 }
 
 pub fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool, max_out: usize, io: Io) void {
-    defer _ = session.readers_done.fetchAdd(1, .acq_rel);
+    // fd ownership: the spawn layer transferred this pipe end to THIS
+    // thread (child.stdout/stderr were nulled in toolExecStart), so the
+    // reader is the single owner and the only closer. Close first, bump
+    // readers_done after: readers_done == expected therefore implies no
+    // thread will ever touch the fd again, which is what lets the waiter
+    // (and only then) reap and publish done. std's child.wait cleanup can
+    // never close these fds — on either platform.
+    defer {
+        os.closeFd(fd);
+        _ = session.readers_done.fetchAdd(1, .acq_rel);
+    }
     if (comptime builtin.os.tag == .windows) {
-        // Blocking NtReadFile loop (no poll tick on this OS). Termination is
-        // guaranteed by the Job Object: exec_kill/exec_close run
-        // TerminateJobObject, the waiter terminates the job when the child
-        // exits, and grandchildren auto-join the job (Win8+) — so every write
-        // end of the pipe eventually closes and the pending read completes
-        // with PIPE_BROKEN (EOF). session.closing is still honored between
-        // reads for the already-EOF fast path.
+        // Blocking NtReadFile loop. Termination is guaranteed by two
+        // independent mechanisms: (1) the Job Object — exec_kill/exec_close
+        // and the waiter run TerminateJobObject, and grandchildren
+        // auto-join the job (Win8+) — so every write end of the pipe
+        // eventually closes and the pending read completes with
+        // PIPE_BROKEN (EOF); (2) the wake event: a close request (see
+        // sessionRequestClose) sets `closing` AND sets the event the
+        // read below waits alongside the pipe handle (WaitAny — one of
+        // them suffices), so a parked read is cancelled (CancelIoEx)
+        // instead of relying on EOF alone.
+        // session.closing is still honored between reads for the
+        // already-EOF fast path. The loop head check is what makes the
+        // waiter's drain phase work: `closing` is NOT set during the
+        // drain grace (see sessionWaiterMain Windows Step 3), so readers
+        // keep reading buffered output until EOF; only after the grace
+        // does sessionRequestClose arm the closing+wake stop.
         var wbuf: [util.IO_BUF_SIZE]u8 = undefined;
         while (true) {
             if (session.closing.load(.acquire)) break;
-            const n = proc.readPipeBlocking(fd, &wbuf) orelse break;
-            if (n == 0) break;
-            session.mutex.lockUncancelable(io);
-            if (is_stdout) {
-                appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout, &session.lost_stdout_bytes);
-            } else {
-                appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr, &session.lost_stderr_bytes);
+            switch (proc.readPipeBlocking(fd, session.wake_event, &wbuf)) {
+                .bytes => |n| {
+                    if (n == 0) break; // zero-byte read == EOF on this pipe
+                    session.mutex.lockUncancelable(io);
+                    if (is_stdout) {
+                        appendSessionOutput(&session.stdout, wbuf[0..n], max_out, &session.truncated_stdout, &session.lost_stdout_bytes);
+                    } else {
+                        appendSessionOutput(&session.stderr, wbuf[0..n], max_out, &session.truncated_stderr, &session.lost_stderr_bytes);
+                    }
+                    session.mutex.unlock(io);
+                },
+                // EOF: every write end is gone and the pipe is drained —
+                // the normal exit; all buffered output was collected.
+                .eof => break,
+                // Forced stop: the wake event fired mid-read, so the read
+                // was cancelled and whatever was still buffered in the
+                // pipe is dropped. How much is unknowable (the read never
+                // returned it) — the POSIX wake-only poll exit drops it
+                // the same way, and lost_* stays a max_out-overflow
+                // metric on both platforms.
+                .woken => break,
+                .failed => break,
             }
-            session.mutex.unlock(io);
         }
         return;
     }
-    // POSIX path: poll-tick loop.
+    // POSIX path: poll-tick loop with the wake pipe in the poll set.
     {
         var buf: [util.IO_BUF_SIZE]u8 = undefined;
+        const wake_fd = session.wake_rfd;
         while (true) {
             // Poll instead of blind blocking read: exec_close must be able to reap
             // the session even if a grandchild escaped the process group and holds
-            // the pipe write-end open forever.
+            // the pipe write-end open forever. The wake pipe read end rides in
+            // the same poll: sessionRequestClose stores `closing` and writes a
+            // byte, so a parked poll returns immediately — the 100ms tick is the
+            // latency fallback for a missing wake pipe, never the correctness.
             if (session.closing.load(.acquire)) break;
-            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&pfd, READER_POLL_MS) catch break;
+            var pfds: [2]std.posix.pollfd = .{
+                .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = wake_fd orelse -1, .events = if (wake_fd != null) std.posix.POLL.IN else 0, .revents = 0 },
+            };
+            const n_fds: usize = if (wake_fd != null) 2 else 1;
+            const ready = std.posix.poll(pfds[0..n_fds], READER_POLL_MS) catch break;
             if (ready == 0) continue;
-            if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
+            const pipe_ev = pfds[0].revents;
+            if (pipe_ev & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) break;
+            const data_ready = pipe_ev & std.posix.POLL.IN != 0;
+            const writer_gone = pipe_ev & std.posix.POLL.HUP != 0;
+            if (!data_ready and !writer_gone) break; // wake-only event: stop requested
+            // Test-only: delay the reader inside the poll→read gap
+            // (one-shot; see test_reader_delay_ms).
+            const delay_ms = test_reader_delay_ms.swap(0, .acq_rel);
+            if (delay_ms != 0) os.sleepMs(delay_ms);
+            // Safe even while a stop was requested: POLLIN/HUP means bytes
+            // or EOF sit in the pipe buffer right now, and this pipe has
+            // exactly one reader, so the read always returns immediately —
+            // take the trailing data with us, exit on the next iteration.
             const n = std.posix.read(fd, &buf) catch break;
             if (n == 0) break;
             session.mutex.lockUncancelable(io);
@@ -355,40 +576,141 @@ pub fn sessionReaderMain(session: *Session, fd: std.posix.fd_t, is_stdout: bool,
     }
 }
 
+/// Ask the reader threads to stop, and wake them. ONE-SHOT: the first
+/// caller flips `closing` (atomic swap) and delivers the wake — POSIX
+/// writes a single byte into the nonblocking wake pipe, Windows sets the
+/// manual-reset event. Every later caller sees `closing` already true and
+/// returns without touching the pipe: nobody ever drains the wake pipe
+/// (readers exit on the first byte; both ends live until freeSession), so
+/// a write per call would eventually fill it (~64K requests) and park the
+/// caller on a blocking write forever. The pipe is created nonblocking
+/// (createWakePipe), so even a stray full pipe answers EAGAIN — mapped to
+/// a write error here and swallowed as "already signaled". Windows stays
+/// idempotent the way it always was: SetEvent on a manual-reset event
+/// nobody resets. With no wake plumbing (creation failure) this degrades
+/// to the plain store: readers still observe `closing` within one
+/// READER_POLL_MS tick / at EOF. Callers must treat `closing == true` as
+/// "readers are asked to exit", NEVER as "readers have exited" — only
+/// readers_done proves that.
+pub fn sessionRequestClose(session: *Session) void {
+    // Swap, not store: exactly the caller that flips false→true delivers
+    // the wake. acq_rel keeps the flip a full barrier — readers that
+    // acquire the flag observe everything the first caller did.
+    if (session.closing.swap(true, .acq_rel)) return;
+    if (comptime builtin.os.tag == .windows) {
+        if (session.wake_event) |ev| proc.setWakeEvent(ev);
+    } else {
+        if (session.wake_wfd) |wfd| {
+            var byte = [_]u8{1};
+            // EAGAIN (full, already-signaled pipe) or any other failure is
+            // "already signaled": readers see `closing` within one tick.
+            os.writeAllFd(wfd, &byte) catch {};
+        }
+    }
+}
+
+/// Publish the finished state (`done`, exit code, end time) under the
+/// session mutex, then wake every exec_wait parked on this session. Called
+/// from every exit path of `sessionWaiterMain`. The event is set AFTER the
+/// state store: `set` is a release-store and `isSet`/the wake acquire, so
+/// a woken exec_wait is guaranteed to observe `done == true`; a waiter
+/// that entered before the store is woken by the futex broadcast. With
+/// `session.mutex` NOT held on entry.
+fn sessionFinish(session: *Session, io: Io, exit_code: ?i64) void {
+    session.mutex.lockUncancelable(io);
+    session.done = true;
+    session.exit_code = exit_code;
+    session.ended_us = nowUs(io);
+    session.mutex.unlock(io);
+    session.done_event.set(io);
+}
+
+/// One-tick decision of the post-kill drain grace (POSIX Step 3 and the
+/// Windows waiter's Step 3 share it): keep giving readers time to reach
+/// EOF on their own while the grace window is still open and no explicit
+/// close request arrived; stop once every reader already finished, a
+/// close raced in (exec_close/exec_kill), or the deadline passed. Pure
+/// function so Linux CI unit-tests every branch — the waiter loops only
+/// add the sleep and the atomics.
+fn drainGraceContinue(readers_done: u32, expected_readers: u32, closing: bool, now_us: i64, deadline_us: i64) bool {
+    if (readers_done >= expected_readers) return false;
+    if (closing) return false;
+    return now_us < deadline_us;
+}
+
+/// Bounded drain grace after the tree kill (both platforms): with every
+/// in-tree pipe writer dead, EOF reaches both readers almost immediately
+/// and they finish on their own; an escaped grandchild holding a write
+/// end open makes EOF impossible, and this grace is the bounded window in
+/// which readers still collect everything already buffered in the pipe
+/// BEFORE `closing` is set — the waiter calls this strictly before
+/// sessionRequestClose/finishAfterReaders, so the readers' loop-head
+/// closing check never fires with undrained output in the pipe.
+fn drainReadersGrace(session: *Session, io: Io) void {
+    var expected_readers: u32 = 0;
+    if (session.stdout_thread != null) expected_readers += 1;
+    if (session.stderr_thread != null) expected_readers += 1;
+    const deadline_us = nowUs(io) + DRAIN_GRACE_MS * std.time.us_per_ms;
+    while (drainGraceContinue(
+        session.readers_done.load(.acquire),
+        expected_readers,
+        session.closing.load(.acquire),
+        nowUs(io),
+        deadline_us,
+    )) os.sleepMs(1);
+}
+
 pub fn sessionWaiterMain(session: *Session, io: Io) void {
     if (comptime builtin.os.tag == .windows) {
+        // Step 1: reap the child handle. std's cleanup closes child.stdin
+        // only — the stdout/stderr pipe ends were transferred to the reader
+        // threads at spawn (toolExecStart nulled the fields), so this wait
+        // can never yank a live reader's handle out from under it.
         const term = session.child.wait(io) catch {
-            // done=true must imply the job is dead, so close/reap joins of
-            // the blocking readers can never hang.
+            // done=true must imply the job is dead AND the readers are out,
+            // so close/reap joins of the blocking readers can never hang.
             if (session.job) |j| proc.terminateJob(j);
             session.tree_killed.store(true, .release);
-            session.mutex.lockUncancelable(io);
-            session.done = true;
-            session.exit_code = null;
-            session.ended_us = nowUs(io);
-            session.mutex.unlock(io);
+            drainReadersGrace(session, io);
+            finishAfterReaders(session, io, null);
             return;
         };
         const code = termExitCode(term);
-        // The child is gone; terminate the Job Object so grandchildren cannot
-        // outlive the session pinning the pipe write ends open (the blocking
-        // readers have no poll tick — EOF is their only exit). done=true
-        // published after this point implies the whole tree is dead.
+        // Step 2: the child is gone; terminate the Job Object so
+        // grandchildren cannot outlive the session pinning the pipe write
+        // ends open. Every job member dies, every pipe write end closes,
+        // and the readers' pending reads complete with PIPE_BROKEN (EOF).
         if (session.job) |j| proc.terminateJob(j);
         session.tree_killed.store(true, .release);
-        session.mutex.lockUncancelable(io);
-        session.done = true;
-        session.exit_code = code;
-        session.ended_us = nowUs(io);
-        session.mutex.unlock(io);
+        // Step 3 (drain grace — the mirror of the POSIX Step 3): the job
+        // kill closed every in-tree write end, so both readers hit EOF on
+        // their own within one read and finish with the output drained. A
+        // grandchild that escaped the Job Object can still pin a write end
+        // open — give the readers the same bounded DRAIN_GRACE_MS window
+        // the POSIX side gives them to collect everything already buffered
+        // in the pipe BEFORE closing is armed. Going straight to
+        // finishAfterReaders here (the old shape) meant
+        // sessionRequestClose fired first: the readers' loop-head
+        // `if (closing) break` then exited them with output still sitting
+        // in the pipe buffer — readers_done proved "handles closed", not
+        // "output drained", and done was published with an empty stdout
+        // at truncated=false.
+        drainReadersGrace(session, io);
+        // Step 4: stop the readers (closing + wake event cancels a parked
+        // read) and wait for their actual exit, then publish done. done
+        // therefore still means "the tree is dead AND the output is
+        // drained" — including everything the readers had in flight.
+        finishAfterReaders(session, io, code);
         return;
     }
-    // POSIX: done=true must imply (a) the whole process tree is dead and
-    // (b) every buffered byte has been drained from the pipes.
+    // POSIX: done=true must imply (a) the whole process tree is dead, (b)
+    // every buffered byte has been drained from the pipes, and (c) the
+    // reader threads are fully out — the pipe read ends are reader-owned
+    // (see sessionReaderMain), so nobody closes them before readers_done.
     //
     // Step 1: detect the leader's exit WITHOUT reaping it. The unreaped
     // zombie keeps its pid — and therefore the process-group id it led —
-    // allocated, so the group kill below can never hit a recycled pgid
+    // allocated, so the kill below can never hit a recycled pgid
     // (the classic PID/PGID reuse race).
     const no_reap_ok = if (proc.waitChildExitNoReap(session.pid)) |_| true else |_| false;
     if (no_reap_ok) {
@@ -396,101 +718,112 @@ pub fn sessionWaiterMain(session: *Session, io: Io) void {
         // reaches every in-group descendant; the leader zombie ignores it.
         proc.killTree(session.pid, session.job);
         session.tree_killed.store(true, .release);
-        // Step 3: done must mean the available output is drained. After the
-        // group kill every in-group pipe writer is dead, so EOF lets both
-        // readers finish quickly. An escaped (setsid) grandchild holding a
-        // pipe write end open makes EOF impossible: give the readers a
-        // bounded grace to collect everything already written, then force
-        // finalization — done=true is guaranteed within DRAIN_GRACE_MS plus
-        // one reader tick even for pipe-holding escapees, instead of the
-        // session never finalizing.
+        // Step 3 (drain grace): after the group kill every in-group pipe
+        // writer is dead, so EOF lets both readers finish quickly. An
+        // escaped (setsid) grandchild holding a pipe write end open makes
+        // EOF impossible: give the readers a bounded grace to collect
+        // everything already written before asking them to stop. The
+        // loop lives in drainReadersGrace, shared with the Windows
+        // waiter's Step 3 so both platforms follow identical drain rules.
         var expected_readers: u32 = 0;
         if (session.stdout_thread != null) expected_readers += 1;
         if (session.stderr_thread != null) expected_readers += 1;
-        const drain_deadline = nowUs(io) + DRAIN_GRACE_MS * std.time.us_per_ms;
-        while (session.readers_done.load(.acquire) < expected_readers) {
-            if (session.closing.load(.acquire)) break;
-            if (nowUs(io) >= drain_deadline) break;
-            os.sleepMs(1);
-        }
-        // Step 4: child.wait() cleanup closes the parent pipe ends, so the
-        // readers must be fully out of their poll/read loop BEFORE the reap
-        // (a reader's defer bumps readers_done only after its last fd
-        // touch). If the drain ended on the deadline or an external closing,
-        // the readers are still inside a poll tick: tell them to stop and
-        // wait them out. Bounded by construction — readers observe closing
-        // within one READER_POLL_MS tick; the hard cap only backstops a
-        // wedged kernel and is never reached in practice.
-        if (session.readers_done.load(.acquire) < expected_readers) {
-            session.closing.store(true, .release);
-            const exit_deadline = nowUs(io) + READER_EXIT_MS * std.time.us_per_ms;
-            while (session.readers_done.load(.acquire) < expected_readers) {
-                if (nowUs(io) >= exit_deadline) break;
-                os.sleepMs(1);
-            }
-        }
+        drainReadersGrace(session, io);
+        // Step 4: stop the readers (closing + wake byte) and wait for their
+        // actual exit without a timeout, ensuring no reader remains between
+        // its closing check, poll, and read when the pipe fds are closed.
+        // The wait is progress-guaranteed instead of time-bounded: the readers' poll
+        // includes the wake pipe (a parked poll returns the moment the wake
+        // byte lands; the 100ms tick covers a missing wake pipe), and a
+        // read after POLLIN/HUP on this single-reader pipe always has data
+        // or EOF available, so it cannot block indefinitely. The wait is
+        // therefore bounded by the scheduler, not by a timer that would
+        // have to break the "done ⇒ drained" promise to fire.
+        sessionRequestClose(session);
+        while (session.readers_done.load(.acquire) < expected_readers) os.sleepMs(1);
         // Step 5: reap with the child already dead, so child.wait() returns
-        // immediately. The kill_mutex critical section serializes the reap
-        // against killTreeGuarded callers: their tree_killed check + kill
-        // complete either strictly before this reap (leader zombie still
-        // pins the pgid — safe) or strictly after it (they observe
-        // tree_killed == true and skip). A bare bool left a load(false) →
-        // waiter kill+reap → late kill at a recycled pgid race.
+        // immediately — and closes nothing the readers own: stdin is null
+        // by construction, stdout/stderr were transferred to the readers.
+        // The kill_mutex critical section serializes the reap against
+        // killTreeGuarded callers: their tree_killed check + kill complete
+        // either strictly before this reap (leader zombie still pins the
+        // pgid — safe) or strictly after it (they observe tree_killed ==
+        // true and skip). A bare bool left a load(false) → waiter
+        // kill+reap → late kill at a recycled pgid race.
         session.kill_mutex.lockUncancelable(io);
         const term = session.child.wait(io) catch {
             session.kill_mutex.unlock(io);
-            session.mutex.lockUncancelable(io);
-            session.done = true;
-            session.exit_code = null;
-            session.ended_us = nowUs(io);
-            session.mutex.unlock(io);
+            sessionFinish(session, io, null);
             return;
         };
         session.kill_mutex.unlock(io);
+        // Owner reap confirmed: release the registry protection. Exact
+        // (pid, tag) removal — a recycled pid keeps its new registration.
+        proc.unregisterSpawnPid(io, session.pid, session.registry_tag);
         const code = termExitCode(term);
-        session.mutex.lockUncancelable(io);
-        session.done = true;
-        session.exit_code = code;
-        session.ended_us = nowUs(io);
-        session.mutex.unlock(io);
+        sessionFinish(session, io, code);
         return;
     }
     // Fallback after a waitid failure: block on the child WITHOUT holding
     // kill_mutex — exec_kill must be able to unblock this wait. The
     // post-reap kill keeps its documented pid-reuse window (the gap the
     // WNOWAIT path exists to close), but a late kill is still strictly
-    // better than a leaked tree.
+    // better than a leaked tree. Reader fds stay reader-owned through this
+    // path too, so the reap cannot close them out from under a live
+    // reader; the kill unblocks EOF and finishAfterReaders does the
+    // stop/wait/publish sequence.
     const term = session.child.wait(io) catch {
         killTreeGuarded(session, io);
-        session.mutex.lockUncancelable(io);
-        session.done = true;
-        session.exit_code = null;
-        session.ended_us = nowUs(io);
-        session.mutex.unlock(io);
+        finishAfterReaders(session, io, null);
         return;
     };
+    // Owner reap confirmed: release the registry protection (see above).
+    proc.unregisterSpawnPid(io, session.pid, session.registry_tag);
     const code = termExitCode(term);
     killTreeGuarded(session, io);
-    session.mutex.lockUncancelable(io);
-    session.done = true;
-    session.exit_code = code;
-    session.ended_us = nowUs(io);
-    session.mutex.unlock(io);
+    finishAfterReaders(session, io, code);
+}
+
+/// Terminal half of the waiter protocol (both platforms): ask the readers
+/// to stop (closing + wake), wait until every reader thread has actually
+/// finished (readers_done == expected — the count of spawned reader
+/// threads), then publish done. Deadlock-free by ownership: readers never
+/// hold session.mutex across their fd operations, and each reader is
+/// guaranteed to observe the stop request (wake pipe / wake event /
+/// 100ms poll tick / job-object EOF — see sessionReaderMain). `done`
+/// is therefore published strictly after the final output is drained.
+fn finishAfterReaders(session: *Session, io: Io, exit_code: ?i64) void {
+    sessionRequestClose(session);
+    var expected_readers: u32 = 0;
+    if (session.stdout_thread != null) expected_readers += 1;
+    if (session.stderr_thread != null) expected_readers += 1;
+    while (session.readers_done.load(.acquire) < expected_readers) os.sleepMs(1);
+    sessionFinish(session, io, exit_code);
 }
 
 fn freeSession(session: *Session) void {
+    if (session.durable) |b| b.deinit();
     // Called only after all session threads were joined (close/evict/error
-    // paths), i.e. always after child.wait() already closed child.stdout/
-    // stderr via std cleanup. child.stdin is null by construction on both
-    // platforms — POSIX spawns with `.file` stdio (child.stdin starts null),
-    // Windows nulls it in the post-spawn takeover — so std cleanup never
-    // holds a stdin handle and closing Session.stdin_fd here is the single
-    // owner's close, never a double-close.
+    // paths), i.e. always after the waiter already reaped the child. The
+    // stdout/stderr pipe ends were reader-owned and closed by the reader
+    // threads themselves (sessionReaderMain's defer), so nothing here or
+    // in std's child cleanup can double-close them. child.stdin is null by
+    // construction on both platforms — POSIX spawns with `.file` stdio
+    // (child.stdin starts null), Windows nulls it in the post-spawn
+    // takeover — so closing Session.stdin_fd here is the single owner's
+    // close, never a double-close.
     if (session.stdin_fd) |fd| os.closeFd(fd);
-    // Windows: release the Job Object. The tree is already dead (waiter ran
-    // TerminateJobObject), so KILL_ON_JOB_CLOSE is a no-op here.
+    // Wake plumbing: no reader is alive at this point (all threads joined),
+    // so closing the write/read ends (or the event) can never race a poll
+    // or a pending NtReadFile.
     if (comptime builtin.os.tag == .windows) {
+        if (session.wake_event) |ev| os.closeFd(ev);
+        // Windows: release the Job Object. The tree is already dead (waiter
+        // ran TerminateJobObject), so KILL_ON_JOB_CLOSE is a no-op here.
         if (session.job) |j| os.closeFd(j);
+    } else {
+        if (session.wake_wfd) |fd| os.closeFd(fd);
+        if (session.wake_rfd) |fd| os.closeFd(fd);
     }
     for (session.argv) |arg| std.heap.page_allocator.free(arg);
     std.heap.page_allocator.free(session.argv);
@@ -534,16 +867,43 @@ fn sliceFromOffset(items: []const u8, offset_i: i64) ![]const u8 {
     return items[offset..];
 }
 
+fn pageDelta(raw: []const u8, page: ?usize, done: bool) []const u8 {
+    if (page) |cap| {
+        if (raw.len > cap) return raw[0..@import("output_shape.zig").trimEnd(raw, cap)];
+    }
+    return if (done) raw else utf8CompletePrefix(raw);
+}
+
 pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Session, stdout_offset: i64, stderr_offset: i64, out: *std.ArrayList(u8)) !void {
+    return renderSessionPage(arena, store, session, stdout_offset, stderr_offset, null, out);
+}
+
+pub fn renderSessionPage(arena: Allocator, store: *SessionStore, session: *Session, stdout_offset: i64, stderr_offset: i64, page: ?usize, out: *std.ArrayList(u8)) !void {
     session.mutex.lockUncancelable(store.io);
     defer session.mutex.unlock(store.io);
-    const stdout_raw = try sliceFromOffset(session.stdout.items, stdout_offset);
-    const stderr_raw = try sliceFromOffset(session.stderr.items, stderr_offset);
+    try durable.refreshLocked(session, store.io, true);
+    // Durable no-limit calls still return a bounded page and advertise the
+    // remaining backlog. Ephemeral calls retain their exact legacy shape.
+    const effective_page = if (session.durable) |b| page orelse @as(usize, @intCast(@min(b.meta.max_out, 1024 * 1024))) else page;
+    const stdout_page: durable.SpoolPage = if (session.durable) |b|
+        try durable.readPage(arena, store.io, b.stdout, stdout_offset, effective_page.?)
+    else blk: {
+        const raw = try sliceFromOffset(session.stdout.items, stdout_offset);
+        break :blk .{ .raw = raw, .total = session.stdout.items.len + session.lost_stdout_bytes, .remaining = raw.len };
+    };
+    defer if (session.durable != null) arena.free(stdout_page.raw);
+    const stderr_page: durable.SpoolPage = if (session.durable) |b|
+        try durable.readPage(arena, store.io, b.stderr, stderr_offset, effective_page.?)
+    else blk: {
+        const raw = try sliceFromOffset(session.stderr.items, stderr_offset);
+        break :blk .{ .raw = raw, .total = session.stderr.items.len + session.lost_stderr_bytes, .remaining = raw.len };
+    };
+    defer if (session.durable != null) arena.free(stderr_page.raw);
     // While the process is alive never split a multi-byte UTF-8 sequence at
     // the delta edge: hold the partial tail back; reported offsets let the
     // client re-fetch it once completed.
-    const stdout_delta = if (session.done) stdout_raw else utf8CompletePrefix(stdout_raw);
-    const stderr_delta = if (session.done) stderr_raw else utf8CompletePrefix(stderr_raw);
+    const stdout_delta = pageDelta(stdout_page.raw, effective_page, session.done);
+    const stderr_delta = pageDelta(stderr_page.raw, effective_page, session.done);
     const stdout_text = try util.utf8LossyAlloc(arena, stdout_delta);
     const stderr_text = try util.utf8LossyAlloc(arena, stderr_delta);
     // Elapsed kept in microseconds: sub-millisecond sessions would flatten
@@ -576,6 +936,23 @@ pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Sess
     try out.print(arena, "{d}", .{@divTrunc(elapsed_us, std.time.us_per_ms)});
     try out.appendSlice(arena, ",\"duration_us\":");
     try out.print(arena, "{d}", .{elapsed_us});
+    if (effective_page) |cap| {
+        const more_out = stdout_delta.len < stdout_page.remaining;
+        const more_err = stderr_delta.len < stderr_page.remaining;
+        try out.print(arena, ",\"has_more_stdout\":{},\"has_more_stderr\":{},\"has_more\":{},\"page_limited\":{},\"total_stdout_bytes\":{d},\"total_stderr_bytes\":{d}", .{
+            more_out,                                                   more_err,          more_out or more_err,
+            stdout_page.remaining > cap or stderr_page.remaining > cap, stdout_page.total, stderr_page.total,
+        });
+        // Exit-page contract: done reports process
+        // exit, not drained output; say so on the page where both are true.
+        if (session.done and (more_out or more_err) and (session.durable == null or session.durable.?.completionReason() == null)) try out.appendSlice(arena, ",\"message\":\"process exited; has_more=true means buffered output remains - keep polling until has_more is false\"");
+    }
+    if (session.durable) |b| {
+        try out.print(arena, ",\"recovered\":{},\"stdin_available\":{},\"output_complete\":{},\"tree_state\":\"{s}\"", .{ b.recovered, !b.recovered and session.stdin_fd != null, session.done and !b.output_settling and b.completionReason() == null, if (session.tree_killed.load(.acquire)) @as([]const u8, "killed") else "unknown" });
+        if (b.completionReason()) |reason| {
+            try out.print(arena, ",\"completion_reason\":\"{s}\",\"message\":\"output exceeded the durable per-session log cap (2x MCP_NODE_MAX_OUT); a live session is killed with a verified identity, already-written output remains pollable\"", .{@tagName(reason)});
+        } else if (b.output_settling) try out.appendSlice(arena, ",\"completion_reason\":\"output_settling\"") else if (b.meta.state == .interrupted) try out.appendSlice(arena, ",\"completion_reason\":\"interrupted\"") else if (session.done and session.exit_code == null) try out.appendSlice(arena, ",\"completion_reason\":\"orphaned_exit\"");
+    }
     try out.appendSlice(arena, "}");
 }
 
@@ -589,6 +966,11 @@ pub fn renderSessionState(arena: Allocator, store: *SessionStore, session: *Sess
 pub fn killTreeGuarded(session: *Session, io: Io) void {
     session.kill_mutex.lockUncancelable(io);
     defer session.kill_mutex.unlock(io);
+    if (session.durable) |b| {
+        if (b.meta.state == .interrupted or session.tree_killed.load(.acquire)) return;
+        if (proc.killRecoveredTreeVerified(b.identity())) session.tree_killed.store(true, .release) else durable.event(b.writer, "session.orphan_skip", "reason", "pid_reused_or_dead");
+        return;
+    }
     if (!session.tree_killed.load(.acquire)) {
         proc.killTree(session.pid, session.job);
         session.tree_killed.store(true, .release);
@@ -621,6 +1003,72 @@ fn newSyntheticSession(io: Io, id: u64) !*Session {
         .started_us = nowUs(io),
     };
     return session;
+}
+
+test "sessionFinish publishes the finished state and arms the done event" {
+    const io = Io.Threaded.global_single_threaded.io();
+    const session = try newSyntheticSession(io, 1);
+    defer freeSession(session);
+
+    try std.testing.expect(!session.done_event.isSet());
+    sessionFinish(session, io, 42);
+
+    session.mutex.lockUncancelable(io);
+    const done = session.done;
+    const exit_code = session.exit_code;
+    const ended = session.ended_us;
+    session.mutex.unlock(io);
+    try std.testing.expect(done);
+    try std.testing.expectEqual(@as(?i64, 42), exit_code);
+    try std.testing.expect(ended != null);
+    try std.testing.expect(session.done_event.isSet());
+
+    // exec_wait's entry contract: a session already finished before the
+    // wait starts returns without ever parking — waitTimeout on a set
+    // event must succeed immediately, not burn a timeout (or a 50ms tick).
+    session.done_event.waitTimeout(io, .{
+        .duration = .{ .raw = .{ .nanoseconds = std.time.ns_per_s }, .clock = .real },
+    }) catch return error.SetEventMustWakeImmediately;
+}
+
+test "done event wakes a parked waiter without the 50ms poll quantum" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // threading + futex timing asserted on the CI target
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const session = try newSyntheticSession(io, 1);
+
+    const Setter = struct {
+        fn run(s: *Session, thread_io: Io) void {
+            os.sleepMs(5);
+            sessionFinish(s, thread_io, 0);
+        }
+    };
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{ session, io });
+    defer setter.join();
+
+    // The exact wait loop toolExecWait runs: isSet pre-check, remaining-
+    // time waitTimeout, Timeout re-check (spurious wakes fall through).
+    const start = nowUs(io);
+    const deadline = start + 10 * std.time.us_per_s;
+    while (true) {
+        if (session.done_event.isSet()) break;
+        const now = nowUs(io);
+        if (now >= deadline) break;
+        const remaining_ns: i96 = @as(i96, deadline - now) * std.time.ns_per_us;
+        session.done_event.waitTimeout(io, .{
+            .duration = .{ .raw = .{ .nanoseconds = remaining_ns }, .clock = .real },
+        }) catch {};
+    }
+    const elapsed_us = nowUs(io) - start;
+    // The setter finishes at ~5ms; the event wake must return well under
+    // the old 50ms sleep tick (the poll loop could never beat its own
+    // quantum: done was always set inside the first sleeping tick). 45ms
+    // keeps an order-of-magnitude margin over the ~5ms expected wake.
+    try std.testing.expect(session.done_event.isSet());
+    try std.testing.expect(elapsed_us < 45_000);
+
+    freeSession(session);
 }
 
 test "session store allocates monotonic ids and tracks sessions" {
@@ -916,6 +1364,32 @@ test "utf8 prefix and offset slicing helpers" {
     try std.testing.expectError(error.BadOffset, sliceFromOffset("abcdef", 7));
 }
 
+test "drainGraceContinue bounds the post-kill drain window" {
+    // Pure decision function shared by the POSIX and Windows waiter Step 3.
+    // All branch shapes live here so Linux CI
+    // covers the full drain semantics; the waiter loops only add the
+    // sleep and the atomics around this call.
+    const deadline: i64 = 1_000_000; // 1s in µs after the kill
+
+    // Mid-grace with readers still alive: keep draining.
+    try std.testing.expect(drainGraceContinue(0, 2, false, 0, deadline));
+    // The last tick before the deadline still counts as grace time.
+    try std.testing.expect(drainGraceContinue(1, 2, false, deadline - 1, deadline));
+
+    // All readers finished (EOF reached): stop waiting immediately.
+    try std.testing.expect(!drainGraceContinue(2, 2, false, 0, deadline));
+    // No readers were spawned at all: nothing to drain.
+    try std.testing.expect(!drainGraceContinue(0, 0, false, 0, deadline));
+
+    // An exec_close/exec_kill racing in (closing already armed): the
+    // forced-stop path takes over, the grace is abandoned.
+    try std.testing.expect(!drainGraceContinue(0, 2, true, 0, deadline));
+
+    // Deadline reached or passed: grace is over regardless.
+    try std.testing.expect(!drainGraceContinue(0, 2, false, deadline, deadline));
+    try std.testing.expect(!drainGraceContinue(0, 2, false, deadline + 5, deadline));
+}
+
 test "appendSessionOutput counts dropped bytes past the cap" {
     // Under the cap everything is kept and nothing is lost.
     {
@@ -1019,7 +1493,148 @@ test "session store tombstone ring wraps at the fixed size" {
     try std.testing.expect(store.sawSession(TOMBSTONE_SLOTS + 7));
     // The final session (id 136) is still live in the map, not a tombstone.
     try std.testing.expect(!store.sawSession(TOMBSTONE_SLOTS + 8));
-    try std.testing.expect(store.get(TOMBSTONE_SLOTS + 8) != null);
-    sessionRelease(store.get(TOMBSTONE_SLOTS + 8).?);
+    // get() is acquiring: it bumps refs. Release the acquired reference
+    // (and the store's own one via remove) or the session leaks one
+    // reference past the test.
+    const live = store.get(TOMBSTONE_SLOTS + 8);
+    try std.testing.expect(live != null);
+    sessionRelease(live.?);
     sessionRelease(store.remove(TOMBSTONE_SLOTS + 8).?);
+}
+
+test "sessionRequestClose is one-shot: repeated calls write exactly one wake byte" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // POSIX wake-pipe plumbing
+    // Only the fields sessionRequestClose touches are initialized: the
+    // function must never reach into anything else.
+    var s: Session = undefined;
+    s.closing = std.atomic.Value(bool).init(false);
+    const pair = proc.createWakePipe() orelse return error.SkipZigTest;
+    defer os.closeFd(pair[0]);
+    defer os.closeFd(pair[1]);
+    s.wake_wfd = pair[1];
+    s.wake_rfd = pair[0];
+
+    sessionRequestClose(&s);
+    sessionRequestClose(&s);
+    sessionRequestClose(&s);
+
+    // Exactly one byte landed: the read end is nonblocking (createWakePipe
+    // sets NONBLOCK), so after consuming the single byte the next read
+    // answers EAGAIN — mapped to ReadFailed — instead of blocking; a
+    // per-call write would have left more bytes behind.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try os.readFd(pair[0], &buf));
+    try std.testing.expectEqual(@as(u8, 1), buf[0]);
+    try std.testing.expectError(error.ReadFailed, os.readFd(pair[0], &buf));
+    // The one-shot flag is visible to every caller and every reader.
+    try std.testing.expect(s.closing.load(.acquire));
+}
+
+test "session pages progress across UTF-8 without capture loss" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const session = try newSyntheticSession(io, 7);
+    defer freeSession(session);
+    const raw = "a💩é中z";
+    try session.stdout.appendSlice(std.heap.page_allocator, raw);
+    try session.stderr.appendSlice(std.heap.page_allocator, "123456");
+    session.done = true;
+    var offset: i64 = 0;
+    var err_offset: i64 = 0;
+    var joined: std.ArrayList(u8) = .empty;
+    var pages: usize = 0;
+    while (true) {
+        var out: std.ArrayList(u8) = .empty;
+        try renderSessionPage(a, &store, session, offset, err_offset, 4, &out);
+        const obj = (try std.json.parseFromSliceLeaky(std.json.Value, a, out.items, .{})).object;
+        try joined.appendSlice(a, obj.get("stdout").?.string);
+        const next = obj.get("stdout_offset").?.integer;
+        if (offset < raw.len) try std.testing.expect(next > offset);
+        offset = next;
+        err_offset = obj.get("stderr_offset").?.integer;
+        try std.testing.expect(!obj.get("truncated_stdout").?.bool);
+        try std.testing.expectEqual(@as(i64, 0), obj.get("lost_stdout_bytes").?.integer);
+        try std.testing.expectEqual(@as(i64, raw.len), obj.get("total_stdout_bytes").?.integer);
+        pages += 1;
+        if (!obj.get("has_more").?.bool) {
+            // The final page carries no exit-page message.
+            try std.testing.expect(obj.get("message") == null);
+            break;
+        }
+        // done (exit) may arrive with has_more (undrained pages) —
+        // the payload must then say so explicitly.
+        try std.testing.expect(obj.get("done").?.bool);
+        try std.testing.expectEqualStrings("process exited; has_more=true means buffered output remains - keep polling until has_more is false", obj.get("message").?.string);
+        try std.testing.expect(pages < 10);
+    }
+    try std.testing.expectEqualStrings(raw, joined.items);
+    try std.testing.expectEqual(@as(usize, 4), pages);
+    session.truncated_stdout = true;
+    session.lost_stdout_bytes = 42;
+    var out: std.ArrayList(u8) = .empty;
+    try renderSessionPage(a, &store, session, 0, 0, 4, &out);
+    const obj = (try std.json.parseFromSliceLeaky(std.json.Value, a, out.items, .{})).object;
+    try std.testing.expect(obj.get("truncated_stdout").?.bool);
+    try std.testing.expectEqual(@as(i64, 42), obj.get("lost_stdout_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, raw.len + 42), obj.get("total_stdout_bytes").?.integer);
+}
+
+test "session page holds live partial UTF-8 but flushes malformed EOF" {
+    try std.testing.expectEqualStrings("abc", pageDelta("abc💩", 4, true));
+    try std.testing.expectEqualStrings("abc\xff", pageDelta("abc\xffz", 4, true));
+    try std.testing.expectEqualStrings("a", pageDelta("a\xf0\x9f", 4, false));
+    try std.testing.expectEqualStrings("a\xf0\x9f", pageDelta("a\xf0\x9f", 4, true));
+    try std.testing.expectEqualStrings("", pageDelta("", 4, true));
+}
+
+test "state enabled tombstones preserve ephemeral expiry and durable ownership" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 4);
+    defer store.map.deinit();
+    var disk: @import("durable.zig").Disk = undefined;
+    disk.mutex = .init;
+    disk.index = .{};
+    store.disk = &disk;
+    store.tombstone(1);
+    disk.index.push(.{ .id = 2, .owner_hash = @splat(7), .reason = .closed_by_client });
+    try std.testing.expect(store.sawOwnedSession(1, @splat(0)));
+    try std.testing.expect(store.sawOwnedSession(2, @splat(7)));
+    try std.testing.expect(!store.sawOwnedSession(2, @splat(0)));
+}
+
+test "ephemeral overflow preserves head kept offsets and lost counters" {
+    const io = Io.Threaded.global_single_threaded.io();
+    var store = SessionStore.init(io, 8);
+    defer store.map.deinit();
+    var state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const s = try newSyntheticSession(io, 1);
+    defer freeSession(s);
+    appendSessionOutput(&s.stdout, "head-tail", 4, &s.truncated_stdout, &s.lost_stdout_bytes);
+    appendSessionOutput(&s.stdout, "-more", 4, &s.truncated_stdout, &s.lost_stdout_bytes);
+    appendSessionOutput(&s.stderr, "err-tail", 4, &s.truncated_stderr, &s.lost_stderr_bytes);
+    s.done = true;
+    var out: std.ArrayList(u8) = .empty;
+    try renderSessionPage(a, &store, s, 0, 0, 4, &out);
+    const obj = (try std.json.parseFromSliceLeaky(std.json.Value, a, out.items, .{})).object;
+    try std.testing.expectEqualStrings("head", obj.get("stdout").?.string);
+    try std.testing.expectEqualStrings("err-", obj.get("stderr").?.string);
+    try std.testing.expectEqual(@as(i64, 10), obj.get("lost_stdout_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), obj.get("lost_stderr_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 14), obj.get("total_stdout_bytes").?.integer);
+    try std.testing.expect(obj.get("truncated_stdout").?.bool);
+    try std.testing.expect(!obj.get("has_more").?.bool);
+    try std.testing.expect(obj.get("output_complete") == null);
+    out = .empty;
+    try renderSessionState(a, &store, s, 4, 4, &out);
+    const eof = (try std.json.parseFromSliceLeaky(std.json.Value, a, out.items, .{})).object;
+    try std.testing.expectEqualStrings("", eof.get("stdout").?.string);
+    try std.testing.expectEqual(@as(i64, 10), eof.get("lost_stdout_bytes").?.integer);
+    try std.testing.expect(eof.get("total_stdout_bytes") == null);
+    try std.testing.expectError(error.BadOffset, renderSessionPage(a, &store, s, 5, 0, 4, &out));
 }

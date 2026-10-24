@@ -165,7 +165,10 @@ pub fn run(io: Io, cfg: *const config.Config) void {
             break;
         };
     }
-    if (cfg.sessions) |store| store.killAll();
+    // Full teardown, not killAll: session threads borrow the Io that main
+    // destroys right after we return — every waiter/reader must be
+    // JOINED here, a process kill alone only starts their exit.
+    if (cfg.sessions) |store| store.shutdownAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +295,7 @@ test "stdio dispatcher: pretty-printed bodies (tools/list) still go out as one l
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
     defer parsed.deinit();
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
-    try testing.expectEqual(@as(usize, 13), tools.items.len);
+    try testing.expectEqual(@as(usize, 14), tools.items.len);
 }
 
 test "stdio dispatcher: oversize line gets one Invalid Request error" {

@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const os = @import("os.zig");
+const proc = @import("os/proc.zig");
 const util = @import("util.zig");
 const link = @import("link.zig");
 const config = @import("config.zig");
@@ -83,6 +84,17 @@ pub const MAX_PENDING_HANDSHAKES: u32 = 16;
 /// under the same name may take the name over.
 pub const PROBE_MS: u64 = 3 * 1000;
 const PROBE_STEP_MS: u64 = 50;
+/// Poll step of the probe's write-mutex admission loop: fine enough that
+/// a holder releasing mid-budget is picked up at once, coarse enough that
+/// the loop costs nothing next to the frame writes it waits behind.
+const PROBE_MUTEX_STEP_MS: u64 = 5;
+/// Budget of the replacement GOAWAY in Hub.register (mutex admission
+/// included, see writeFrameByDeadline). The frame is pure courtesy — the
+/// old link is killed right after whatever this spends — so unlike the
+/// probe's PROBE_MS it must not hold the handshake slot on its own
+/// account: a writer stuck on the old link's write mutex delays the
+/// name takeover by at most this much.
+const GOAWAY_BUDGET_MS: u64 = 500;
 /// GOAWAY text for a node whose name is held by a live link.
 pub const NAME_IN_USE = "name in use by a live link";
 /// Floor for the relay deadline: a long tool call holds the line as long
@@ -105,6 +117,12 @@ const gpa = std.heap.page_allocator;
 
 fn nowMs(io: Io) i64 {
     return Io.Clock.awake.now(io).toMilliseconds();
+}
+
+/// Time left before an absolute awake-clock deadline; 0 once it passed.
+fn deadlineLeftMs(deadline_ms: i64, now_ms: i64) u64 {
+    const left = deadline_ms - now_ms;
+    return if (left > 0) @intCast(left) else 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +266,23 @@ pub const Hub = struct {
     /// Live handshake/reader threads; tests wait for zero.
     threads: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Infrastructure threads, joinable: start keeps the handles so
+    /// stop/rollback can retract them instead of leaving detached threads
+    /// pointing at startup state that is being unwound.
+    accept_thread: ?std.Thread = null,
+    pinger_thread: ?std.Thread = null,
+    /// POSIX: the accept loop polls the listener together with this pipe,
+    /// so stop() retracts the thread without allocating a new socket (a
+    /// self-connect would fail under fd exhaustion). Null on Windows.
+    wake_rfd: ?std.posix.fd_t = null,
+    wake_wfd: ?std.posix.fd_t = null,
+    /// Windows: the same guarantee through a loopback wake CONNECTION
+    /// created at start (listener on 127.0.0.1:0 + connect + accept, then
+    /// the tiny listener closes — the pair lives on). stop() sends one
+    /// byte on wake_send; the accept loop WSAPolls wake_recv. Null on
+    /// POSIX.
+    wake_send: ?Io.net.Stream = null,
+    wake_recv: ?Io.net.Stream = null,
     /// Per-source pending counts and failure bans (fixed size).
     sources_mutex: Io.Mutex = .init,
     sources: SourceTable = .{},
@@ -282,14 +317,41 @@ pub const Hub = struct {
     }
 
     /// Insert an authenticated link. An existing link with the same name is
-    /// replaced: it gets GOAWAY, is killed (its waiters fail) and released.
-    /// `authenticate` only gets here when that link failed the probe.
+    /// replaced: it gets a best-effort GOAWAY bounded by GOAWAY_BUDGET_MS,
+    /// is killed (its waiters fail) and released. `authenticate` only gets
+    /// here when that link failed the probe.
+    ///
+    /// Established-link admission: a NEW name is refused once the
+    /// live registry population reaches cfg.max_node_links — the cap that
+    /// bounds sockets, reader threads and TLS state for authenticated
+    /// links (shared-secret mode authorizes arbitrary names, so the
+    /// configured pin list is not an implicit bound). The check runs under
+    /// the registry mutex, so admission and insertion are atomic against
+    /// other admissions. Same-name replacement never consumes additional
+    /// admission: the old link's registry slot — its credit — transfers.
+    /// A replaced link is killed below, so its reader thread and socket
+    /// teardown is prompt; residual reader/forward references drain with
+    /// the in-flight work that holds them.
     fn register(self: *Hub, ln: *Link) !void {
         ln.retain();
         var old: ?*Link = null;
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
+            // Admission first, before any mutation: a new name past the
+            // cap is refused without touching the registry. Registration
+            // once stopping has begun is refused too — stop() set the flag
+            // under this same mutex, so this check is serialized against
+            // the kill sweep and no link can be registered after it.
+            if (self.stopping.load(.acquire)) {
+                ln.release();
+                return error.HubStopping;
+            }
+            if (self.registry.get(ln.name) == null and self.registry.count() >= self.cfg.max_node_links) {
+                ln.release();
+                std.debug.print("hub: refusing node '{s}': established-link cap {d} reached\n", .{ ln.name, self.cfg.max_node_links });
+                return error.LinkCapacityExceeded;
+            }
             const gop = self.registry.getOrPut(gpa, ln.name) catch |err| {
                 ln.release();
                 return err;
@@ -301,7 +363,22 @@ pub const Hub = struct {
             gop.value_ptr.* = ln;
         }
         if (old) |o| {
-            o.writeFrame(.goaway, 0, &.{"replaced by a new link"});
+            // The GOAWAY goes out under writeFrameByDeadline's
+            // budget-bound mutex admission, never through writeFrame's
+            // UNCANCELABLE lock. The writer that just failed the probe by
+            // holding the old link's write mutex past PROBE_MS would
+            // otherwise park register — and with it the handshake slot, the
+            // start of the new link's reader, and every forward on the
+            // already-registered new link — behind itself. If the budget
+            // expires (or the link dies first) the GOAWAY is simply
+            // skipped. kill() runs UNCONDITIONALLY after: its
+            // shutdown(.both) breaks the stuck writer's blocked send, so
+            // the holder frees the mutex through the failing syscall
+            // instead of on its own clock. The object outlives this
+            // release: reader/forward holders keep their own references,
+            // this one is only the registry's.
+            const deadline = nowMs(self.io) + @as(i64, @intCast(GOAWAY_BUDGET_MS));
+            _ = o.writeFrameByDeadline(.goaway, 0, &.{"replaced by a new link"}, deadline);
             o.kill();
             o.release();
         }
@@ -377,15 +454,14 @@ pub const Hub = struct {
         return out.items;
     }
 
-    /// Kill every registered link (tests and shutdown).
+    /// Kill every registered link (tests and shutdown). Iterates the
+    /// registry directly under the mutex — no snapshot allocation — so the
+    /// sweep cannot silently skip links under memory pressure.
     pub fn killAll(self: *Hub) void {
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const links = self.snapshot(arena_state.allocator()) catch return;
-        for (links) |ln| {
-            ln.kill();
-            ln.release();
-        }
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.registry.valueIterator();
+        while (it.next()) |v| v.*.kill();
     }
 };
 
@@ -404,6 +480,12 @@ pub const Link = struct {
     conn: Conn,
     name: []u8,
     connected_at: Io.Timestamp,
+    /// Frame-key state, installed after the WELCOME went out (untagged,
+    /// like every handshake frame), so the tags start with the first
+    /// post-handshake frame — on plaintext and TLS links alike (see
+    /// link.zig); tx_seq is guarded by write_mutex, rx_seq by the reader
+    /// thread.
+    frame_auth: ?link.FrameAuth = null,
     write_mutex: Io.Mutex = .init,
     refs: std.atomic.Value(u32) = .init(1),
     dead: std.atomic.Value(bool) = .init(false),
@@ -428,6 +510,7 @@ pub const Link = struct {
 
     pub fn release(self: *Link) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (self.frame_auth) |*fa| fa.secureZero();
         connDeinit(self.conn);
         self.stream.close(self.hub.io);
         self.waiters.deinit(gpa);
@@ -453,24 +536,121 @@ pub const Link = struct {
     fn writeFrame(self: *Link, kind: link.FrameType, sid: u32, parts: []const []const u8) void {
         if (self.dead.load(.acquire)) return;
         const io = self.hub.io;
-        const timeout_ms = @as(u64, self.hub.cfg.socket_timeout_s) * 1000;
         self.write_mutex.lockUncancelable(io);
         defer self.write_mutex.unlock(io);
+        self.writeFrameLocked(kind, sid, parts, @as(u64, self.hub.cfg.socket_timeout_s) * 1000);
+    }
+
+    /// Write one frame with the caller's write budget; the write mutex must
+    /// already be held (see writeFrame and writeFrameByDeadline). On POSIX
+    /// the write bound is carried by SO_SNDTIMEO on the fd, not by the
+    /// timeout parameter (see os.net socketWriteAll), so a budget below the
+    /// accept-time bound is enforced by temporarily tightening the option —
+    /// under the write mutex, which serializes every writer of this link,
+    /// no other I/O can observe the temporary value. The TLS reader never
+    /// writes and mbedtls reads do not use the send bound, so the
+    /// tightening is invisible to it as well. The get/set calls themselves
+    /// run on every platform: on Windows getSocketSendTimeoutMs returns
+    /// null (its socketWriteAll already enforces the timeout_ms parameter
+    /// in software through the overlapped wait) and setSocketSendTimeoutMs
+    /// is a no-op, so the tightening never arms there — the budget rides
+    /// the software deadline instead.
+    fn writeFrameLocked(self: *Link, kind: link.FrameType, sid: u32, parts: []const []const u8, timeout_ms: u64) void {
+        const auth: ?*link.FrameAuth = if (self.frame_auth) |*fa| fa else null;
         // kill() never takes the write mutex, so calling it here is safe.
-        link.writeFramePartsOn(self.conn, kind, sid, parts, timeout_ms) catch self.kill();
+        // For TLS links this same mutex is installed in the conn's `lock`
+        // (see authenticate): the reader takes it only around
+        // mbedtls_ssl_read (tls_server sslReadLocked), which never blocks
+        // on the socket, so a frame write never queues behind an idle
+        // reader's socket wait.
+        var tightened_fd: ?os.net.Handle = null;
+        var saved_send_ms: u64 = 0;
+        if (self.connFd()) |fd| {
+            if (os.net.getSocketSendTimeoutMs(fd)) |cur| {
+                // 0 = "no bound": larger than any finite budget.
+                const cur_ms: u64 = if (cur == 0) std.math.maxInt(u64) else cur;
+                if (cur_ms > timeout_ms) {
+                    if (os.net.setSocketSendTimeoutMs(fd, timeout_ms)) |_| {
+                        tightened_fd = fd;
+                        saved_send_ms = cur;
+                    } else |_| {}
+                }
+            }
+        }
+        defer if (tightened_fd) |fd| {
+            os.net.setSocketSendTimeoutMs(fd, saved_send_ms) catch {};
+        };
+        link.writeFramePartsOn(self.conn, auth, kind, sid, parts, timeout_ms) catch self.kill();
+    }
+
+    /// writeFrame bounded by one absolute awake-clock `deadline` on the
+    /// WHOLE operation, mutex admission included: the probe's budget must
+    /// also cover the time spent waiting for a slow (backpressured, mid
+    /// large-frame) writer to release the link's write mutex, or the
+    /// handshake slot would sit occupied past the window in which a new
+    /// HELLO may take the name over. Admission is a tryLock loop polled on
+    /// the awake clock with a small sleep — Mutex has no timed wait, and a
+    /// futex park would not be cancelable by the deadline anyway; the
+    /// holder releases within one frame write, so the poll is cheap.
+    /// Returns false when the budget expired (or the link died) before the
+    /// PING could go out — the link is dead in the probe's sense either
+    /// way. After acquisition `dead` is rechecked and the transport write
+    /// gets only the REMAINING budget, so partial writes cannot stretch
+    /// the absolute deadline: the probe frame is a small single write, and
+    /// SO_SNDTIMEO (POSIX) or the software deadline (Windows) bounds it by
+    /// exactly that remainder.
+    fn writeFrameByDeadline(self: *Link, kind: link.FrameType, sid: u32, parts: []const []const u8, deadline: i64) bool {
+        const io = self.hub.io;
+        while (!self.write_mutex.tryLock()) {
+            if (self.dead.load(.acquire)) return false;
+            if (nowMs(io) >= deadline) return false;
+            os.sleepMs(PROBE_MUTEX_STEP_MS);
+        }
+        defer self.write_mutex.unlock(io);
+        if (self.dead.load(.acquire)) return false;
+        const left = deadlineLeftMs(deadline, nowMs(io));
+        if (left == 0) return false;
+        self.writeFrameLocked(kind, sid, parts, left);
+        return true;
+    }
+
+    /// The fd carrying this link's socket I/O, for per-write send-bound
+    /// adjustments in writeFrameLocked. Both conn variants expose it.
+    fn connFd(self: *Link) ?os.net.Handle {
+        if (build_options.tls_server) {
+            return switch (self.conn) {
+                .plain => |plain| plain.fd,
+                .tls => |t| t.fd,
+            };
+        }
+        return self.conn.fd;
     }
 
     /// PING the peer and wait up to PROBE_MS for any inbound frame.
     fn answersProbe(self: *Link) bool {
+        return self.answersProbeWithin(PROBE_MS);
+    }
+
+    /// The probe deadline is measured on the awake clock, not by counting
+    /// nominal sleep steps: a slow PING write (big frame ahead of ours, a
+    /// full peer receive buffer) must not stretch the window in which a
+    /// new HELLO may take the name over — the hub decides exactly
+    /// PROBE_MS after the probe started, whatever the steps took. The
+    /// budget therefore covers the WHOLE probe: the deadline is armed
+    /// BEFORE anything else, the write mutex admission and the PING write
+    /// are both capped by what is left of it (see writeFrameByDeadline),
+    /// and the wait loop below only spends the remainder.
+    fn answersProbeWithin(self: *Link, probe_ms: u64) bool {
+        const io = self.hub.io;
+        const deadline = nowMs(io) + @as(i64, @intCast(probe_ms));
         const seen = self.rx_frames.load(.acquire);
-        self.writeFrame(.ping, 0, &.{"probe"});
-        var waited: u64 = 0;
-        while (waited < PROBE_MS) : (waited += PROBE_STEP_MS) {
+        if (!self.writeFrameByDeadline(.ping, 0, &.{"probe"}, deadline)) return false;
+        while (true) {
             if (self.dead.load(.acquire)) return false;
             if (self.rx_frames.load(.acquire) != seen) return true;
+            if (nowMs(io) >= deadline) return false;
             os.sleepMs(PROBE_STEP_MS);
         }
-        return false;
     }
 
     fn nextSid(self: *Link) u32 {
@@ -611,28 +791,65 @@ const Authenticated = struct {
     name: []const u8,
     /// WELCOME payload carrying the hub's own proof of the secret.
     welcome: []const u8,
+    /// Frame-key state for the link (the caller installs it on the link
+    /// once the (untagged) WELCOME went out) — armed on every link, TLS
+    /// included: the wire format must not depend on the local transport,
+    /// or a TLS terminator in front of a plaintext hub would leave the
+    /// ends disagreeing after a handshake that still completes.
+    frame_auth: link.FrameAuth,
 };
 
 /// Key for the MAC computed when a pinned name is unknown, so that path
 /// costs the same HMAC as a bad MAC for a known name.
 const DUMMY_KEY = "mcp-node-reverse-unknown-name";
 
+/// Time left of a handshake window of `budget_ms` counted from `started`
+/// on the awake clock; 0 once it passed. The handshake's reads already
+/// measure this way (readFrameWithinOn); its writes measure the same.
+fn handshakeLeftMs(hub: *Hub, started: Io.Timestamp, budget_ms: u64) u64 {
+    const elapsed_i = started.untilNow(hub.io, .awake).toMilliseconds();
+    const elapsed: u64 = if (elapsed_i > 0) @intCast(elapsed_i) else 0;
+    return if (elapsed >= budget_ms) 0 else budget_ms - elapsed;
+}
+
+/// Best-effort refusal GOAWAY inside the handshake budget (see handshake):
+/// what is left of the window bounds the write, a spent window skips it.
+fn handshakeRefuse(hub: *Hub, conn: Conn, timeout_ms: u64, started: Io.Timestamp, budget_ms: u64, text: []const u8) void {
+    const left = handshakeLeftMs(hub, started, budget_ms);
+    if (left == 0) return;
+    link.writeFramePartsOn(conn, null, .goaway, 0, &.{text}, @min(timeout_ms, left)) catch {};
+}
+
 /// Authenticate a freshly accepted peer over `conn`. Returns the node name
 /// and the WELCOME payload (in `arena`) or an error after sending GOAWAY
-/// where that makes sense. `started` bounds the whole handshake phase
-/// (transport setup included) to HANDSHAKE_MS.
-fn handshake(hub: *Hub, arena: Allocator, conn: Conn, started: Io.Timestamp) !Authenticated {
+/// where that makes sense. `started` bounds the HELLO exchange — reads AND
+/// writes — to `budget_ms`; a transport (TLS) handshake, when the build has
+/// one, runs before this on its own separate budget (see authenticate).
+fn handshake(hub: *Hub, arena: Allocator, conn: Conn, started: Io.Timestamp, budget_ms: u64) !Authenticated {
     const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
     var nonce: [link.NONCE_LEN]u8 = undefined;
+    // The handshake's writes share its ONE budget with the
+    // reads: the CHALLENGE and every refusal GOAWAY take what is left of
+    // `budget_ms`, never the accept-armed socket timeout — mirroring the
+    // node side, which bounds its HELLO send the same way
+    // (handshakeWithin). A peer that stops reading must not stretch the
+    // handshake slot through a blocked send; with the budget spent the
+    // refusal write is skipped and the stream close carries the message.
+    // (POSIX plain-socket caveat, the same one the node carries: the
+    // syscall bound of socketWriteAll rides SO_SNDTIMEO there, so the
+    // parameter tightens the write over TLS and on Windows; the
+    // left == 0 skip holds on every platform.)
+    const challenge_left = handshakeLeftMs(hub, started, budget_ms);
+    if (challenge_left == 0) return error.LinkTimeout;
     try hub.io.randomSecure(&nonce);
-    try link.writeFramePartsOn(conn, .challenge, 0, &.{&nonce}, timeout_ms);
-    const frame = try link.readFrameWithinOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, hub.io, started, HANDSHAKE_MS);
+    try link.writeFramePartsOn(conn, null, .challenge, 0, &.{&nonce}, @min(timeout_ms, challenge_left));
+    const frame = try link.readFrameWithinOn(arena, conn, null, link.MAX_HANDSHAKE_PAYLOAD, hub.io, started, budget_ms);
     if (frame.kind != .hello) {
-        link.writeFramePartsOn(conn, .goaway, 0, &.{"expected hello"}, timeout_ms) catch {};
+        handshakeRefuse(hub, conn, timeout_ms, started, budget_ms, "expected hello");
         return error.BadHello;
     }
     const hello = link.parseHello(arena, frame.payload) catch |err| {
-        link.writeFramePartsOn(conn, .goaway, 0, &.{"bad hello"}, timeout_ms) catch {};
+        handshakeRefuse(hub, conn, timeout_ms, started, budget_ms, "bad hello");
         return err;
     };
     const secret = hub.secrets.lookup(hello.name);
@@ -640,11 +857,18 @@ fn handshake(hub: *Hub, arena: Allocator, conn: Conn, started: Io.Timestamp) !Au
     // work: the unknown-name path still computes one HMAC, with a dummy key.
     const mac_ok = link.verifyAuth(.node, secret orelse DUMMY_KEY, &nonce, &hello.nonce, hello.name, hello.auth);
     if (!(mac_ok and secret != null)) {
-        link.writeFramePartsOn(conn, .goaway, 0, &.{"auth failed"}, timeout_ms) catch {};
+        handshakeRefuse(hub, conn, timeout_ms, started, budget_ms, "auth failed");
         return error.AuthFailed;
     }
     const welcome = try link.buildWelcome(arena, secret.?, &nonce, &hello.nonce, hello.name);
-    return .{ .name = hello.name, .welcome = welcome };
+    // Session keys for the frames that follow: both nonces bind them to
+    // this exact handshake. Armed on every link, TLS included — the frame
+    // format must not depend on the local transport (see link.zig).
+    return .{
+        .name = hello.name,
+        .welcome = welcome,
+        .frame_auth = link.FrameAuth.init(.hub, secret.?, &nonce, &hello.nonce),
+    };
 }
 
 const Accepted = struct { hub: *Hub, stream: Io.net.Stream, source: Source };
@@ -685,9 +909,16 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
         stream.close(hub.io);
         return null;
     };
-    // One deadline for the whole handshake phase: a transport handshake
-    // (when the build has one) and the HELLO exchange share HANDSHAKE_MS.
+    // The transport handshake (when the build has one) gets its own full
+    // HANDSHAKE_MS budget; the HELLO exchange below gets another full
+    // budget counted from `link_started`. They are re-armed separately on
+    // purpose: a slow but legitimate TLS handshake (say, 8 s on a bad
+    // link) must not leave the protocol exchange with a spent deadline —
+    // that would time out honest nodes and count as their failure toward
+    // the per-source ban. Worst case for one unauthenticated peer is
+    // therefore 2 x HANDSHAKE_MS, still bounded by the handshake slots.
     const started = Io.Clock.awake.now(hub.io);
+    var link_started = started;
     var conn = plainConn(fd);
     var conn_taken = false;
     defer if (!conn_taken) connDeinit(conn);
@@ -707,9 +938,12 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
                 return null;
             };
             conn = .{ .tls = tc };
+            // The transport handshake finished: the protocol handshake
+            // gets a fresh budget from this moment, not TLS's leftovers.
+            link_started = Io.Clock.awake.now(hub.io);
         }
     }
-    const auth = handshake(hub, arena_state.allocator(), conn, started) catch |err| {
+    var auth = handshake(hub, arena_state.allocator(), conn, link_started, HANDSHAKE_MS) catch |err| {
         std.debug.print("hub handshake failed: {s}\n", .{@errorName(err)});
         audit.linkFail(aw, peer_s, @errorName(err));
         // Out of memory, no entropy or shutdown is ours; everything else
@@ -723,6 +957,8 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
         return null;
     };
     outcome = .authenticated;
+    // Zero the local copy of the frame keys once the link owns its own.
+    defer auth.frame_auth.secureZero();
     // Two live processes under one name would otherwise evict each other
     // forever. Keep the link that still answers; refuse the newcomer before
     // WELCOME, so it learns why and retries only at its backoff. Only an
@@ -730,8 +966,12 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
     if (hub.nameHeldByLiveLink(auth.name)) {
         std.debug.print("hub: refused a second link for '{s}': " ++ NAME_IN_USE ++ "\n", .{auth.name});
         audit.linkFail(aw, peer_s, "NameInUse");
-        const timeout_ms = @as(u64, hub.cfg.socket_timeout_s) * 1000;
-        link.writeFramePartsOn(conn, .goaway, 0, &.{NAME_IN_USE}, timeout_ms) catch {};
+        // The refusal rides the SAME unified budget as the handshake's own
+        // writes (see handshakeRefuse): what is left of the protocol
+        // handshake window bounds the GOAWAY. The probe may have spent the
+        // rest by then — in which case the peer learns the refusal from
+        // the close alone.
+        handshakeRefuse(hub, conn, @as(u64, hub.cfg.socket_timeout_s) * 1000, link_started, HANDSHAKE_MS, NAME_IN_USE);
         stream.close(hub.io);
         return null;
     }
@@ -740,7 +980,23 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
         return null;
     };
     conn_taken = true; // the link owns the transport state from here on
+    // The TLS conn's mbedTLS context is shared between the link reader and
+    // every frame writer from this point on: install the link's write
+    // mutex into the conn before anything else can reach the link (the
+    // WELCOME write, registration). The reader takes it only around
+    // mbedtls_ssl_read, which answers from the conn's ciphertext buffer
+    // and never blocks on the socket (see tls_server.zig); the socket
+    // wait itself (fillRaw) runs without it, so writers stay free.
+    // Writers themselves already hold this same mutex in Link.writeFrame.
+    if (build_options.tls_server) {
+        if (conn == .tls) conn.tls.lock = &ln.write_mutex;
+    }
+    // The WELCOME is the last untagged frame: it is part of the handshake
+    // (the node verifies it before it arms its own tags). Frame tags and
+    // their sequence numbers start at 0 with the next frame, so the keys
+    // are installed only after this write.
     ln.writeFrame(.welcome, 0, &.{auth.welcome});
+    ln.frame_auth = auth.frame_auth;
     if (ln.dead.load(.acquire)) {
         ln.release();
         return null;
@@ -755,10 +1011,11 @@ fn authenticate(hub: *Hub, stream: Io.net.Stream, source: Source) ?*Link {
 }
 
 fn readLoop(ln: *Link) !void {
+    const auth: ?*link.FrameAuth = if (ln.frame_auth) |*fa| fa else null;
     while (!ln.dead.load(.acquire)) {
         // Any inbound frame refreshes liveness: the per-read idle bound is
         // the 45 s silence limit.
-        const frame = try link.readFrameOn(gpa, ln.conn, link.MAX_PAYLOAD, DEAD_AFTER_MS);
+        const frame = try link.readFrameOn(gpa, ln.conn, auth, link.MAX_PAYLOAD, DEAD_AFTER_MS);
         _ = ln.rx_frames.fetchAdd(1, .acq_rel);
         switch (frame.kind) {
             .resp => ln.fulfil(frame.stream_id, frame.payload), // takes payload
@@ -804,6 +1061,11 @@ fn pinger(hub: *Hub) void {
 /// handshake budget (global or per source) is spent or the source is
 /// banned after repeated failed handshakes.
 pub fn adopt(hub: *Hub, stream: Io.net.Stream) void {
+    // A stop() may land between the accept loop's check and this call.
+    if (hub.stopping.load(.acquire)) {
+        stream.close(hub.io);
+        return;
+    }
     if (hub.handshakes.fetchAdd(1, .acq_rel) >= MAX_PENDING_HANDSHAKES) {
         _ = hub.handshakes.fetchSub(1, .acq_rel);
         stream.close(hub.io);
@@ -839,20 +1101,80 @@ pub fn adopt(hub: *Hub, stream: Io.net.Stream) void {
 
 fn acceptLoop(hub: *Hub, server: *Io.net.Server) void {
     while (!hub.stopping.load(.acquire)) {
-        const stream = server.accept(hub.io) catch |err| {
+        if (comptime builtin.os.tag != .windows) {
+            // POSIX: poll the listener together with the stop wake pipe —
+            // stop() retracts this thread without allocating a new socket
+            // (a self-connect would fail under fd exhaustion). The listen
+            // fd is non-blocking (set in start), so a queue drained by a
+            // reset between poll and accept answers null, never a park.
+            var pfds: [2]std.posix.pollfd = .{
+                .{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = hub.wake_rfd orelse -1, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            _ = std.posix.poll(&pfds, 1000) catch { // tick is a fallback
+                if (!hub.stopping.load(.acquire)) os.sleepMs(ACCEPT_BACKOFF_MS);
+                continue;
+            };
             if (hub.stopping.load(.acquire)) return;
-            std.debug.print("hub accept failed: {s}\n", .{@errorName(err)});
-            os.sleepMs(ACCEPT_BACKOFF_MS);
+            if (pfds[1].revents & std.posix.POLL.IN != 0) return; // wake byte
+            if (pfds[0].revents & std.posix.POLL.IN == 0) continue; // tick
+            // Drain every pending connection before polling again.
+            while (os.net.acceptNonBlocking(server.socket.handle)) |stream| {
+                if (hub.stopping.load(.acquire)) {
+                    stream.close(hub.io);
+                    return;
+                }
+                adopt(hub, stream);
+            }
             continue;
+        }
+        // Windows: WSAPoll the listener and the pre-created wake channel:
+        // stop() lands one byte on it, so retracting this thread
+        // never needs a fresh socket. The 1 s tick is a fallback only.
+        var pfds: [2]os.net.WSAPOLLFD = .{
+            .{ .fd = server.socket.handle, .events = os.net.POLLRDNORM, .revents = 0 },
+            .{ .fd = if (hub.wake_recv) |*st| st.socket.handle else server.socket.handle, .events = if (hub.wake_recv != null) os.net.POLLRDNORM else 0, .revents = 0 },
         };
-        adopt(hub, stream);
+        if (os.net.wsaPoll(&pfds, 1000) < 0) {
+            if (!hub.stopping.load(.acquire)) os.sleepMs(ACCEPT_BACKOFF_MS);
+            continue;
+        }
+        if (hub.stopping.load(.acquire)) return;
+        if (hub.wake_recv != null and pfds[1].revents != 0) return; // wake byte
+        if (pfds[0].revents & os.net.POLLRDNORM == 0) {
+            if (pfds[0].revents & (os.net.POLLERR | os.net.POLLHUP | os.net.POLLNVAL) != 0) {
+                std.debug.print("hub listener poll failed\n", .{});
+                os.sleepMs(ACCEPT_BACKOFF_MS);
+            }
+            continue; // tick
+        }
+        // Raw non-blocking accepts (FIONBIO listener, set in start): a
+        // queue drained between poll and accept answers null instead of
+        // parking this thread beyond the wake's reach. std's
+        // Io.net accept is never used on this socket.
+        while (os.net.acceptNonBlocking(server.socket.handle)) |stream| {
+            if (hub.stopping.load(.acquire)) {
+                stream.close(hub.io);
+                return;
+            }
+            adopt(hub, stream);
+        }
     }
 }
 
 /// Open the node-link listener and start the accept and pinger threads.
+/// Both threads are joinable (their handles live on the hub): a later
+/// startup failure — here or in main — retracts them through stop()
+/// instead of unwinding shared state under detached threads.
 /// `server` must outlive the hub (main keeps it for the process lifetime).
 pub fn start(hub: *Hub, server: *Io.net.Server) !void {
     const ep = hub.cfg.hub_listen orelse return error.NoHubListen;
+    // One rollback owner for everything start() acquires — TLS state, the
+    // wake channel, the listener, both threads. stop() tolerates each
+    // piece being absent, so this single errdefer covers every failure,
+    // including TLS setup and listener acquisition themselves.
+    var server_opt: ?*Io.net.Server = null;
+    errdefer stop(hub, server_opt);
     if (build_options.tls_server) {
         if (hub.cfg.hub_tls_cert_file) |cert_file| {
             const srv = tls_server.Server.init(hub.io, cert_file, hub.cfg.hub_tls_key_file.?) catch |err| {
@@ -864,11 +1186,101 @@ pub fn start(hub: *Hub, server: *Io.net.Server) !void {
         }
     }
     const addr = try Io.net.IpAddress.parse(ep.host, ep.port);
+    // The accept loop's wake channel exists before any thread: stop() must
+    // never depend on allocating a fresh socket under teardown. POSIX uses
+    // a pipe; Windows a pre-connected loopback pair.
+    if (comptime builtin.os.tag == .windows) {
+        const loop = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        var wls = try os.net.listenTcp(hub.io, loop);
+        defer wls.deinit(hub.io); // the established pair outlives its listener
+        hub.wake_send = try wls.socket.address.connect(hub.io, .{ .mode = .stream });
+        hub.wake_recv = try wls.accept(hub.io);
+    } else {
+        const pair = proc.createWakePipe() orelse return error.WakePipeFailed;
+        hub.wake_rfd = pair[0];
+        hub.wake_wfd = pair[1];
+    }
     server.* = try os.net.listenTcp(hub.io, addr); // no SO_REUSEPORT, see os.net
+    server_opt = server;
+    // The accept loop polls and then accepts raw/non-blocking: the listen
+    // fd must not block between poll and accept (queue drained by a reset).
+    try os.net.setListenNonBlocking(server.socket.handle);
     const a = try std.Thread.spawn(.{}, acceptLoop, .{ hub, server });
-    a.detach();
+    hub.accept_thread = a;
     const p = try std.Thread.spawn(.{}, pinger, .{hub});
-    p.detach();
+    hub.pinger_thread = p;
+}
+
+/// Stop the hub's infrastructure and link threads, close the listener and
+/// release TLS state. Called by start's own rollback (pinger spawn
+/// failure) and by main's errdefer once the hub is up, so no startup
+/// failure unwinds arenas or the Io while hub threads still borrow them.
+pub fn stop(hub: *Hub, server: ?*Io.net.Server) void {
+    // Set stopping under the registry mutex: a register either completes
+    // before this section (and is swept by killAll below) or observes
+    // stopping afterwards and is refused — no link can be registered
+    // after the kill sweep.
+    hub.mutex.lockUncancelable(hub.io);
+    hub.stopping.store(true, .release);
+    hub.mutex.unlock(hub.io);
+    hub.killAll();
+    // Wake the parked accept without allocating anything at teardown time.
+    // POSIX: one byte into the pre-created wake pipe (non-blocking; a full
+    // pipe means "already signaled"). Windows: one byte over the
+    // pre-connected loopback pair; the self-connect remains only as the
+    // fallback for a hub whose wake-channel creation failed.
+    if (comptime builtin.os.tag == .windows) {
+        if (hub.wake_send) |*st| {
+            os.net.socketWriteAll(st.socket.handle, "!", 1000) catch {};
+        } else if (server) |srv| {
+            if (srv.socket.address.connect(hub.io, .{ .mode = .stream })) |st2| {
+                st2.close(hub.io);
+            } else |_| {}
+        }
+    } else if (hub.wake_wfd) |wfd| {
+        var byte = [_]u8{1};
+        os.writeAllFd(wfd, &byte) catch {};
+    }
+    if (hub.accept_thread) |t| {
+        t.join();
+        hub.accept_thread = null;
+    }
+    if (hub.pinger_thread) |t| {
+        t.join();
+        hub.pinger_thread = null;
+    }
+    // Link/reader threads: progress-guaranteed exit, no deadline — killed
+    // links break their sockets (readers fail out of readLoop), and
+    // handshake-stage threads hold the bounded HANDSHAKE_MS budget, so
+    // every borrower of hub/cfg/io exits on its own. A deadline here would
+    // only authorize freeing state a live thread still borrows.
+    while (hub.threads.load(.acquire) != 0) os.sleepMs(5);
+    if (server) |srv| srv.deinit(hub.io);
+    if (comptime builtin.os.tag == .windows) {
+        if (hub.wake_send) |*st| {
+            st.close(hub.io);
+            hub.wake_send = null;
+        }
+        if (hub.wake_recv) |*st| {
+            st.close(hub.io);
+            hub.wake_recv = null;
+        }
+    } else {
+        if (hub.wake_rfd) |fd| {
+            os.closeFd(fd);
+            hub.wake_rfd = null;
+        }
+        if (hub.wake_wfd) |fd| {
+            os.closeFd(fd);
+            hub.wake_wfd = null;
+        }
+    }
+    if (build_options.tls_server) {
+        if (hub.tls) |srv| {
+            srv.deinit();
+            hub.tls = null;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -910,8 +1322,10 @@ fn tcpPair(io: Io, server: *Io.net.Server) !Pair {
 }
 
 fn waitZero(v: *std.atomic.Value(u32)) !void {
+    // 15 s ceiling: the legitimate work this waits on can take ~3.5 s, and
+    // CI runners under load add seconds of scheduling slack.
     var spins: u32 = 0;
-    while (v.load(.acquire) != 0 and spins < 1000) : (spins += 1) os.sleepMs(5);
+    while (v.load(.acquire) != 0 and spins < 3000) : (spins += 1) os.sleepMs(5);
     try testing.expectEqual(@as(u32, 0), v.load(.acquire));
 }
 
@@ -967,7 +1381,7 @@ test "hub registry: a new link for a name replaces the old one" {
     try testing.expect(w.event.isSet());
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const ga = try link.readFrame(arena_state.allocator(), p1.far.socket.handle, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    const ga = try link.readFrame(arena_state.allocator(), p1.far.socket.handle, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.goaway, ga.kind);
 
     const cur = fx.hub.acquire("pc").?;
@@ -1006,7 +1420,7 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
     // Fulfil: a peer thread answers the REQ with the same stream_id.
     const Peer = struct {
         fn answer(owner: *Link, fd: os.net.Handle) void {
-            const f = link.readFrame(gpa, fd, link.MAX_PAYLOAD, 5000) catch return;
+            const f = link.readFrame(gpa, fd, null, link.MAX_PAYLOAD, 5000) catch return;
             defer gpa.free(f.payload);
             const resp = gpa.alloc(u8, 2 + f.payload.len) catch return;
             std.mem.writeInt(u16, resp[0..2], 201, .big);
@@ -1033,7 +1447,7 @@ test "hub waiter: fulfil, timeout with late RESP, and link loss" {
     ln.fulfil(before, stale);
     try testing.expectEqual(@as(usize, 0), ln.waiterCount());
     // drain the REQ frame the peer side never answered
-    _ = try link.readFrame(arena, far, link.MAX_PAYLOAD, 5000);
+    _ = try link.readFrame(arena, far, null, link.MAX_PAYLOAD, 5000);
 
     // Loss: the link dies while a request waits.
     const Killer = struct {
@@ -1057,6 +1471,230 @@ test "hub relay deadline is at least one hour" {
     try testing.expectEqual(MIN_FORWARD_MS, forwardDeadlineMs(&cfg));
     cfg.socket_timeout_s = 7200;
     try testing.expectEqual(@as(u64, 7200 * 1000), forwardDeadlineMs(&cfg));
+}
+
+test "hub probe deadline follows the awake clock" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const ln = try Link.create(&fx.hub, p.near, plainConn(p.near.socket.handle), "pc");
+    defer ln.release();
+
+    // A silent peer: the probe fails at its awake deadline (not after a
+    // counted number of nominal 50 ms steps, and not instantly either).
+    const t0 = Io.Clock.awake.now(io);
+    try testing.expect(!ln.answersProbeWithin(300));
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    try testing.expect(took >= 250);
+    try testing.expect(took < 2_000);
+
+    // A frame arriving inside the window answers the probe at once.
+    const Bump = struct {
+        fn run(owner: *Link) void {
+            os.sleepMs(100);
+            _ = owner.rx_frames.fetchAdd(1, .acq_rel);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Bump.run, .{ln});
+    try testing.expect(ln.answersProbeWithin(300));
+    t.join();
+}
+
+test "hub probe budget covers the PING write" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    // Old behavior: the PING write carried the whole socket timeout (2 s
+    // here, fd-bound to 1 s below) and the probe deadline was armed only
+    // AFTER the write returned, so a blocked write stretched the window
+    // in which a new HELLO may take the name over.
+    fx.cfg.socket_timeout_s = 2;
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const ln = try Link.create(&fx.hub, p.near, plainConn(p.near.socket.handle), "pc");
+    defer ln.release();
+    const near_fd = p.near.socket.handle;
+    // 1 s send bound (below the 2 s socket timeout) and a shrunken pipe,
+    // then fill it with junk the silent peer never reads. The fill loop
+    // ends only on WriteFailed — a POSIX send with zero progress in a
+    // whole SO_SNDTIMEO window — proving the kernel cannot take another
+    // byte: whatever this link writes next must block.
+    try os.net.setSocketTimeouts(near_fd, 1);
+    try std.posix.setsockopt(near_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&@as(c_int, 8192)));
+    try std.posix.setsockopt(near_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&@as(c_int, 8192)));
+    var junk: [128 * 1024]u8 = undefined;
+    @memset(&junk, 0x6a);
+    while (true) {
+        _ = (link.FdConn{ .fd = near_fd }).write(&junk, 1_000) catch break;
+    }
+
+    const t0 = Io.Clock.awake.now(io);
+    try testing.expect(!ln.answersProbeWithin(250));
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    // Fixed behavior: the write is capped by the probe budget. It fails
+    // ~250 ms in (the tightened SO_SNDTIMEO), the kill lands, and the
+    // probe ends at its window. Old behavior red-lines this assert: the
+    // PING blocked the full 1 s fd send bound (and the old deadline
+    // arming then added the 250 ms wait on top), running ~4x over the
+    // budget. With no reader the blocked send is deterministic — it fails
+    // exactly at SO_SNDTIMEO; nothing drains the pipe, so no wake-up race.
+    try testing.expect(took >= 150);
+    try testing.expect(took < 700);
+}
+
+test "hub probe budget bounds the write mutex admission" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const ln = try Link.create(&fx.hub, p.near, plainConn(p.near.socket.handle), "pc");
+    defer ln.release();
+
+    // The probe deadline must bound the time spent QUEUING
+    // for the write mutex, not only the PING write and the wait. A helper
+    // (a backpressured writer mid large frame) holds the mutex far past
+    // the 300 ms probe budget; the probe must still decide within its
+    // window, so the handshake slot frees for a new HELLO instead of
+    // parking behind the stuck writer. Old behavior red-lines this: the
+    // uncancelable lock parks the probe for the holder's full 2 s.
+    const Holder = struct {
+        fn run(owner: *Link) void {
+            const holder_io = owner.hub.io;
+            owner.write_mutex.lockUncancelable(holder_io);
+            defer owner.write_mutex.unlock(holder_io);
+            os.sleepMs(2000);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Holder.run, .{ln});
+    // Let the holder actually take the mutex before the probe starts.
+    os.sleepMs(100);
+
+    const t0 = Io.Clock.awake.now(io);
+    try testing.expect(!ln.answersProbeWithin(300));
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    t.join();
+    // It really spent its budget deciding (not an instant false)...
+    try testing.expect(took >= 250);
+    // ...and the budget, not the holder's 2 s, ended the probe.
+    try testing.expect(took < 1000);
+}
+
+// The same stuck writer that fails the probe must not also
+// park Hub.register: the replacement GOAWAY runs on a small deadline
+// (mutex admission included) and kill() breaks the blocked send instead.
+// Old behavior: register's writeFrame took the old link's write mutex
+// with an UNCANCELABLE lock and waited out the holder — with the new link
+// already in the registry, its reader not started, and the handshake slot
+// occupied the whole while.
+test "hub register does not park behind the old link's stuck writer" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The old link for "pc": registered, its peer silent, its write mutex
+    // held by a writer that outlives the probe budget AND the GOAWAY
+    // budget — the exact writer that just failed the probe.
+    const p1 = try tcpPair(io, &fx.server);
+    defer p1.far.close(io);
+    const a = try Link.create(&fx.hub, p1.near, plainConn(p1.near.socket.handle), "pc");
+    try fx.hub.register(a);
+    const Holder = struct {
+        fn run(owner: *Link) void {
+            const holder_io = owner.hub.io;
+            owner.write_mutex.lockUncancelable(holder_io);
+            defer owner.write_mutex.unlock(holder_io);
+            os.sleepMs(PROBE_MS + GOAWAY_BUDGET_MS + 1200);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Holder.run, .{a});
+    os.sleepMs(100); // the holder really holds the mutex by now
+
+    // A real node takes the name over: the probe on the old link fails at
+    // its own budget, and register replaces the old link on GOAWAY_BUDGET
+    // — not on the holder's clock.
+    var ncfg = try testConfig(arena, .node);
+    var budget = InflightBudget{ .io = io, .max = ncfg.max_inflight_bytes };
+    ncfg.inflight = &budget;
+    var node = node_link.Node{ .io = io, .cfg = &ncfg };
+    const p2 = try tcpPair(io, &fx.server);
+    adopt(&fx.hub, p2.near);
+    var result: anyerror!u64 = error.NotRun;
+    const tnode = try std.Thread.spawn(.{}, nodeSessionThread, .{ &node, p2.far, &result });
+
+    const t0 = Io.Clock.awake.now(io);
+    const ln = try waitRegistered(&fx.hub, "pc");
+    ln.release();
+    // handshakes back to 0 == authenticate really returned (register done).
+    try waitZero(&fx.hub.handshakes);
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    // The probe spent its full budget deciding (the mutex never freed)...
+    try testing.expect(took >= 2500);
+    // ...and the takeover ended ≈PROBE_MS+GOAWAY+ε, NOT on the holder's
+    // clock: old behavior parked register behind the stuck writer for the
+    // whole ~4.7 s hold. The threshold sits between the two behaviors with
+    // slack for loaded CI; the forward below is the timing-free half of the
+    // same invariant (the new link serves while the old writer still holds).
+    try testing.expect(took < 4600);
+
+    // forward on the NEW link works while the old writer still holds.
+    const res = try forward(&fx.hub, arena, "pc", "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}", 5000, null);
+    try testing.expectEqual(@as(u16, 200), res.resp.status);
+
+    fx.hub.killAll();
+    tnode.join();
+    try testing.expectError(error.LinkClosed, result);
+    try waitZero(&node.workers);
+    try waitZero(&fx.hub.threads);
+    // The holder releases the mutex before the object it guards is freed.
+    t.join();
+    a.release();
+}
+
+// The handshake's writes live inside the same window as its
+// reads. A spent window sends no CHALLENGE at all (old behavior armed the
+// write with the full socket timeout); a fresh one bounds the exchange.
+test "hub handshake writes live inside the handshake budget" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const conn = plainConn(p.near.socket.handle);
+    const fd = p.far.socket.handle;
+
+    // Window spent before the CHALLENGE: the write is skipped, the call
+    // fails on the deadline, and nothing reaches the peer.
+    const stale = Io.Clock.awake.now(io);
+    os.sleepMs(150);
+    try testing.expectError(error.LinkTimeout, handshake(&fx.hub, arena, conn, stale, 100));
+    var probe: [1]u8 = undefined;
+    try testing.expectError(error.LinkTimeout, (link.FdConn{ .fd = fd }).readSome(&probe, 250));
+
+    // Fresh window: the CHALLENGE goes out (peer sees it after the fact),
+    // then the silent peer fails the HELLO read at the same small budget.
+    const fresh = Io.Clock.awake.now(io);
+    try testing.expectError(error.LinkTimeout, handshake(&fx.hub, arena, conn, fresh, 250));
+    const ch = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 2000);
+    try testing.expectEqual(link.FrameType.challenge, ch.kind);
+    try testing.expectEqual(link.NONCE_LEN, ch.payload.len);
 }
 
 fn nodeSessionThread(node: *node_link.Node, stream: Io.net.Stream, out: *anyerror!u64) void {
@@ -1104,7 +1742,8 @@ test "hub handshake accepts a real node and relays a request end to end" {
     // Dropping the link on the hub side ends the node session.
     fx.hub.killAll();
     t.join();
-    _ = try result;
+    // The node's reader saw EOF and reported it instead of a clean exit.
+    try testing.expectError(error.LinkClosed, result);
     try waitZero(&node.workers);
     try waitZero(&fx.hub.threads);
     try testing.expect(fx.hub.acquire("pc") == null);
@@ -1150,13 +1789,78 @@ test "hub handshake drops a peer that sends a non-hello frame" {
     defer p.far.close(io);
     adopt(&fx.hub, p.near);
     const fd = p.far.socket.handle;
-    const ch = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    const ch = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.challenge, ch.kind);
     try testing.expectEqual(link.NONCE_LEN, ch.payload.len);
-    try link.writeFrame(fd, .ping, 0, "12345678", 5000);
-    const ga = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try link.writeFrame(fd, null, .ping, 0, "12345678", 5000);
+    const ga = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.goaway, ga.kind);
     try waitZero(&fx.hub.threads);
+}
+
+test "hub drops an injected RESP frame without a valid tag" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s3cret" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    adopt(&fx.hub, p.near);
+    const fd = p.far.socket.handle;
+
+    // Complete the handshake as a genuine node would (the MAC must check
+    // out), then read the WELCOME and arm the node-side frame keys.
+    const ch = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.challenge, ch.kind);
+    const hub_nonce: *const [link.NONCE_LEN]u8 = ch.payload[0..link.NONCE_LEN];
+    var node_nonce: [link.NONCE_LEN]u8 = @splat(7);
+    const hello = try link.buildHello(arena, "s3cret", hub_nonce, &node_nonce, "pc");
+    try link.writeFrame(fd, null, .hello, 0, hello, 5000);
+    const welcome = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.welcome, welcome.kind);
+    // Node-side frame keys: needed to verify the tagged REQ the hub sends.
+    var auth = link.FrameAuth.init(.node, "s3cret", hub_nonce, &node_nonce);
+
+    // A request in flight so the RESP has a waiter to hit.
+    const WaitFwd = struct {
+        fn run(hub: *Hub, a: Allocator, out: *?Forwarded) void {
+            out.* = forward(hub, a, "pc", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000, null) catch null;
+        }
+    };
+    var got: ?Forwarded = null;
+    const fw = try std.Thread.spawn(.{}, WaitFwd.run, .{ &fx.hub, arena, &got });
+    // Wait until the link holds a waiter, read the REQ the hub sent
+    // (tagged, like every post-handshake frame), then inject the fake
+    // RESP: an attacker without the secret cannot tag it, so the hub
+    // drops the link and the request fails as node_disconnected instead
+    // of being answered by injected bytes.
+    const ln = try waitRegistered(&fx.hub, "pc");
+    var spins: u32 = 0;
+    while (ln.waiterCount() == 0 and spins < 1000) : (spins += 1) os.sleepMs(5);
+    ln.release();
+    const reqf = try link.readFrame(arena, fd, &auth, link.MAX_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.req, reqf.kind);
+    var resp_payload: [2 + 18]u8 = undefined;
+    std.mem.writeInt(u16, resp_payload[0..2], 200, .big);
+    @memcpy(resp_payload[2..], "{\"id\":1,\"ok\":true}");
+    const forged_tag = [_]u8{0xAA} ** link.MAC_LEN;
+    var hdr: [link.HEADER_LEN]u8 = undefined;
+    link.encodeHeader(&hdr, .{ .len = @intCast(resp_payload.len), .kind = .resp, .stream_id = 1 });
+    try os.net.socketWriteAll(fd, &hdr, 5000);
+    try os.net.socketWriteAll(fd, &resp_payload, 5000);
+    try os.net.socketWriteAll(fd, &forged_tag, 5000);
+
+    fw.join();
+    try testing.expect(got != null);
+    try testing.expect(got.? == .node_disconnected);
+    try waitZero(&fx.hub.threads);
+    try testing.expect(fx.hub.acquire("pc") == null);
+    // The hub shut the link down: nothing more arrives from its side.
+    try testing.expectError(error.LinkClosed, link.readFrame(arena, fd, null, link.MAX_PAYLOAD, 5000));
 }
 
 test "hub caps handshakes in progress" {
@@ -1294,9 +1998,89 @@ test "hub refuses a source over its pending cap while another is served" {
     adopt(&fx.hub, q.near); // another source still gets a CHALLENGE
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const ch = try link.readFrame(arena_state.allocator(), q.far.socket.handle, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    const ch = try link.readFrame(arena_state.allocator(), q.far.socket.handle, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.challenge, ch.kind);
-    try link.writeFrame(q.far.socket.handle, .ping, 0, "12345678", 5000);
+    try link.writeFrame(q.far.socket.handle, null, .ping, 0, "12345678", 5000);
     try waitZero(&fx.hub.threads);
     for (0..MAX_PENDING_PER_SOURCE) |_| fx.hub.finishSource(a, try Io.net.IpAddress.parse("192.0.2.1", 1), .neutral);
+}
+
+test "hub refuses new-name links past the established-link cap" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+    fx.cfg.max_node_links = 1;
+
+    const p1 = try tcpPair(io, &fx.server);
+    defer p1.far.close(io);
+    const p2 = try tcpPair(io, &fx.server);
+    defer p2.far.close(io);
+    const p3 = try tcpPair(io, &fx.server);
+    defer p3.far.close(io);
+    const p4 = try tcpPair(io, &fx.server);
+    defer p4.far.close(io);
+    const a = try Link.create(&fx.hub, p1.near, plainConn(p1.near.socket.handle), "alpha");
+    const b = try Link.create(&fx.hub, p2.near, plainConn(p2.near.socket.handle), "beta");
+    const a2 = try Link.create(&fx.hub, p3.near, plainConn(p3.near.socket.handle), "alpha");
+    const d = try Link.create(&fx.hub, p4.near, plainConn(p4.near.socket.handle), "beta");
+
+    try fx.hub.register(a);
+    // A second distinct name exceeds the cap: refused, no reader state.
+    try testing.expectError(error.LinkCapacityExceeded, fx.hub.register(b));
+    b.release();
+    try testing.expect(fx.hub.acquire("beta") == null);
+    // Same-name replacement stays allowed at the cap: the slot transfers.
+    // `a` keeps its caller reference until after the dead check — the
+    // registry's replacement release must not leave us reading freed memory.
+    try fx.hub.register(a2);
+    a2.release();
+    try testing.expect(a.dead.load(.acquire));
+    a.release();
+    const cur = fx.hub.acquire("alpha").?;
+    try testing.expect(cur == a2);
+    cur.release();
+    // Removing the link frees the slot: the previously refused name fits.
+    fx.hub.unregister(a2);
+    try testing.expect(fx.hub.acquire("alpha") == null);
+    try fx.hub.register(d);
+    d.release();
+    const got = fx.hub.acquire("beta").?;
+    try testing.expect(got == d);
+    got.release();
+}
+
+test "hub stop retracts infrastructure threads and closes the listener" {
+    var fx: Fixture = undefined;
+    try fx.init(.{ .single = "s" });
+    defer fx.deinit();
+    const io = fx.threaded.io();
+
+    fx.cfg.hub_listen = .{ .host = "127.0.0.1", .port = 0 };
+    var server: Io.net.Server = undefined;
+    try start(&fx.hub, &server);
+    try testing.expect(fx.hub.accept_thread != null);
+    try testing.expect(fx.hub.pinger_thread != null);
+    // The accept loop's wake does not depend on allocating a socket.
+    try testing.expect(fx.hub.wake_wfd != null);
+    const bound = server.socket.address;
+
+    // The startup-rollback entry point: threads join, the listener closes.
+    stop(&fx.hub, &server);
+    try testing.expect(fx.hub.accept_thread == null);
+    try testing.expect(fx.hub.pinger_thread == null);
+    try testing.expectEqual(@as(u32, 0), fx.hub.threads.load(.acquire));
+    // The listener is gone: a fresh connect is refused.
+    if (bound.connect(io, .{ .mode = .stream })) |st| {
+        st.close(io);
+        return error.ListenerStillOpen;
+    } else |_| {}
+    // A late registration — racing the stop sweep — is refused: no link
+    // may enter the registry after the kill sweep.
+    const p = try tcpPair(io, &fx.server);
+    defer p.far.close(io);
+    const late = try Link.create(&fx.hub, p.near, plainConn(p.near.socket.handle), "late");
+    try testing.expectError(error.HubStopping, fx.hub.register(late));
+    late.release();
+    try testing.expect(fx.hub.acquire("late") == null);
 }

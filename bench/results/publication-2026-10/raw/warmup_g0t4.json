@@ -9,11 +9,11 @@
  "ok": true,
  "boot_listen_ms": null,
  "initialize_handshake_ms": null,
- "cold_first_response_ms": 2126.837448,
- "ready_to_serve_ms": 2128.579306,
- "rtt_initialize_ms": 2126.793898,
- "rtt_tools_list_ms": 0.999429,
- "rtt_exec_ms": 0.686059,
+ "cold_first_response_ms": 1091.979016,
+ "ready_to_serve_ms": 1094.246476,
+ "rtt_initialize_ms": 1091.836425,
+ "rtt_tools_list_ms": 0.514078,
+ "rtt_exec_ms": 0.911585,
  "tools_listed": 1,
  "exec_ok": true,
  "server_info": {
@@ -22,7 +22,7 @@
   "description": "Run commands on this linux machine"
  },
  "harness": {
-  "python": "3.11.16",
+  "python": "3.12.3",
   "phase": "warmup",
   "tool": "exec",
   "tool_key": "argv",

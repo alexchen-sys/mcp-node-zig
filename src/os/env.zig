@@ -144,6 +144,9 @@ fn readFileAlloc(gpa: Allocator, path: []const u8, limit: usize) ![]u8 {
     // matching the daemon's existing closeFd semantics.
     defer _ = std.os.linux.close(fd);
     var out: std.ArrayList(u8) = .empty;
+    // StreamTooLong or a read error after the buffer grew must not leak the
+    // grown allocation (the happy path hands ownership off below).
+    errdefer out.deinit(gpa);
     var buf: [READ_SCRATCH_SIZE]u8 = undefined;
     while (true) {
         const n = try std.posix.read(fd, &buf);

@@ -144,6 +144,9 @@ pub fn parseHead(head: []const u8) !HeadInfo {
     const rl = try parseRequestLine(request_line);
     var info = HeadInfo{ .method = rl.method, .path = rl.path };
     var seen_cl: ?usize = null;
+    // Raw (post-trim) text of the first Content-Length value: duplicates
+    // are compared as strings, not as numbers (see the duplicate branch).
+    var seen_cl_raw: ?[]const u8 = null;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         // obs-fold (a line starting with SP/HTAB) died with RFC 7230: reject.
@@ -184,12 +187,36 @@ pub fn parseHead(head: []const u8) !HeadInfo {
         } else if (asciiEqlIgnoreCase(name, "transfer-encoding")) {
             return error.TransferEncodingUnsupported;
         } else if (asciiEqlIgnoreCase(name, "content-length")) {
-            const parsed = std.fmt.parseInt(usize, value, 10) catch return error.BadContentLength;
+            // RFC 9110 §8.6 / RFC 9112 §6.3: Content-Length = 1*DIGIT and
+            // nothing else. std.fmt.parseInt is a Zig *literal* parser, not
+            // an HTTP field grammar: it accepts a leading "+" ("+5" -> 5)
+            // and "_" separators between digits ("1_0" -> 10), while "-0"
+            // parses as 0. A proxy in front of this server that applies
+            // different rules (strtoul-style prefix parse, or "unparseable
+            // means no body") turns those shapes into a CL.CL
+            // request-smuggling differential. Validate the raw value
+            // byte-by-byte first; after that parseInt can only fail on
+            // overflow, which maps to RequestTooLarge and keeps the 413
+            // contract for enormous values.
+            if (value.len == 0) return error.BadContentLength;
+            for (value) |c| {
+                if (c < '0' or c > '9') return error.BadContentLength;
+            }
+            const parsed = std.fmt.parseInt(usize, value, 10) catch return error.RequestTooLarge;
             if (parsed > MAX_BODY_BYTES) return error.RequestTooLarge;
-            if (seen_cl) |prev| {
-                if (prev != parsed) return error.BadContentLength;
+            if (seen_cl_raw) |prev_raw| {
+                // RFC 7230 §3.3.2: duplicate Content-Length values may be
+                // combined only when the field values are identical strings.
+                // "5" and "05" are equal as numbers but distinct as field
+                // values, so numeric comparison would accept a pair that a
+                // fronting proxy may have normalized, forwarded verbatim, or
+                // dropped — a framing differential. Byte-identical
+                // (post-trim) duplicates are strictly narrower than any
+                // permissive peer, which is the safe side of the boundary.
+                if (!std.mem.eql(u8, prev_raw, value)) return error.BadContentLength;
             } else {
                 seen_cl = parsed;
+                seen_cl_raw = value;
             }
         }
     }
@@ -236,12 +263,17 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 
 /// Map a presented-token hash to its policy entry (timing-safe compare of
 /// each entry's stored hash). Null when the hash matches no entry — the
-/// caller turns that into the standard 401.
+/// caller turns that into the standard 401. The scan never exits early:
+/// returning on the first hit would leak the matched entry's index through
+/// the iteration count (timing side channel), so every entry is always
+/// compared and the match is only remembered, then returned after the full
+/// pass. If hashes ever repeat, the first match wins.
 fn policyLookup(ps: *const policy_mod.PolicySet, presented_hash: [32]u8) ?*const policy_mod.TokenPolicy {
+    var found: ?*const policy_mod.TokenPolicy = null;
     for (ps.entries) |*e| {
-        if (std.crypto.timing_safe.eql([32]u8, presented_hash, e.token_hash)) return e;
+        if (std.crypto.timing_safe.eql([32]u8, presented_hash, e.token_hash) and found == null) found = e;
     }
-    return null;
+    return found;
 }
 
 /// First 8 bytes of the token hash as 16 lowercase hex chars: identifies a
@@ -400,11 +432,21 @@ pub fn serveOneRequest(io: Io, cfg: *const config.Config, stream: *Io.net.Stream
             return false;
         }
         const remaining = remainingMs(started, io, timeout_ms) orelse {
+            // Deadline expired before any byte of this request arrived (an
+            // empty `data` also means `carry` was empty: carry bytes are
+            // seeded into `data` above). Writing 408 here races a client
+            // that has just started sending its next request on the idle
+            // keep-alive connection and would read it as that request's
+            // answer. Close silently instead, mirroring the clean-EOF branch.
+            if (data.items.len == 0) return false;
             try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
             return false;
         };
         const n = readWithDeadline(fd, &buf, remaining) catch |err| switch (err) {
             error.RequestTimeout => {
+                // Idle keep-alive wait timed out with no request bytes: same
+                // silent close as the pre-read deadline check above.
+                if (data.items.len == 0) return false;
                 try sendHttpError(ra, fd, 408, "request_timeout", "request timed out", timeout_ms);
                 return false;
             },
@@ -650,8 +692,18 @@ test "host allowlist supports exact and wildcard-port patterns" {
 }
 
 test "content length rejects overflow and conflicting duplicates" {
+    // Values past usize range hit the parseInt overflow path, which maps to
+    // RequestTooLarge (413) after the 1*DIGIT pre-validation: only overflow
+    // can still fail there, and giant values keep the 413 contract.
     try std.testing.expectError(error.RequestTooLarge, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 18446744073709551615"));
+    try std.testing.expectError(error.RequestTooLarge, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 99999999999999999999999"));
+    // Conflicting duplicates (request smuggling vector) answer 400.
     try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2"));
+    // Numerically equal but textually distinct duplicates ("5" vs "05") are
+    // also rejected: RFC 7230 §3.3.2 allows combining only identical field
+    // values, and a fronting proxy may treat the pair differently.
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 05"));
+    // Byte-identical duplicates stay accepted.
     const info = try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2");
     try std.testing.expectEqual(@as(usize, 2), info.content_length);
 }
@@ -739,6 +791,54 @@ test "presented token from x-node-token and authorization headers" {
     try std.testing.expectError(error.DuplicateHeader, parseHead("POST /mcp HTTP/1.1\r\n" ++ auth ++ "t1\r\n" ++ auth ++ "t1"));
 }
 
+test "policy lookup resolves any entry position, misses clean, first duplicate wins" {
+    const Entry = policy_mod.TokenPolicy;
+    const zero = [_]u8{0} ** 32;
+    var h1 = zero;
+    h1[0] = 1;
+    var h2 = zero;
+    h2[0] = 2;
+    var h3 = zero;
+    h3[0] = 3;
+    const mk = struct {
+        fn e(hash: [32]u8) Entry {
+            return .{
+                .file = "f",
+                .token_hash = hash,
+                .tools = &.{},
+                .exec_argv0 = &.{},
+                .exec_cwd = &.{},
+                .cwd_deny = &.{},
+                .read_paths = &.{},
+                .write_paths = &.{},
+                .read_deny = &.{},
+                .write_deny = &.{},
+            };
+        }
+    }.e;
+    var entries = [_]Entry{ mk(h1), mk(h2), mk(h3) };
+    var ps = policy_mod.PolicySet{
+        .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .entries = &entries,
+        .file_digest = zero,
+        .file_path = "f",
+    };
+    defer ps.arena_state.deinit();
+    // A match at the first, middle, or last position all resolve to that
+    // exact entry: the constant-time scan must not depend on the index.
+    try std.testing.expect(policyLookup(&ps, h1) == &entries[0]);
+    try std.testing.expect(policyLookup(&ps, h2) == &entries[1]);
+    try std.testing.expect(policyLookup(&ps, h3) == &entries[2]);
+    // A hash matching no entry is a miss (the caller turns it into a 401).
+    var miss = zero;
+    miss[0] = 9;
+    try std.testing.expect(policyLookup(&ps, miss) == null);
+    // Repeated hashes keep the first-match semantics of the early-return
+    // version the constant-time scan replaced.
+    entries[2].token_hash = h1;
+    try std.testing.expect(policyLookup(&ps, h1) == &entries[0]);
+}
+
 test "content type accepts only strict application/json media type" {
     try std.testing.expect(contentTypeJson("application/json"));
     try std.testing.expect(contentTypeJson("application/json; charset=utf-8"));
@@ -786,16 +886,23 @@ test "routes: listen mode keeps only /mcp; hub adds /n and /n/<name>/mcp" {
     try std.testing.expect(routeFor(.hub, "/mcp/") == null);
 }
 
-test "content length rejects malformed values and documents plus prefix" {
-    // Documents the std.fmt.parseInt behavior surfaced by parseHead's
-    // content-length handling: garbage, empty, and negative values all
-    // collapse to BadContentLength ("-" on an unsigned parse fails, empty
-    // fails InvalidCharacter), while a leading "+" IS accepted by parseInt
-    // and parses to its plain value.
+test "content length enforces digit-only grammar" {
+    // RFC 9110 §8.6 / RFC 9112 §6.3: Content-Length = 1*DIGIT. Every value
+    // below carries a shape std.fmt.parseInt would happily accept as a Zig
+    // literal — a leading "+", "_" separators between digits, "-0" — plus
+    // plain garbage, empty, negative, and embedded-whitespace forms. All
+    // must fail as BadContentLength: any acceptance is a CL.CL parsing
+    // differential against a fronting proxy (request smuggling vector).
     try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: abc"));
     try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length:"));
     try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: -1"));
-    try std.testing.expectEqual(@as(usize, 5), (try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: +5")).content_length);
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: -0"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: +5"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 1_0"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 3_2"));
+    try std.testing.expectError(error.BadContentLength, parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 1 0"));
+    // Leading zeros are valid 1*DIGIT and stay accepted on their own.
+    try std.testing.expectEqual(@as(usize, 5), (try parseHead("POST /mcp HTTP/1.1\r\nContent-Length: 05")).content_length);
 }
 
 test "expect continue matching is case insensitive and whitespace trimmed" {
@@ -958,6 +1065,7 @@ test "read http request extracts full post request" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
     }
@@ -989,6 +1097,7 @@ test "read http request extracts lowercase header names" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         // "hello" is not JSON: the RPC layer answers 400 parse error, which
         // still proves the lowercase head passed every gate.
@@ -1023,6 +1132,7 @@ test "read http request body containing crlfcrlf sequence" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         // Three observable facts pin the framing down:
         //  * 400 with -32700: raw CR/LF inside a JSON string makes the body
@@ -1063,6 +1173,7 @@ test "read http request sends 100 continue for expect header" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
 
         // The interim response was written before the body read started, so
@@ -1100,6 +1211,7 @@ test "read http request ignores non continue expect value" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 417"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "HTTP/1.1 100") == null);
@@ -1131,6 +1243,7 @@ test "read http request skips 100 continue without body" {
             try os.writeAllFd(sock.peer, request);
 
             var carry: std.ArrayList(u8) = .empty;
+            defer carry.deinit(std.heap.page_allocator);
             const out = try testServeRequest(io, arena, sock, &carry);
             try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
             // No interim response was sent: the first buffered bytes are the
@@ -1151,12 +1264,18 @@ test "read http request rejects malformed content length" {
         defer threaded.deinit();
         const io = threaded.io();
 
-        // Garbage, empty, and negative values all answer 400 with the
-        // BadContentLength reason named in the response body.
+        // Garbage, empty, negative, and Zig-literal-only shapes ("+5", "1_0",
+        // "-0", embedded space) all answer 400 with the BadContentLength
+        // reason named in the response body: the serve loop must treat them
+        // as unrecoverable framing errors, not as a body-less request.
         for ([_][]const u8{
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: abc\r\n\r\n",
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length:\r\n\r\n",
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: -1\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: -0\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: +5\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: 1_0\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: 1 0\r\n\r\n",
         }) |request| {
             const sock = try testSocketPair(io);
             defer os.closeFd(sock.peer);
@@ -1164,6 +1283,7 @@ test "read http request rejects malformed content length" {
             try os.writeAllFd(sock.peer, request);
 
             var carry: std.ArrayList(u8) = .empty;
+            defer carry.deinit(std.heap.page_allocator);
             const out = try testServeRequest(io, arena, sock, &carry);
             try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
             try std.testing.expect(std.mem.indexOf(u8, out.response, "BadContentLength") != null);
@@ -1190,6 +1310,7 @@ test "read http request rejects conflicting duplicate content length" {
             try os.writeAllFd(sock.peer, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nAB");
 
             var carry: std.ArrayList(u8) = .empty;
+            defer carry.deinit(std.heap.page_allocator);
             const out = try testServeRequest(io, arena, sock, &carry);
             try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
             try std.testing.expect(std.mem.indexOf(u8, out.response, "BadContentLength") != null);
@@ -1204,6 +1325,7 @@ test "read http request rejects conflicting duplicate content length" {
             try os.writeAllFd(sock.peer, try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body.len, body }));
 
             var carry: std.ArrayList(u8) = .empty;
+            defer carry.deinit(std.heap.page_allocator);
             const out = try testServeRequest(io, arena, sock, &carry);
             try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
         }
@@ -1230,6 +1352,7 @@ test "read http request rejects oversized content length" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 413"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "RequestTooLarge") != null);
@@ -1256,6 +1379,7 @@ test "read http request short body after eof errors" {
         testShutdownWrite(sock.peer);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "ShortBody") != null);
@@ -1286,6 +1410,7 @@ test "read http request unterminated headers error on eof" {
             testShutdownWrite(sock.peer);
 
             var carry: std.ArrayList(u8) = .empty;
+            defer carry.deinit(std.heap.page_allocator);
             const out = try testServeRequest(io, arena, sock, &carry);
             try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
             try std.testing.expect(std.mem.indexOf(u8, out.response, "BadHeaders") != null);
@@ -1312,9 +1437,50 @@ test "read http request clean eof on empty socket" {
         testShutdownWrite(sock.peer);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expectEqual(false, out.keep);
         try std.testing.expectEqual(@as(usize, 0), out.response.len);
+    }
+}
+
+test "read http request idle keep-alive timeout closes without 408" {
+    if (comptime builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    } else {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        // An idle keep-alive connection where the deadline expires before a
+        // single byte of the next request arrives. The server must close
+        // WITHOUT answering: a 408 written here races a client that has just
+        // started sending its next request and would read the 408 as that
+        // request's response (classic keep-alive close race). Regression for
+        // the silent-close fix in the header-phase timeout branches.
+        const sock = try testSocketPair(io);
+        defer os.closeFd(sock.peer);
+        defer os.closeFd(sock.subject);
+
+        var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
+        var stream = Io.net.Stream{
+            .socket = .{
+                .handle = sock.subject,
+                .address = try Io.net.IpAddress.parseIp4("127.0.0.1", 43210),
+            },
+        };
+        var cfg = testServeConfig();
+        cfg.socket_timeout_s = 1;
+        const keep = try serveOneRequest(io, &cfg, &stream, &carry);
+
+        // The connection is dropped (caller closes), nothing was written to
+        // the peer, and no request byte was consumed into the carry.
+        try std.testing.expectEqual(false, keep);
+        try std.testing.expectEqual(@as(usize, 0), carry.items.len);
+        try std.testing.expect(!testSocketReadable(sock.peer));
     }
 }
 
@@ -1351,6 +1517,7 @@ test "read http request oversized headers rejected" {
         defer os.closeFd(sock.subject);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 431"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "headers_too_large") != null);
@@ -1375,6 +1542,7 @@ test "read http request rejects malformed request line" {
         try os.writeAllFd(sock.peer, "POST\r\n\r\n");
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "BadRequestLine") != null);
@@ -1405,6 +1573,7 @@ test "read http request keeps pipelined bytes as carry for the next request" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 202"));
         try std.testing.expectEqualStrings("GARBAGE-SECOND-REQUEST", carry.items);
@@ -1431,6 +1600,7 @@ test "read http request rejects chunked transfer encoding" {
         try os.writeAllFd(sock.peer, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8341\r\nTransfer-Encoding: chunked\r\n\r\n");
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
         try std.testing.expect(std.mem.indexOf(u8, out.response, "TransferEncodingUnsupported") != null);
@@ -1470,6 +1640,7 @@ test "read http request without content length has empty body" {
         try os.writeAllFd(sock.peer, request);
 
         var carry: std.ArrayList(u8) = .empty;
+        defer carry.deinit(std.heap.page_allocator);
         const out = try testServeRequest(io, arena, sock, &carry);
         try std.testing.expect(std.mem.startsWith(u8, out.response, "HTTP/1.1 400"));
         try std.testing.expectEqualStrings(tail, carry.items);

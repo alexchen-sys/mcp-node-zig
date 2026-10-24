@@ -22,6 +22,9 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, __file__.rsplit("/", 2)[0] + "/lib")
+import stats  # noqa: E402
+
 PROC_VERSION = "2024-11-05"
 
 
@@ -403,10 +406,10 @@ def sample_tree_memory(root_pid, samples=20, interval_s=0.5, on_sample=None):
     pss = [m["pss_kib"] for m in out]
     return {
         "samples_taken": len(out),
-        "rss_kib": {"median": sorted(rss)[len(rss) // 2] if rss else None,
+        "rss_kib": {"median": stats.percentile(rss, 50) if rss else None,
                     "max": max(rss) if rss else None,
                     "series": rss},
-        "pss_kib": {"median": sorted(pss)[len(pss) // 2] if pss else None,
+        "pss_kib": {"median": stats.percentile(pss, 50) if pss else None,
                     "max": max(pss) if pss else None,
                     "series": pss},
     }

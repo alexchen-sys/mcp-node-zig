@@ -21,6 +21,8 @@ const util = @import("util.zig");
 const link = @import("link.zig");
 const config = @import("config.zig");
 const rpc_mod = @import("rpc.zig");
+const build_options = @import("build_options");
+const tls_server = if (build_options.tls_server) @import("tls_server.zig") else struct {};
 
 pub const PING_INTERVAL_MS: u64 = 15 * 1000;
 pub const DEAD_AFTER_MS: u64 = 45 * 1000;
@@ -48,6 +50,19 @@ fn jitterMs(io: Io, cap: u64) u64 {
     var raw: [8]u8 = undefined;
     io.random(&raw);
     return std.mem.readInt(u64, &raw, .little) % (cap + 1);
+}
+
+fn nowMs(io: Io) i64 {
+    return Io.Clock.awake.now(io).toMilliseconds();
+}
+
+/// Time left before an absolute awake-clock deadline; 0 once it passed.
+/// The node-side TLS socket callbacks use it so one logical operation
+/// (the whole TLS handshake, one buffered record) is bounded by one
+/// deadline no matter how many separate socket reads it takes.
+fn deadlineLeftMs(deadline_ms: i64, now_ms: i64) u64 {
+    const left = deadline_ms - now_ms;
+    return if (left > 0) @intCast(left) else 0;
 }
 
 /// Dial loop; never returns under normal operation.
@@ -108,7 +123,15 @@ fn sessionOn(node: *Node, stream: Io.net.Stream, conn: Conn) !u64 {
     const timeout_ms = @as(u64, node.cfg.socket_timeout_s) * 1000;
     os.net.setSocketTimeouts(fd, node.cfg.socket_timeout_s) catch return error.SocketOptionFailed;
 
-    try handshake(node, conn, timeout_ms);
+    // The handshake proves the hub; its return value arms the frame tags
+    // on every link, TLS included: the wire format must not depend on the
+    // local transport, or a TLS terminator between the node and a
+    // plaintext hub would leave the ends disagreeing after a handshake
+    // that still completes (see link.zig). From here on every frame in
+    // both directions carries a tag.
+    var frame_auth = try handshake(node, conn, timeout_ms);
+    ln.frame_auth = frame_auth;
+    frame_auth.secureZero(); // the local copy; the link's is live
     const up_since = std.Io.Clock.awake.now(io);
     std.debug.print("node link: welcome as '{s}'\n", .{node.cfg.name});
 
@@ -120,28 +143,62 @@ fn sessionOn(node: *Node, stream: Io.net.Stream, conn: Conn) !u64 {
 
     readLoop(ln) catch |err| {
         std.debug.print("node link lost: {s}\n", .{@errorName(err)});
+        return err;
     };
     const up = up_since.untilNow(io, .awake).toMilliseconds();
     return if (up > 0) @intCast(up) else 0;
 }
 
-fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
+/// Run the mutual handshake. Returns the frame-key state the caller
+/// installs on the link — on every link, TLS included: the tags ride
+/// inside the TLS records, so a terminator between the node and a
+/// plaintext hub changes nothing on the wire (see link.zig).
+fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !link.FrameAuth {
+    return handshakeWithin(node, conn, timeout_ms, HANDSHAKE_MS);
+}
+
+/// The whole applied handshake — CHALLENGE read, HELLO send, WELCOME
+/// read — runs under ONE absolute deadline of `budget_ms` on the awake
+/// clock: a hub that dribbles one byte per read cannot stretch it into
+/// idle_ms x reads (where readFrameOn hands every partial read a fresh idle
+/// budget). What is left of the deadline
+/// also bounds the HELLO send — and, over TLS, this phase's socket
+/// writes and reads, via TlsState's own deadline fields.
+fn handshakeWithin(node: *Node, conn: Conn, timeout_ms: u64, budget_ms: u64) !link.FrameAuth {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const io = node.io;
+    const started = Io.Clock.awake.now(io);
+    const deadline = nowMs(io) + @as(i64, @intCast(budget_ms));
 
-    const ch = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
+    // Over TLS, bound this phase's writes by the same deadline: sockDrain
+    // honors send_deadline while it is set. Plain writes take the time
+    // left as their timeout below. Single-threaded here either way: the
+    // link (and its writer mutex users) does not exist until WELCOME.
+    const tls_state: ?*TlsState = switch (conn) {
+        .tls => |t| t,
+        .plain => null,
+    };
+    if (tls_state) |t| t.send_deadline = deadline;
+    defer {
+        if (tls_state) |t| t.send_deadline = null;
+    }
+
+    const ch = try link.readFrameWithinOn(arena, conn, null, link.MAX_HANDSHAKE_PAYLOAD, io, started, budget_ms);
     if (ch.kind != .challenge or ch.payload.len != link.NONCE_LEN) return error.BadChallenge;
     const hub_nonce: *const [link.NONCE_LEN]u8 = ch.payload[0..link.NONCE_LEN];
     var node_nonce: [link.NONCE_LEN]u8 = undefined;
     node.io.randomSecure(&node_nonce) catch return error.EntropyUnavailable;
     const secret = node.cfg.connect_secret;
     const hello = try link.buildHello(arena, secret, hub_nonce, &node_nonce, node.cfg.name);
-    try link.writeFramePartsOn(conn, .hello, 0, &.{hello}, timeout_ms);
+    const left = deadlineLeftMs(deadline, nowMs(io));
+    if (left == 0) return error.LinkTimeout;
+    try link.writeFramePartsOn(conn, null, .hello, 0, &.{hello}, @min(timeout_ms, left));
 
     // The hub must prove the secret before any other frame is accepted:
     // nothing reaches the read loop (and so rpc.handleRpc) until then.
-    const reply = try link.readFrameOn(arena, conn, link.MAX_HANDSHAKE_PAYLOAD, HANDSHAKE_MS);
+    const reply = try link.readFrameWithinOn(arena, conn, null, link.MAX_HANDSHAKE_PAYLOAD, io, started, budget_ms);
     switch (reply.kind) {
         .welcome => {
             if (!link.verifyWelcome(arena, secret, hub_nonce, &node_nonce, node.cfg.name, reply.payload)) {
@@ -159,6 +216,11 @@ fn handshake(node: *Node, conn: Conn, timeout_ms: u64) !void {
             return error.HubAuthFailed;
         },
     }
+    // Session keys for the frames that follow: both nonces bind the keys
+    // to this exact handshake, and the two directions get distinct keys.
+    // Always armed, over TLS too — the frame format must not depend on
+    // the local transport (see the module doc in link.zig).
+    return link.FrameAuth.init(.node, secret, hub_nonce, &node_nonce);
 }
 
 const GOAWAY_PRINT_MAX = 200;
@@ -210,7 +272,11 @@ const Conn = union(enum) {
 /// to the socket reader/writer). Ciphertext moves through the os.net
 /// helpers, so read deadlines behave exactly like the plain path: every
 /// socket read is armed with SO_RCVTIMEO (software deadline on Windows)
-/// and a timeout surfaces as error.LinkTimeout.
+/// and a timeout surfaces as error.LinkTimeout. One logical operation —
+/// the whole TLS handshake, or one record buffered for one read — is
+/// bounded by one absolute deadline (read_deadline/send_deadline): each
+/// socket read inside it is armed with the time left, so a dribbling
+/// peer cannot stretch the budget.
 ///
 /// Locking: writers run under the link write mutex. The std client is not
 /// split into independent read and write halves: when a received TLS 1.3
@@ -235,6 +301,18 @@ const TlsState = struct {
     read_timeout_ms: u64 = HANDSHAKE_MS,
     read_err: ?anyerror = null,
     send_timeout_ms: u64,
+    /// Absolute awake-clock deadline (ms) that bounds the whole logical
+    /// read in progress — the entire TLS handshake, or one record
+    /// buffered for one readSome call. While set, every socket read is
+    /// armed with the time left before it instead of a fresh
+    /// read_timeout_ms, so a hub that dribbles one segment per read
+    /// cannot stretch one budget into many. Written only by the thread
+    /// that owns the current read phase; cleared when that phase ends.
+    read_deadline: ?i64 = null,
+    /// Same for handshake writes: one deadline for the whole TLS
+    /// handshake (single-threaded there). Null afterwards, when each
+    /// write is bounded by send_timeout_ms.
+    send_deadline: ?i64 = null,
     sock_in: Io.Reader,
     sock_out: Io.Writer,
     client: tls.Client = undefined,
@@ -283,6 +361,18 @@ const TlsState = struct {
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch return error.EntropyUnavailable;
         defer std.crypto.secureZero(u8, &entropy);
+        // One absolute deadline for the whole TLS handshake. The std
+        // client reads ServerHello, Certificate and Finished as separate
+        // socket reads; arming each with the full read timeout would let
+        // a hub that dribbles one byte per timeout park us forever (each
+        // read resets the clock). Every socket read and write below is
+        // armed with the time left of HANDSHAKE_MS instead.
+        self.read_deadline = nowMs(io) + @as(i64, @intCast(HANDSHAKE_MS));
+        self.send_deadline = self.read_deadline;
+        defer {
+            self.read_deadline = null;
+            self.send_deadline = null;
+        }
         self.client = tls.Client.init(&self.sock_in, &self.sock_out, .{
             .host = .{ .explicit = cfg.connect_server_name },
             .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &self.bundle_lock, .bundle = &self.bundle } },
@@ -309,6 +399,16 @@ const TlsState = struct {
     fn readSome(self: *TlsState, buf: []u8, timeout_ms: u64) !usize {
         if (buf.len == 0) return 0;
         const plain = &self.client.reader;
+        self.read_timeout_ms = timeout_ms;
+        self.read_err = null;
+        // One absolute deadline covers the whole read: buffering one
+        // ciphertext record may take several socket reads, and the loop
+        // below may need more than one record before plaintext appears.
+        // Each socket read is armed with the time left, so a peer that
+        // dribbles one segment per read cannot stretch timeout_ms into
+        // N times timeout_ms (the DEAD_AFTER_MS bound must stay a bound).
+        self.read_deadline = nowMs(self.io) + @as(i64, @intCast(timeout_ms));
+        defer self.read_deadline = null;
         while (true) {
             // Plaintext already decrypted: only this thread moves the
             // client reader's seek/end, so no lock is needed to copy it.
@@ -319,8 +419,6 @@ const TlsState = struct {
                 plain.toss(n);
                 return n;
             }
-            self.read_timeout_ms = timeout_ms;
-            self.read_err = null;
             self.bufferRecord() catch return self.readError();
             self.decryptOne() catch |err| switch (err) {
                 error.EndOfStream => return 0,
@@ -338,7 +436,10 @@ const TlsState = struct {
 
     /// Read ciphertext (no lock) until one whole record is buffered, the
     /// header announces an oversize record, or the socket hit EOF; the
-    /// std client reports the last two on decrypt.
+    /// std client reports the last two on decrypt. Every socket read
+    /// here is armed with the time left of the caller's absolute
+    /// deadline (readSome or the TLS handshake), so a dribbling peer
+    /// cannot stretch one record across many per-read timeouts.
     fn bufferRecord(self: *TlsState) error{ReadFailed}!void {
         const in = &self.sock_in;
         while (true) {
@@ -376,7 +477,17 @@ const TlsState = struct {
     fn sockStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
         const self: *TlsState = @alignCast(@fieldParentPtr("sock_in", r));
         const dest = limit.slice(try w.writableSliceGreedy(1));
-        const n = (link.FdConn{ .fd = self.fd }).readSome(dest, self.read_timeout_ms) catch |err| {
+        const timeout_ms: u64 = if (self.read_deadline) |d| blk: {
+            // The armed deadline rules, not the per-read timeout: what is
+            // left of the whole logical read bounds this socket read.
+            const left = deadlineLeftMs(d, nowMs(self.io));
+            if (left == 0) {
+                self.read_err = error.LinkTimeout;
+                return error.ReadFailed;
+            }
+            break :blk left;
+        } else self.read_timeout_ms;
+        const n = (link.FdConn{ .fd = self.fd }).readSome(dest, timeout_ms) catch |err| {
             self.read_err = err;
             return error.ReadFailed;
         };
@@ -387,7 +498,13 @@ const TlsState = struct {
 
     fn sockDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const self: *TlsState = @alignCast(@fieldParentPtr("sock_out", w));
-        const t = self.send_timeout_ms;
+        const t: u64 = if (self.send_deadline) |d| blk: {
+            // During the TLS handshake the whole exchange shares one
+            // deadline: each write gets the time left, expiry fails it.
+            const left = deadlineLeftMs(d, nowMs(self.io));
+            if (left == 0) return error.WriteFailed;
+            break :blk left;
+        } else self.send_timeout_ms;
         os.net.socketWriteAll(self.fd, w.buffer[0..w.end], t) catch return error.WriteFailed;
         w.end = 0;
         var n: usize = 0;
@@ -408,6 +525,10 @@ const Link = struct {
     node: *Node,
     stream: Io.net.Stream,
     conn: Conn,
+    /// Frame-key state, armed once after the handshake — on plaintext and
+    /// TLS links alike (tags ride inside the TLS records; see link.zig).
+    /// tx_seq is guarded by write_mutex, rx_seq by the reader.
+    frame_auth: ?link.FrameAuth = null,
     write_mutex: std.Io.Mutex = .init,
     refs: std.atomic.Value(u32) = .init(1),
     dead: std.atomic.Value(bool) = .init(false),
@@ -418,6 +539,7 @@ const Link = struct {
 
     fn release(self: *Link) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (self.frame_auth) |*fa| fa.secureZero();
         self.conn.deinit();
         self.stream.close(self.node.io);
         std.heap.page_allocator.destroy(self);
@@ -435,7 +557,8 @@ const Link = struct {
         const timeout_ms = @as(u64, self.node.cfg.socket_timeout_s) * 1000;
         self.write_mutex.lockUncancelable(io);
         defer self.write_mutex.unlock(io);
-        link.writeFramePartsOn(self.conn, kind, sid, parts, timeout_ms) catch self.kill();
+        const auth: ?*link.FrameAuth = if (self.frame_auth) |*fa| fa else null;
+        link.writeFramePartsOn(self.conn, auth, kind, sid, parts, timeout_ms) catch self.kill();
     }
 
     fn writeResp(self: *Link, sid: u32, status: u16, body: []const u8) void {
@@ -447,8 +570,9 @@ const Link = struct {
 
 fn readLoop(ln: *Link) !void {
     const gpa = std.heap.page_allocator;
+    const auth: ?*link.FrameAuth = if (ln.frame_auth) |*fa| fa else null;
     while (!ln.dead.load(.acquire)) {
-        const frame = try link.readFrameOn(gpa, ln.conn, link.MAX_PAYLOAD, DEAD_AFTER_MS);
+        const frame = try link.readFrameOn(gpa, ln.conn, auth, link.MAX_PAYLOAD, DEAD_AFTER_MS);
         switch (frame.kind) {
             .req => dispatch(ln, frame.stream_id, frame.payload), // takes payload
             .ping => {
@@ -589,6 +713,129 @@ test "node link backoff cap doubles from 0.5 s to 30 s" {
     try testing.expectEqual(@as(u64, 30000), backoffCapMs(1000));
 }
 
+test "node link deadline math saturates at zero and counts down" {
+    try testing.expectEqual(@as(u64, 500), deadlineLeftMs(10_000, 9_500));
+    try testing.expectEqual(@as(u64, 1), deadlineLeftMs(10_000, 9_999));
+    try testing.expectEqual(@as(u64, 0), deadlineLeftMs(10_000, 10_000));
+    try testing.expectEqual(@as(u64, 0), deadlineLeftMs(10_000, 25_000));
+}
+
+test "node link bufferRecord is bounded by the absolute read deadline" {
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const far = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer far.close(io);
+    const near = try server.accept(io);
+    defer near.close(io);
+    try os.net.setSocketTimeouts(near.socket.handle, 10);
+
+    const gpa = std.heap.page_allocator;
+    const self = try gpa.create(TlsState);
+    defer gpa.destroy(self);
+    self.* = .{
+        .fd = near.socket.handle,
+        .io = io,
+        .send_timeout_ms = 10_000,
+        .sock_in = .{ .vtable = &.{ .stream = TlsState.sockStream }, .buffer = &.{}, .seek = 0, .end = 0 },
+        .sock_out = .{ .vtable = &.{ .drain = TlsState.sockDrain }, .buffer = &.{} },
+    };
+    self.sock_in.buffer = &self.in_buf;
+    self.sock_out.buffer = &self.out_buf;
+
+    // A record header announcing 32 bytes of body, with only 8 of them
+    // ever arriving: bufferRecord must keep filling, but the armed
+    // absolute deadline — not the per-read timeout — decides when to
+    // give up. With the old per-read arming this would block for
+    // read_timeout_ms (seconds); with the deadline it fails at ~300 ms.
+    var head: [13]u8 = undefined;
+    head[0] = 0x17;
+    head[1] = 0x03;
+    head[2] = 0x03;
+    head[3] = 0x00;
+    head[4] = 0x20;
+    @memset(head[5..13], 0xaa);
+    try os.net.socketWriteAll(far.socket.handle, &head, 5000);
+
+    self.read_timeout_ms = HANDSHAKE_MS; // the old per-read bound
+    self.read_deadline = nowMs(io) + 300; // what readSome/the handshake arm
+    const t0 = Io.Clock.awake.now(io);
+    try testing.expectError(error.ReadFailed, self.bufferRecord());
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    try testing.expectEqual(@as(anyerror, error.LinkTimeout), self.read_err.?);
+    // It waited for the deadline (not a spurious early error)...
+    try testing.expect(took >= 200);
+    // ...and the deadline, not the per-read timeout, ended it.
+    try testing.expect(took < 5_000);
+
+    // With the rest of the record available the deadline does not fire
+    // and bufferRecord completes normally.
+    var rest: [24]u8 = @splat(0xbb);
+    try os.net.socketWriteAll(far.socket.handle, &rest, 5000);
+    self.read_deadline = nowMs(io) + 2_000;
+    try self.bufferRecord();
+}
+
+test "node link handshake is bounded by one absolute deadline" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cfg = try testConfig(arena);
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const far = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer far.close(io);
+    const near = try server.accept(io);
+    defer near.close(io);
+    try os.net.setSocketTimeouts(near.socket.handle, 5);
+    try os.net.setSocketTimeouts(far.socket.handle, 5);
+
+    // A hub that dribbles the CHALLENGE one byte at a time, each pause
+    // comfortably inside any per-read idle budget, but the whole frame
+    // far past the handshake budget: the handshake must hit the ONE
+    // absolute deadline, not idle x 41 partial reads.
+    const Dribbler = struct {
+        fn run(fd: os.net.Handle) void {
+            var frame: [link.HEADER_LEN + link.NONCE_LEN]u8 = undefined;
+            link.encodeHeader(frame[0..link.HEADER_LEN], .{
+                .len = link.NONCE_LEN,
+                .kind = .challenge,
+                .stream_id = 0,
+            });
+            @memset(frame[link.HEADER_LEN..], 4);
+            for (frame) |b| {
+                var one = [1]u8{b};
+                os.net.socketWriteAll(fd, &one, 5000) catch return;
+                os.sleepMs(40); // 41 bytes x 40 ms = 1.6 s of dribble
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Dribbler.run, .{far.socket.handle});
+
+    const t0 = Io.Clock.awake.now(io);
+    try testing.expectError(
+        error.LinkTimeout,
+        handshakeWithin(&node, .{ .plain = .{ .fd = near.socket.handle } }, 5000, 300),
+    );
+    const took = t0.untilNow(io, .awake).toMilliseconds();
+    t.join();
+    // It really waited for the deadline (not an early error)...
+    try testing.expect(took >= 250);
+    // ...and the deadline, not 1.6 s of dribbled idle reads, ended it.
+    try testing.expect(took < 900);
+}
+
 fn testConfig(arena: std.mem.Allocator) !config.Config {
     return .{
         .name = "pc",
@@ -611,6 +858,32 @@ fn testConfig(arena: std.mem.Allocator) !config.Config {
 fn sessionThread(node: *Node, stream: Io.net.Stream, out: *anyerror!u64) void {
     out.* = session(node, stream);
 }
+
+/// A scripted hub peer for plaintext-link tests: it runs the real
+/// handshake (CHALLENGE/HELLO/WELCOME) and ends up with the same frame
+/// keys a genuine hub would derive, so the test can speak the tagged wire
+/// format — or deliberately break it.
+fn scriptedHubHandshake(arena: std.mem.Allocator, fd: os.net.Handle) !link.FrameAuth {
+    var nonce: [link.NONCE_LEN]u8 = @splat(4);
+    try link.writeFrame(fd, null, .challenge, 0, &nonce, 5000);
+    const hello_frame = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    const hello = try link.parseHello(arena, hello_frame.payload);
+    const welcome = try link.buildWelcome(arena, "s3cret", &nonce, &hello.nonce, hello.name);
+    try link.writeFrame(fd, null, .welcome, 0, welcome, 5000);
+    return link.FrameAuth.init(.hub, "s3cret", &nonce, &hello.nonce);
+}
+
+/// Write one fully crafted post-handshake frame: header, payload, tag as
+/// given (all bytes go on the wire exactly as provided).
+fn writeRawFrame(fd: os.net.Handle, kind: link.FrameType, sid: u32, payload: []const u8, tag: *const [link.MAC_LEN]u8) !void {
+    var hdr: [link.HEADER_LEN]u8 = undefined;
+    link.encodeHeader(&hdr, .{ .len = @intCast(payload.len), .kind = kind, .stream_id = sid });
+    try os.net.socketWriteAll(fd, &hdr, 5000);
+    try os.net.socketWriteAll(fd, payload, 5000);
+    try os.net.socketWriteAll(fd, tag, 5000);
+}
+
+const REQ_BODY = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
 
 test "node link serves REQ and PING over an authenticated link" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -638,36 +911,353 @@ test "node link serves REQ and PING over an authenticated link" {
     var result: anyerror!u64 = error.NotRun;
     const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
 
-    var nonce: [link.NONCE_LEN]u8 = @splat(3);
-    try link.writeFrame(fd, .challenge, 0, &nonce, 5000);
-    const hello_frame = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
-    try testing.expectEqual(link.FrameType.hello, hello_frame.kind);
-    const hello = try link.parseHello(arena, hello_frame.payload);
-    try testing.expectEqualStrings("pc", hello.name);
-    try testing.expect(link.verifyAuth(.node, "s3cret", &nonce, &hello.nonce, hello.name, hello.auth));
-    const welcome = try link.buildWelcome(arena, "s3cret", &nonce, &hello.nonce, hello.name);
-    try link.writeFrame(fd, .welcome, 0, welcome, 5000);
-
-    try link.writeFrame(fd, .req, 7, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000);
-    const resp = try link.readFrame(arena, fd, link.MAX_PAYLOAD, 5000);
+    // Handshake as a genuine hub would, then arm the frame keys: every
+    // frame after WELCOME is tagged on both directions.
+    var auth = try scriptedHubHandshake(arena, fd);
+    try link.writeFrame(fd, &auth, .req, 7, REQ_BODY, 5000);
+    const resp = try link.readFrame(arena, fd, &auth, link.MAX_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.resp, resp.kind);
     try testing.expectEqual(@as(u32, 7), resp.stream_id);
     const r = try link.splitResp(resp.payload);
     try testing.expectEqual(@as(u16, 200), r.status);
     try testing.expect(std.mem.indexOf(u8, r.body, "\"id\":1") != null);
 
-    try link.writeFrame(fd, .ping, 0, "12345678", 5000);
-    const pong = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try link.writeFrame(fd, &auth, .ping, 0, "12345678", 5000);
+    const pong = try link.readFrame(arena, fd, &auth, link.MAX_HANDSHAKE_PAYLOAD, 5000);
     try testing.expectEqual(link.FrameType.pong, pong.kind);
     try testing.expectEqualStrings("12345678", pong.payload);
 
-    try link.writeFrame(fd, .goaway, 0, "bye", 5000);
+    try link.writeFrame(fd, &auth, .goaway, 0, "bye", 5000);
     t.join();
-    _ = try result;
+    try testing.expectError(error.GoAway, result);
     // The REQ worker finishes (and drops its link reference) shortly after
     // its RESP went out; wait for it before the stack frame goes away.
     var spins: u32 = 0;
     while (node.workers.load(.acquire) != 0 and spins < 400) : (spins += 1) os.sleepMs(5);
+    try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+}
+
+// The frame format must not depend on the LOCAL
+// transport. Topology under test — the terminator deployment:
+//   node --TLS--> terminator (mbedTLS) --plain--> plaintext hub.
+// Both ends derive and arm frame keys from the shared handshake transcript
+// so every post-WELCOME frame is tagged end-to-end across the relay.
+test "node link speaks tagged frames through a TLS terminator relay" {
+    if (comptime !build_options.tls_server) return error.SkipZigTest; // mbedTLS only exists in -Dtls-server builds
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    const pems = try tls_server.writeTestPems(io, "term");
+    defer std.heap.page_allocator.free(pems.cert);
+    defer std.heap.page_allocator.free(pems.key);
+    cfg.connect_tls = true;
+    cfg.connect_ca_file = pems.cert;
+    cfg.connect_server_name = "localhost"; // the test pair's CN
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    // Node-facing socket, accepted by the TLS terminator.
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    const term_side = try server.accept(io);
+    // Terminator-to-hub plain socket pair.
+    const hf = try server.socket.address.connect(io, .{ .mode = .stream });
+    const hub_side = try server.accept(io);
+    // Closed exactly once — explicitly at the end, or here on failure.
+    var closed = false;
+    defer if (!closed) {
+        client.close(io);
+        term_side.close(io);
+        hf.close(io);
+        hub_side.close(io);
+    };
+    try os.net.setSocketTimeouts(term_side.socket.handle, 5);
+    try os.net.setSocketTimeouts(hf.socket.handle, 5);
+    try os.net.setSocketTimeouts(hub_side.socket.handle, 5);
+    const hub_fd = hub_side.socket.handle;
+
+    const srv = try tls_server.Server.init(io, pems.cert, pems.key);
+    defer srv.deinit();
+
+    // The node session: a REAL TlsState.start (std TLS 1.3 client against
+    // the terminator's certificate), then the protocol handshake, REQ
+    // dispatch and the read loop — all through the relay below.
+    const SessionTls = struct {
+        fn run(n: *Node, stream: Io.net.Stream, out: *anyerror!u64) void {
+            const t = TlsState.start(n, stream) catch |err| {
+                stream.close(n.io);
+                out.* = err;
+                return;
+            };
+            out.* = sessionOn(n, stream, .{ .tls = t });
+        }
+    };
+    var result: anyerror!u64 = error.NotRun;
+    const ts = try std.Thread.spawn(.{}, SessionTls.run, .{ &node, client, &result });
+
+    // The terminator: mbedTLS on the node-facing socket. The mutex
+    // serializes its ssl_read against the relay's ssl_write, exactly the
+    // role the hub's per-link write mutex plays in production.
+    var relay_mutex: Io.Mutex = .init;
+    const started = Io.Clock.awake.now(io);
+    const conn = try tls_server.Conn.accept(srv, io, term_side.socket.handle, started, 5000);
+    conn.lock = &relay_mutex;
+    // The relay: decrypted plaintext flows raw toward the plaintext hub,
+    // hub bytes get encrypted back toward the node. Joined by the defer
+    // before the conn is destroyed.
+    var relay: Relay = .{ .conn = conn, .plain_fd = hf.socket.handle, .mutex = &relay_mutex, .io = io };
+    var up: std.Thread = undefined;
+    var down: std.Thread = undefined;
+    var relay_spawned = false;
+    defer {
+        relay.done.store(true, .release);
+        if (relay_spawned) {
+            up.join();
+            down.join();
+        }
+        conn.destroy();
+    }
+    up = try std.Thread.spawn(.{}, Relay.runUp, .{&relay});
+    down = try std.Thread.spawn(.{}, Relay.runDown, .{&relay});
+    relay_spawned = true;
+
+    // The plaintext hub: the real handshake, then the tagged wire format.
+    var auth = try scriptedHubHandshake(arena, hub_fd);
+    try link.writeFrame(hub_fd, &auth, .req, 7, REQ_BODY, 5000);
+    const resp = try link.readFrame(arena, hub_fd, &auth, link.MAX_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.resp, resp.kind);
+    try testing.expectEqual(@as(u32, 7), resp.stream_id);
+    const r = try link.splitResp(resp.payload);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"id\":1") != null);
+
+    try link.writeFrame(hub_fd, &auth, .ping, 0, "12345678", 5000);
+    const pong = try link.readFrame(arena, hub_fd, &auth, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.pong, pong.kind);
+    try testing.expectEqualStrings("12345678", pong.payload);
+
+    try link.writeFrame(hub_fd, &auth, .goaway, 0, "bye", 5000);
+    ts.join();
+    try testing.expectError(error.GoAway, result);
+    var spins: u32 = 0;
+    while (node.workers.load(.acquire) != 0 and spins < 400) : (spins += 1) os.sleepMs(5);
+    try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+
+    // The session thread owned and already closed `client`; only the
+    // terminator- and hub-facing sockets are ours to close.
+    term_side.close(io);
+    hf.close(io);
+    hub_side.close(io);
+    closed = true;
+}
+
+/// Byte pump of the terminator test: one direction per thread. Downstream
+/// writes take the terminator's mutex (ssl_write must be serialized
+/// against ssl_read, and the send-deadline publication must not race the
+/// read's), upstream reads park in conn.readSome, which releases the mutex
+/// for its socket wait — the production lock split.
+const Relay = struct {
+    conn: *tls_server.Conn,
+    plain_fd: os.net.Handle,
+    mutex: *Io.Mutex,
+    io: Io,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn runUp(self: *Relay) void {
+        var buf: [16 * 1024]u8 = undefined;
+        while (!self.done.load(.acquire)) {
+            const n = self.conn.readSome(&buf, 500) catch |err| switch (err) {
+                error.LinkTimeout => continue, // idle between frames
+                else => return, // node closed or the link died
+            };
+            if (n == 0) return; // clean EOF from the node
+            os.net.socketWriteAll(self.plain_fd, buf[0..n], 5000) catch return;
+        }
+    }
+
+    fn runDown(self: *Relay) void {
+        var buf: [16 * 1024]u8 = undefined;
+        while (!self.done.load(.acquire)) {
+            const n = (link.FdConn{ .fd = self.plain_fd }).readSome(&buf, 500) catch |err| switch (err) {
+                error.LinkTimeout => continue, // idle between frames
+                else => return,
+            };
+            if (n == 0) return;
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.conn.write(buf[0..n], 5000) catch return;
+        }
+    }
+};
+
+test "node link drops an injected REQ frame without a valid tag" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    var hub_side = try server.accept(io);
+    defer hub_side.close(io);
+    const fd = hub_side.socket.handle;
+    try os.net.setSocketTimeouts(fd, 5);
+
+    var result: anyerror!u64 = error.NotRun;
+    const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
+    _ = try scriptedHubHandshake(arena, fd);
+
+    // An on-path attacker without the secret relays the handshake and
+    // then injects a REQ with made-up tag bytes: the node must fail the
+    // frame, kill the link and never dispatch the request.
+    const forged_tag = [_]u8{0xAA} ** link.MAC_LEN;
+    try writeRawFrame(fd, .req, 1, REQ_BODY, &forged_tag);
+    t.join();
+    try testing.expectError(error.FrameAuthFailed, result);
+    try testing.expectError(error.LinkClosed, link.readFrame(arena, fd, null, link.MAX_PAYLOAD, 5000));
+    try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+}
+
+test "node link drops a frame whose payload was flipped after tagging" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    var hub_side = try server.accept(io);
+    defer hub_side.close(io);
+    const fd = hub_side.socket.handle;
+    try os.net.setSocketTimeouts(fd, 5);
+
+    var result: anyerror!u64 = error.NotRun;
+    const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
+    const auth = try scriptedHubHandshake(arena, fd);
+
+    // An honest tag over an honest frame, then one payload bit flipped
+    // in flight: the tag no longer matches and the link dies.
+    var hdr: [link.HEADER_LEN]u8 = undefined;
+    link.encodeHeader(&hdr, .{ .len = @intCast(REQ_BODY.len), .kind = .req, .stream_id = 1 });
+    var tag: [link.MAC_LEN]u8 = undefined;
+    auth.computeTag(&tag, 0, &hdr, &.{REQ_BODY});
+    var flipped: [REQ_BODY.len]u8 = undefined;
+    @memcpy(&flipped, REQ_BODY);
+    flipped[0] ^= 1;
+    try writeRawFrame(fd, .req, 1, &flipped, &tag);
+    t.join();
+    try testing.expectError(error.FrameAuthFailed, result);
+    try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+}
+
+test "node link drops a replayed frame with a stale sequence number" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    var hub_side = try server.accept(io);
+    defer hub_side.close(io);
+    const fd = hub_side.socket.handle;
+    try os.net.setSocketTimeouts(fd, 5);
+
+    var result: anyerror!u64 = error.NotRun;
+    const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
+    var auth = try scriptedHubHandshake(arena, fd);
+
+    // Frame 0 is honest and is served; then the exact same bytes are
+    // replayed. The node's rx sequence is past 0, so the replay fails
+    // and the link is closed.
+    try link.writeFrame(fd, &auth, .req, 5, REQ_BODY, 5000);
+    const resp = try link.readFrame(arena, fd, &auth, link.MAX_PAYLOAD, 5000);
+    try testing.expectEqual(link.FrameType.resp, resp.kind);
+    var spins: u32 = 0;
+    while (node.workers.load(.acquire) != 0 and spins < 400) : (spins += 1) os.sleepMs(5);
+
+    var hdr: [link.HEADER_LEN]u8 = undefined;
+    link.encodeHeader(&hdr, .{ .len = @intCast(REQ_BODY.len), .kind = .req, .stream_id = 5 });
+    var tag: [link.MAC_LEN]u8 = undefined;
+    auth.computeTag(&tag, 0, &hdr, &.{REQ_BODY});
+    try writeRawFrame(fd, .req, 5, REQ_BODY, &tag); // byte-identical replay
+    t.join();
+    try testing.expectError(error.FrameAuthFailed, result);
+    try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
+}
+
+test "node link drops frames that arrive out of order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try testConfig(arena);
+    var budget = InflightBudget{ .io = io, .max = cfg.max_inflight_bytes };
+    cfg.inflight = &budget;
+    var node = Node{ .io = io, .cfg = &cfg };
+
+    const any = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try any.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    var hub_side = try server.accept(io);
+    defer hub_side.close(io);
+    const fd = hub_side.socket.handle;
+    try os.net.setSocketTimeouts(fd, 5);
+
+    var result: anyerror!u64 = error.NotRun;
+    const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
+    const auth = try scriptedHubHandshake(arena, fd);
+
+    // Both frames carry honest tags for their own sequence numbers, but
+    // the one for seq 1 arrives first. The node expects seq 0 exactly,
+    // so the frame is refused and the link is closed.
+    var hdr: [link.HEADER_LEN]u8 = undefined;
+    link.encodeHeader(&hdr, .{ .len = @intCast(REQ_BODY.len), .kind = .req, .stream_id = 1 });
+    var tag1: [link.MAC_LEN]u8 = undefined;
+    auth.computeTag(&tag1, 1, &hdr, &.{REQ_BODY});
+    try writeRawFrame(fd, .req, 1, REQ_BODY, &tag1);
+    t.join();
+    try testing.expectError(error.FrameAuthFailed, result);
     try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
 }
 
@@ -693,9 +1283,9 @@ test "node link reports a hub refusal" {
     var result: anyerror!u64 = error.NotRun;
     const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
     var nonce: [link.NONCE_LEN]u8 = @splat(9);
-    try link.writeFrame(fd, .challenge, 0, &nonce, 5000);
-    _ = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
-    try link.writeFrame(fd, .goaway, 0, "bad auth", 5000);
+    try link.writeFrame(fd, null, .challenge, 0, &nonce, 5000);
+    _ = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+    try link.writeFrame(fd, null, .goaway, 0, "bad auth", 5000);
     t.join();
     try testing.expectError(error.Refused, result);
 }
@@ -727,23 +1317,23 @@ test "node link refuses a hub that cannot prove the secret" {
         var result: anyerror!u64 = error.NotRun;
         const t = try std.Thread.spawn(.{}, sessionThread, .{ &node, client, &result });
         var nonce: [link.NONCE_LEN]u8 = @splat(4);
-        try link.writeFrame(fd, .challenge, 0, &nonce, 5000);
-        const hello_frame = try link.readFrame(arena, fd, link.MAX_HANDSHAKE_PAYLOAD, 5000);
+        try link.writeFrame(fd, null, .challenge, 0, &nonce, 5000);
+        const hello_frame = try link.readFrame(arena, fd, null, link.MAX_HANDSHAKE_PAYLOAD, 5000);
         const hello = try link.parseHello(arena, hello_frame.payload);
         switch (bad) {
-            .missing_auth => try link.writeFrame(fd, .welcome, 0, "{\"v\":1}", 5000),
-            .wrong_secret => try link.writeFrame(fd, .welcome, 0, try link.buildWelcome(arena, "guess", &nonce, &hello.nonce, hello.name), 5000),
-            .zero_auth => try link.writeFrame(fd, .welcome, 0, "{\"v\":1,\"auth\":\"" ++ "0" ** 64 ++ "\"}", 5000),
-            .req_first => try link.writeFrame(fd, .req, 1, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000),
+            .missing_auth => try link.writeFrame(fd, null, .welcome, 0, "{\"v\":1}", 5000),
+            .wrong_secret => try link.writeFrame(fd, null, .welcome, 0, try link.buildWelcome(arena, "guess", &nonce, &hello.nonce, hello.name), 5000),
+            .zero_auth => try link.writeFrame(fd, null, .welcome, 0, "{\"v\":1,\"auth\":\"" ++ "0" ** 64 ++ "\"}", 5000),
+            .req_first => try link.writeFrame(fd, null, .req, 1, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", 5000),
             .reflected_hello => {
                 const w = try std.fmt.allocPrint(arena, "{{\"v\":1,\"auth\":\"{s}\"}}", .{hello.auth});
-                try link.writeFrame(fd, .welcome, 0, w, 5000);
+                try link.writeFrame(fd, null, .welcome, 0, w, 5000);
             },
         }
         t.join();
         try testing.expectError(error.HubAuthFailed, result);
         // The node closed without answering anything: the next read is EOF.
-        try testing.expectError(error.LinkClosed, link.readFrame(arena, fd, link.MAX_PAYLOAD, 5000));
+        try testing.expectError(error.LinkClosed, link.readFrame(arena, fd, null, link.MAX_PAYLOAD, 5000));
         try testing.expectEqual(@as(u32, 0), node.workers.load(.acquire));
     }
 }

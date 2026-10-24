@@ -98,9 +98,10 @@ MCP_NODE_NAME=laptop MCP_NODE_CONNECT_SECRET_FILE=secret \
   ./mcp-node --connect 192.168.1.10:8400
 ```
 
-The handshake still authenticates both sides, but the frames after it are
-neither encrypted nor integrity-protected (see [Security](#security)). Use
-this only where nobody you don't trust can sit on the path.
+The handshake still authenticates both sides, and every frame after it is
+integrity-protected and bound to that handshake, but the traffic is not
+encrypted (see [Security](#security)): an on-path relay can still read it.
+Use this only where nobody you don't trust can sit on the path.
 
 ## Configuration
 
@@ -149,6 +150,28 @@ sides' fresh nonces.
 4. The node checks the WELCOME MAC in constant time before it accepts any
    other frame. A missing or wrong MAC, or any other frame first, ends the
    link with "hub authentication failed" and the node backs off and redials.
+5. From the first frame after WELCOME, every frame carries a 32-byte tag
+   appended after the payload:
+   `HMAC-SHA256(K_dir, seq_be64 | header | payload)`, where the header is
+   the 9-byte frame header (so the announced length is signed too) and
+   `seq` counts frames per direction from 0. The direction keys come from
+   the handshake: `K_n2h = HMAC-SHA256(secret, "mcpnz-frame-n2h" |
+   hub_nonce | node_nonce)` for node-to-hub frames, `K_h2n` analogously
+   (`"mcpnz-frame-h2n"`) for hub-to-node frames. The receiver checks the
+   tag in constant time against the exact expected sequence number, so an
+   injected frame (no key), an altered frame, a replay or a reordering
+   fails the link, which is closed at once. TLS links carry the tags too:
+   the frame format must not depend on the LOCAL transport of either end,
+   because a TLS terminator (nginx `stream`, stunnel, HAProxy) between a
+   TLS node and a plaintext hub would otherwise leave the two ends
+   speaking different formats; the handshake completes, the first
+   post-handshake frame does not. The HMAC cost is negligible next to the
+   TLS record layer that carries the tags.
+
+Every link requires both ends to speak this tagged frame format.
+Binaries from before it, which send untagged frames after the handshake,
+are not supported: the link dies on its first post-handshake frame.
+Hub and node are one binary, so upgrade both ends of a link together.
 
 Nonces are fixed-length and the name comes last, so the MAC input is
 unambiguous; the distinct `node`/`hub` labels stop a proof from being
@@ -192,11 +215,18 @@ do not survive a node restart.
   nonces from both sides: a recorded handshake cannot be replayed, and a hub
   without the secret (a spoofed address, a hijacked DNS name) is refused
   before it can send a single request.
-- The handshake does **not** encrypt or integrity-protect the frames that
-  follow. Over plain TCP, an active relay on the path can pass the handshake
-  through between two genuine endpoints and then read and alter traffic.
-  Mutual authentication stops impersonation without the secret, not that
-  relay. Across untrusted networks use TLS (`MCP_NODE_CONNECT_TLS=1`).
+- After the handshake, every frame is integrity-protected and
+  bound to that exact handshake: per-direction HMAC keys derived from the
+  secret and both nonces, and per-direction sequence numbers checked for
+  exact order; on plaintext and TLS links alike (inside TLS the tags add
+  a second, handshake-bound integrity layer over the record layer's).
+  An on-path relay can still pass the handshake through
+  between two genuine endpoints, but from then on it can neither inject
+  frames (it has no key) nor alter, replay or reorder captured ones; the
+  first bad tag or sequence number closes the link. What a link without
+  TLS still does not give is confidentiality: the relay can read the
+  traffic. Across untrusted networks use TLS
+  (`MCP_NODE_CONNECT_TLS=1`).
 - `MCP_NODE_CONNECT_TLS=1` makes the node a TLS client (Zig std TLS 1.2/1.3)
   that always verifies the certificate chain and server name; there is no
   insecure switch. On the hub side, either build with `-Dtls-server` and let
@@ -251,21 +281,25 @@ do not survive a node restart.
 
 ## Cost
 
-Measured on x86_64 Linux, ReleaseSafe:
+Binary sizes (current, v0.5.0, x86_64-linux ReleaseSafe; measured in
+BENCHMARKS.md b08): 9.6 MiB for the plain build (link, hub and TLS client
+included), 11.5 MiB for the opt-in `-Dtls-server` build (mbedTLS 3.6.7).
+Feature deltas, measured on a pre-release tree (2026-10, kept for the
+breakdown, not the absolutes):
 
-- binary: 4.30 MiB before this feature, 8.70 MiB with the link, hub and TLS
-  client (x86_64 baseline ReleaseSafe; +4.4 MiB, almost all of it std TLS
-  and X.509 parsing; the link and hub alone added about 0.6 MiB);
-  the opt-in `-Dtls-server` build adds 2.67 MiB of mbedTLS on top
-  (11.42 MiB against 8.75 MiB, x86_64-linux ReleaseSafe, mbedTLS 3.6.7);
-- idle memory after 6 s, each mode started from its own copy of the binary
-  so that no file pages are shared:
+- the link, hub and TLS client together added ~4.4 MiB over a 4.30 MiB
+  pre-link binary; almost all of it std TLS and X.509 parsing (the link
+  and hub alone were ~0.6 MiB); mbedTLS accounted for ~2.7 MiB on top;
+- idle memory after 6 s on that tree, each mode started from its own copy
+  of the binary so that no file pages are shared:
 
   | mode | Rss | Private_Dirty | threads |
   |---|---|---|---|
   | plain listen | 1.0-1.1 MB | 0.34 MB | 1 |
   | node with a link | 1.5 MB | 0.6 MB | 2 |
   | hub with one node | 2.0 MB | 1.15 MB | 4 |
+
+  Current v0.5.0 idle RSS: 1.57 MiB (BENCHMARKS.md b03).
 
   All figures come from `/proc/<pid>/smaps_rollup`, 5 rounds on a 6.8
   kernel sandbox. On a field host Private_Dirty matched within 2% and

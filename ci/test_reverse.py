@@ -275,8 +275,23 @@ FRAME_CHALLENGE, FRAME_HELLO, FRAME_WELCOME, FRAME_REQ, FRAME_RESP = 2, 1, 3, 4,
 AUTH_DOMAIN = b'mcp-node-reverse-v1'
 
 
-def _send_frame(sock, kind, stream_id, payload):
-    sock.sendall(struct.pack('>IBI', len(payload), kind, stream_id) + payload)
+def _frame_key(domain, secret, hub_nonce, node_nonce):
+    # Per-direction session key, mirroring deriveFrameKey in src/link.zig:
+    # HMAC-SHA256(secret, domain || hub_nonce || node_nonce).
+    return hmac.new(secret.encode(), domain + hub_nonce + node_nonce,
+                    hashlib.sha256).digest()
+
+
+def _send_frame(sock, kind, stream_id, payload, key=None, seq=0):
+    # Post-handshake frames carry a 32-byte tag appended after the payload:
+    # HMAC-SHA256(K_dir, seq_be64 || header || payload). Handshake frames
+    # (CHALLENGE/HELLO/WELCOME) stay untagged (key=None).
+    header = struct.pack('>IBI', len(payload), kind, stream_id)
+    out = header + payload
+    if key is not None:
+        out += hmac.new(key, struct.pack('>Q', seq) + header + payload,
+                        hashlib.sha256).digest()
+    sock.sendall(out)
 
 
 def _recv_exact(sock, n):
@@ -289,9 +304,16 @@ def _recv_exact(sock, n):
     return buf
 
 
-def _recv_frame(sock):
-    length, kind, stream_id = struct.unpack('>IBI', _recv_exact(sock, 9))
-    return kind, stream_id, _recv_exact(sock, length)
+def _recv_frame(sock, key=None, seq=0):
+    header = _recv_exact(sock, 9)
+    length, kind, stream_id = struct.unpack('>IBI', header)
+    payload = _recv_exact(sock, length)
+    if key is not None:
+        tag = _recv_exact(sock, 32)
+        expected = hmac.new(key, struct.pack('>Q', seq) + header + payload,
+                            hashlib.sha256).digest()
+        check(hmac.compare_digest(tag, expected), 'frame tag mismatch')
+    return kind, stream_id, payload
 
 
 def _fake_hub_session(env, name, welcome_auth_secret, marker):
@@ -329,15 +351,28 @@ def _fake_hub_session(env, name, welcome_auth_secret, marker):
                    'params': {'name': 'exec', 'arguments': {'argv': ['touch', str(marker)], 'timeout': 10}}}
             try:
                 _send_frame(conn, FRAME_WELCOME, 0, json.dumps({'v': 1, 'auth': auth}).encode())
-                _send_frame(conn, FRAME_REQ, 1, json.dumps(req).encode())
+                # Authenticated session frames: the hub signs hub-to-node
+                # (seq starts at 0 for the first frame after WELCOME) and
+                # verifies node-to-hub replies the same way.
+                if welcome_auth_secret is not None:
+                    key_h2n = _frame_key(b'mcpnz-frame-h2n', welcome_auth_secret,
+                                         hub_nonce, node_nonce)
+                    key_n2h = _frame_key(b'mcpnz-frame-n2h', welcome_auth_secret,
+                                         hub_nonce, node_nonce)
+                else:
+                    key_h2n = key_n2h = None
+                _send_frame(conn, FRAME_REQ, 1, json.dumps(req).encode(),
+                            key=key_h2n, seq=0)
             except OSError:
                 pass  # the node may already have closed
             got = []
             closed = False
+            rx_seq = 0
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 try:
-                    got.append(_recv_frame(conn)[0])
+                    got.append(_recv_frame(conn, key=key_n2h, seq=rx_seq)[0])
+                    rx_seq += 1
                     if FRAME_RESP in got:
                         break
                 except socket.timeout:
@@ -733,7 +768,7 @@ def case_tls_link(env):
         check(status == 200 and 'result' in reply, (status, reply))
         status, reply = env.rpc('tlsnode', 'tools/list', {})
         tools = reply.get('result', {}).get('tools', []) if isinstance(reply, dict) else []
-        check(status == 200 and len(tools) == 13, (status, len(tools)))
+        check(status == 200 and len(tools) == 14, (status, len(tools)))
         out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-tls'], 'timeout': 10})
         check(out.get('ok') and out.get('stdout') == 'over-tls\n', out)
 
@@ -815,7 +850,7 @@ def case_tls_builtin_hub(env):
     check(status == 200 and 'result' in reply, (status, reply))
     status, reply = env.rpc('tlsnode', 'tools/list', {})
     tools = reply.get('result', {}).get('tools', []) if isinstance(reply, dict) else []
-    check(status == 200 and len(tools) == 13, (status, len(tools)))
+    check(status == 200 and len(tools) == 14, (status, len(tools)))
     out = env.tool('tlsnode', 'exec', {'argv': ['echo', 'over-builtin-tls'], 'timeout': 10})
     check(out.get('ok') and out.get('stdout') == 'over-builtin-tls\n', out)
 
@@ -1046,7 +1081,7 @@ CASES = [
     ('default listener mode unaffected', case_listen_mode_unaffected),
     ('a second listener on a taken port fails with AddressInUse', case_second_listener_refused),
     ('TLS link: trusted CA connects and serves exec, other CA and wrong name never appear', case_tls_link),
-    ('built-in TLS hub: trusted CA node serves 13 tools and exec', case_tls_builtin_hub),
+    ('built-in TLS hub: trusted CA node serves 14 tools and exec', case_tls_builtin_hub),
     ('built-in TLS hub: plaintext node refused, hub stays up', case_tls_builtin_plaintext_refused),
     ('built-in TLS hub: per-source cap with real TLS sources', case_tls_builtin_per_source_cap),
     ('built-in TLS hub: failed TLS handshakes ban the source', case_tls_builtin_failed_handshakes_ban),

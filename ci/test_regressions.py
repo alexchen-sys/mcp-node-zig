@@ -993,11 +993,13 @@ class SanityTests(unittest.TestCase):
         self.assertIn(reply.get('error'),
                       ('InvalidPadding', 'InvalidCharacter', 'InvalidLength'), reply)
         self.assertTrue(reply.get('message'), reply)
-        # Scope boundary: self-explanatory names stay message-less.
+        # MissingArgv gained an actionable message in v0.5.0 (the error
+        # rollout across the six most-hit codes).
         reply = node.tool('exec', {})
         self.assertFalse(reply.get('ok'), reply)
         self.assertEqual(reply.get('error'), 'MissingArgv', reply)
-        self.assertNotIn('message', reply)
+        self.assertEqual(reply.get('message'),
+                         'argv is required and must be a non-empty array of strings', reply)
 
 
 if __name__ == '__main__':

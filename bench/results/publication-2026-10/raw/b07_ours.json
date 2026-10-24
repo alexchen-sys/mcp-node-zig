@@ -2,36 +2,36 @@
  "mode": "one process, N keep-alive connections",
  "transport": "http",
  "argv": [
-  "/root/repo/zig-out/bin/mcp-node"
+  "zig-out/bin/mcp-node"
  ],
  "server_info": {
   "name": "mcp-node",
-  "version": "0.3.1"
+  "version": "0.5.0"
  },
- "base_rss_kib": 2704,
+ "base_rss_kib": 1916,
  "steps": [
   {
    "connections": 6,
-   "rss_kib": 3472
+   "rss_kib": 3436
   },
   {
    "connections": 11,
-   "rss_kib": 3856
+   "rss_kib": 4956
   },
   {
    "connections": 16,
-   "rss_kib": 5008
+   "rss_kib": 6476
   },
   {
    "connections": 21,
-   "rss_kib": 6544
+   "rss_kib": 7996
   }
  ],
  "connections_total": 20,
- "delta_rss_kib_total": 3840,
- "delta_rss_kib_per_connection": 192.0,
- "rss_kib_after_close": 4800,
- "recovered_delta_kib": 2096,
- "recovered": false,
+ "delta_rss_kib_total": 6080,
+ "delta_rss_kib_per_connection": 304.0,
+ "rss_kib_after_close": 1612,
+ "recovered_delta_kib": -304,
+ "recovered": true,
  "phase": "per_connection"
 }

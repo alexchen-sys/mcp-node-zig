@@ -7,7 +7,7 @@ Conventions follow the methodology doc (bench/README.md):
   histogram so the distribution shape is inspectable without re-reading
   the raw JSONL
 - 95% CI of the mean uses Student's t (df = N-1)
-- series with CV > 10% are flagged, never silently dropped
+- CV% is always computed and reported alongside percentiles, never silently dropped
 """
 import math
 

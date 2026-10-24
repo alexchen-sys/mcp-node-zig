@@ -3,26 +3,26 @@
  "label": "idle RSS after initialize (tree sum; median of 20 x 0.5s samples)",
  "participants": {
   "ours": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_ours.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b03_ours.json",
    "argv": [
-    "/root/repo/zig-out/bin/mcp-node"
+    "zig-out/bin/mcp-node"
    ],
    "transport": "http",
    "server_info": {
     "name": "mcp-node",
-    "version": "0.3.1"
+    "version": "0.5.0"
    },
    "runs": null,
    "failures": 0,
    "summary": {
-    "rss_mib_median": 2.3,
-    "rss_mib_max": 2.3,
-    "pss_mib_median": 1.87,
-    "pss_mib_max": 1.87
+    "rss_mib_median": 1.57,
+    "rss_mib_max": 1.57,
+    "pss_mib_median": 1.57,
+    "pss_mib_max": 1.57
    }
   },
   "tumf": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_tumf.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b03_tumf.json",
    "argv": [
     "uvx",
     "mcp-shell-server"
@@ -35,14 +35,14 @@
    "runs": null,
    "failures": 0,
    "summary": {
-    "rss_mib_median": 111.84,
-    "rss_mib_max": 111.84,
-    "pss_mib_median": 108.54,
-    "pss_mib_max": 108.54
+    "rss_mib_median": 97.2,
+    "rss_mib_max": 97.2,
+    "pss_mib_median": 92.36,
+    "pss_mib_max": 92.36
    }
   },
   "g0t4": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b03_g0t4.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b03_g0t4.json",
    "argv": [
     "npx",
     "-y",
@@ -57,10 +57,10 @@
    "runs": null,
    "failures": 0,
    "summary": {
-    "rss_mib_median": 152.6,
-    "rss_mib_max": 152.6,
-    "pss_mib_median": 109.26,
-    "pss_mib_max": 109.26
+    "rss_mib_median": 133.19,
+    "rss_mib_max": 133.19,
+    "pss_mib_median": 79.12,
+    "pss_mib_max": 79.12
    }
   }
  }

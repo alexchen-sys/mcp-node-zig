@@ -164,7 +164,7 @@
        "ok": false,
        "error": "MissingSession"
       },
-      "isError": false
+      "isError": true
      }
     }
    }

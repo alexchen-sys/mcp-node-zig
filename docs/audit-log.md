@@ -24,7 +24,7 @@ MCP_NODE_AUDIT_KEY_FILE=./audit-key \
 | `MCP_NODE_AUDIT_KEY_FILE` | unset; records are written but not chained (`"chain":false` in the start record) |
 | `MCP_NODE_AUDIT_ARGS` | `summary`; `full` logs full argv and paths |
 | `MCP_NODE_AUDIT_ON_FULL` | `block`; `drop` sheds records under a stuck disk and logs a chained `dropped` record with the count |
-| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864` (64 MiB); past this size the file is renamed to `<file>.<first-seq>` and the chain continues in a fresh file opened with a `rotate` record |
+| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864` (64 MiB); past this size the file is renamed to `<file>.<chain-gen>.<first-seq>` (never replacing an existing file) and the chain continues in a fresh file opened with a `rotate` record |
 
 The key file must be `0600` on POSIX; anything group/other-readable fails
 startup. The audit key is separate from the HTTP token and the link secret
@@ -39,14 +39,17 @@ record inside the chain.
 ## What is logged
 
 Node, per `tools/call` (`tool.call`), plus `tool.start` before dispatch for
-the long tools (`exec`, `exec_start`, `exec_shell`) so a crash mid-call
+the long tools (`exec`, `exec_start`, `exec_shell`, `copy_path`) so a crash mid-call
 still leaves a trace:
 
 - `tool`, `transport` (`http`/`stdio`/`link`), `client` (HTTP peer address,
   `stdio`, or `hub:<host>:<port>`), `session` (sha256 prefix of the
   `Mcp-Session-Id` header, never the id itself), `req_id` (the JSON-RPC id,
   truncated to 64 bytes), `link_sid` on the reverse link,
-  `args_digest` (sha256 of the canonical arguments JSON),
+  `args_digest` (sha256 of the canonical arguments JSON; when nesting
+  exceeds the examined depth, the record also carries
+  `args_digest_partial: true` and the digest must not be treated as a
+  complete fingerprint),
   `args_summary` (per-tool allowlist, below), `ok`, `exit_code`, `error`
   (error name only), `duration_ms`, `out_bytes`.
 
@@ -60,14 +63,14 @@ two files join.
 Both roles log `start` (with a sha256 fingerprint of the effective config;
 secrets are replaced by their file paths, so a changed allowlist shows up)
 and `stop`. `stop` is written on a clean in-process exit (stdio mode on
-stdin EOF); a daemon killed by SIGTERM exits without it — an absent `stop`
+stdin EOF); a daemon killed by SIGTERM exits without it; an absent `stop`
 after a restart is normal, not tampering.
 
 With `MCP_NODE_POLICY_FILE` configured (see [argument gating](arg-gating.md)),
 every refusal is a `policy.deny` record: the same call fields as
 `tool.call` (tool, transport, client, session, req_id, args_digest,
 args_summary) plus `reason` (machine-readable deny reason) and `token`
-(16-hex sha256 prefix of the client token — identifies which policy entry
+(16-hex sha256 prefix of the client token; identifies which policy entry
 denied; the token value is never logged). The policy file path and a sha256
 of its bytes enter the config fingerprint, so a policy edit shows up in the
 next `start` record.
@@ -80,6 +83,7 @@ Argument summaries are an allowlist, per tool:
 | `exec_shell` | shell name and script length, never the script |
 | `read_file`, `list_dir` | path |
 | `write_file` | path and decoded size, never the content |
+| `copy_path` | `source`, `destination`, `max_bytes`, `max_entries`, `timeout` |
 | `exec_poll`, `exec_wait`, `exec_write`, `exec_kill`, `exec_close` | session id |
 | everything else | `{}` |
 
@@ -103,8 +107,8 @@ A write failure rolls the chain state back and counts the lost records
 into the next batch's chained `dropped` record; a torn partial write is
 truncated back to the last good offset.
 On startup the daemon reads the tail of an existing file, verifies the
-chain over the tail window and continues `seq`/`prev`, so a restart —
-including kill -9 between batches — continues the same chain. A torn final
+chain over the tail window and continues `seq`/`prev`. A restart, including
+kill -9 between batches, continues the same chain. A torn final
 line is truncated; a tail that fails verification is renamed to
 `<file>.corrupt-<epoch ms>` and the new file starts with a `chain.break`
 record.
@@ -130,7 +134,7 @@ keyless logs with the key unset.
 (ticket, chat, another machine) to pin the chain.
 
 Pass rotated files oldest-first (the live file last). The verifier accepts
-a file list in any order — a wrong order can hide a gap between files.
+a file list in any order; a wrong order can hide a gap between files.
 
 Changing the audit key starts a new chain: verification of lines written
 under the old key fails from the key change on. Rename the old file away
@@ -153,12 +157,13 @@ end to end). An anchor pins a `(seq, mac)` pair; any rewrite before it
 breaks the comparison.
 
 Also only against an anchor: replacing the earliest rotated files (the
-first file of a list is the trust root — a zero-prev boundary is accepted
+first file of a list is the trust root; a zero-prev boundary is accepted
 as a legitimate fresh chain), and swapping in a complete attacker-grown
 chain when the key is compromised.
 
-Not covered: a root attacker on the machine can stop logging, delete the
-file, or — with the audit key — forge a fresh chain from scratch. Keep the
+Not covered: a root attacker on the machine can stop logging or delete the
+file. With the audit key, the attacker can also forge a fresh chain from
+scratch. Keep the
 key off the audited machine when that matters, and anchor regularly. The
 `block`/`drop` choice above is the availability trade-off under a full
 disk; `block` can stall tool calls, `drop` loses records with a visible

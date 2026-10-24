@@ -1,8 +1,8 @@
 {
-  "description": "tools/list advertises exactly the 13 v0 tools, in the frozen literal order, each with a description, a human-readable title, an outputSchema (subset-pinned to its presence and object type only) and MCP annotation hints (subset match: extra schema keys like properties and their descriptions are allowed and not pinned byte-exact). Also pins the tools/call envelope for an unknown tool name, including the tools/list recovery hint.",
+  "description": "tools/list advertises exactly the 14 MCP tools, in the frozen literal order, each with a description, a human-readable title, an outputSchema (subset-pinned to its presence and object type only) and MCP annotation hints (subset match: extra schema keys like properties and their descriptions are allowed and not pinned byte-exact). Also pins the tools/call envelope for an unknown tool name, including the tools/list recovery hint.",
   "cases": [
     {
-      "name": "exact_13_tools_in_frozen_order",
+      "name": "exact_14_tools_in_frozen_order",
       "request": {
         "jsonrpc": "2.0",
         "id": 42,
@@ -19,32 +19,191 @@
               {
                 "name": "sys_info",
                 "title": "System Info",
-                "description": {
-                  "*str": null
-                },
+                "description": "Host summary: hostname, OS, load, memory, root disk (disk_root: total/used/free bytes), uptime. No arguments, read-only; use as a connectivity check.",
                 "inputSchema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {}
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "node": {
+                      "type": "string"
+                    },
+                    "hostname": {
+                      "type": "string"
+                    },
+                    "os": {
+                      "type": "string"
+                    },
+                    "machine": {
+                      "type": "string"
+                    },
+                    "loadavg_raw": {
+                      "type": "string"
+                    },
+                    "uptime_raw": {
+                      "type": "string"
+                    },
+                    "mem": {
+                      "type": "object",
+                      "properties": {
+                        "MemTotal": {
+                          "type": "integer"
+                        },
+                        "MemAvailable": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "MemTotal",
+                        "MemAvailable"
+                      ]
+                    },
+                    "disk_root": {
+                      "type": "object",
+                      "properties": {
+                        "total": {
+                          "type": "integer"
+                        },
+                        "used": {
+                          "type": "integer"
+                        },
+                        "free": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "total",
+                        "used",
+                        "free"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "node",
+                    "hostname",
+                    "os",
+                    "machine",
+                    "loadavg_raw",
+                    "uptime_raw",
+                    "mem",
+                    "disk_root"
+                  ]
                 },
                 "annotations": {
                   "readOnlyHint": true,
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec",
                 "title": "Run Command (no shell)",
-                "description": {
-                  "*str": null
-                },
+                "description": "Run argv to exit, no shell: metacharacters are data. Shell syntax: exec_shell. Long-running or interactive: exec_start. timeout in seconds, default 120, clamped to [1, 1800]. Invalid UTF-8 in stdout/stderr becomes U+FFFD.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "argv": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Program and arguments, e.g. [\"df\", \"-h\", \"/\"]. Passed verbatim."
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Child working directory; omit to inherit."
+                    },
+                    "timeout": {
+                      "type": "integer",
+                      "description": "Kill after this many seconds (1..1800, default 120)."
+                    },
+                    "max_bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1048576,
+                      "description": "Per-stream raw byte cap after line selection; also bounded by MCP_NODE_MAX_OUT. Enables bounded shaping instead of OutputTooLong."
+                    },
+                    "head_lines": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Select first lines."
+                    },
+                    "tail_lines": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Select last lines; mutually exclusive with head_lines, including zero. LF delimits lines; a final partial line counts."
+                    }
+                  },
                   "required": [
                     "argv"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "exit_code": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "stdout": {
+                      "type": "string"
+                    },
+                    "stderr": {
+                      "type": "string"
+                    },
+                    "duration_ms": {
+                      "type": "integer"
+                    },
+                    "duration_us": {
+                      "type": "integer"
+                    },
+                    "timeout": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "truncated_stdout": {
+                      "type": "boolean"
+                    },
+                    "truncated_stderr": {
+                      "type": "boolean"
+                    },
+                    "output_complete": {
+                      "type": "boolean"
+                    },
+                    "total_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "total_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "returned_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "returned_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "omitted_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "omitted_stderr_bytes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -52,21 +211,59 @@
                   "destructiveHint": true,
                   "idempotentHint": false,
                   "openWorldHint": true
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_start",
                 "title": "Start Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Start a process as a session; returns session_id at once. Use when it outlives the call, streams output or reads stdin (exec_write). Then exec_poll, exec_wait, exec_kill, exec_close. Sessions survive link drops, hub restarts and client disconnects (they live in the node process, not the connection); after a reconnect, poll the same session_id from your last offsets. Finished sessions are reaped after the session TTL. Durability is opt in: durable:true persists the session under the node state dir so it survives a node restart; after the restart poll the same session_id and a recovered session answers recovered:true with stdin_available:false. Durable needs MCP_NODE_STATE_DIR or --state-dir (else DurabilityDisabled); the state dir is locked for the node lifetime (a second node answers StateDirLocked at startup); cwd plus argv must fit the 12 KiB record cap with at most 256 argv elements (DurableMetadataTooLarge); durable sessions are Linux only in v0.5.0 (DurabilityUnsupported). Without durable a node restart drops the session.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "argv": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Program and arguments, e.g. [\"python3\", \"-i\"]. Passed verbatim. With durable:true: at most 256 elements, and cwd+argv must fit the 12 KiB record cap (DurableMetadataTooLarge)."
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Child working directory; omit to inherit."
+                    },
+                    "durable": {
+                      "type": "boolean",
+                      "description": "Persist this session to the state dir so it survives a node restart; requires MCP_NODE_STATE_DIR/--state-dir, else DurabilityDisabled"
+                    }
+                  },
                   "required": [
                     "argv"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "session_id": {
+                      "type": "integer"
+                    },
+                    "pid": {
+                      "type": "integer"
+                    },
+                    "recovered": {
+                      "type": "boolean"
+                    },
+                    "stdin_available": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -74,21 +271,131 @@
                   "destructiveHint": true,
                   "idempotentHint": false,
                   "openWorldHint": true
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_poll",
                 "title": "Poll Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Read new session output from byte offsets: stdout/stderr deltas, done, exit_code, truncation flags. Pass back the offsets from the previous reply to resume. Works across reconnects: offsets are positions in the node-side buffer, which survives link drops and client disconnects. Unknown/expired session: {ok:false, error:unknown_session, session_id, expired}; expired=true means this node recently had it and closed/reaped/evicted it (bounded recency window; ids removed long ago answer expired=false). done reports process exit, not drained output: keep polling while has_more is true (done and has_more can both be true on the exit page). Same payload as exec_wait. Durable sessions add recovered, stdin_available, output_complete and tree_state, and a finished one adds completion_reason (interrupted, or orphaned_exit when the child outlived the node). A recovered session has no stdin left from the dead node: stdin_available is false and exec_write answers StdinUnavailable. On POSIX a child that exited while the node was down is reaped by init, so its exit code is unknowable: exit_code is null with completion_reason orphaned_exit while output_complete stays true because the logs are exact.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "type": "integer",
+                      "description": "Positive id from exec_start."
+                    },
+                    "stdout_offset": {
+                      "type": "integer",
+                      "description": "Stdout byte offset to resume from, as returned by the previous poll (default 0)."
+                    },
+                    "stderr_offset": {
+                      "type": "integer",
+                      "description": "Stderr byte offset to resume from, as returned by the previous poll (default 0)."
+                    },
+                    "max_bytes": {
+                      "type": "integer",
+                      "minimum": 4,
+                      "maximum": 1048576,
+                      "description": "Per-stream raw byte page size; also bounded by MCP_NODE_MAX_OUT. Offsets advance only by consumed bytes."
+                    }
+                  },
                   "required": [
                     "session_id"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "done": {
+                      "type": "boolean"
+                    },
+                    "exit_code": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "stdout": {
+                      "type": "string"
+                    },
+                    "stderr": {
+                      "type": "string"
+                    },
+                    "stdout_offset": {
+                      "type": "integer"
+                    },
+                    "stderr_offset": {
+                      "type": "integer"
+                    },
+                    "truncated_stdout": {
+                      "type": "boolean"
+                    },
+                    "truncated_stderr": {
+                      "type": "boolean"
+                    },
+                    "lost_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "lost_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "duration_ms": {
+                      "type": "integer"
+                    },
+                    "duration_us": {
+                      "type": "integer"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "session_id": {
+                      "type": "integer"
+                    },
+                    "expired": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "has_more_stdout": {
+                      "type": "boolean"
+                    },
+                    "has_more_stderr": {
+                      "type": "boolean"
+                    },
+                    "has_more": {
+                      "type": "boolean"
+                    },
+                    "page_limited": {
+                      "type": "boolean"
+                    },
+                    "total_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "total_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "recovered": {
+                      "type": "boolean"
+                    },
+                    "stdin_available": {
+                      "type": "boolean"
+                    },
+                    "output_complete": {
+                      "type": "boolean"
+                    },
+                    "tree_state": {
+                      "type": "string"
+                    },
+                    "completion_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -96,44 +403,106 @@
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_write",
                 "title": "Write To Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Write bytes to session stdin; eof=true closes stdin afterwards. For interactive programs started by exec_start. A recovered durable session lost its stdin with the dead node: exec_write answers StdinUnavailable and exec_poll keeps reporting stdin_available:false. Unknown/expired session answers the unknown_session payload (ok:false, session_id, expired; best-effort recency).",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "type": "integer",
+                      "description": "Positive id from exec_start."
+                    },
+                    "data_b64": {
+                      "type": "string",
+                      "description": "Standard base64 of bytes for stdin; may be empty."
+                    },
+                    "eof": {
+                      "type": "boolean",
+                      "description": "Close stdin after writing (default false)."
+                    }
+                  },
                   "required": [
                     "session_id",
                     "data_b64"
                   ]
                 },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "eof": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "session_id": {
+                      "type": "integer"
+                    },
+                    "expired": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
+                },
                 "annotations": {
                   "readOnlyHint": false,
                   "destructiveHint": false,
                   "idempotentHint": false,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_kill",
                 "title": "Kill Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Kill the session's process tree (POSIX: SIGKILL to the process group; Windows: job object). Safe on a dead session. Output stays pollable; free with exec_close. On a durable or recovered session the kill re-verifies the recorded identity (pid, start time, boot id) and signals the process group only when the verified leader is alive and owns it; an unverifiable tree is never signaled and the audit chain records session.orphan_skip with pid_reused_or_dead. Unknown/expired session answers the unknown_session payload (ok:false, session_id, expired; best-effort recency).",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "type": "integer",
+                      "description": "Positive id from exec_start."
+                    }
+                  },
                   "required": [
                     "session_id"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "session_id": {
+                      "type": "integer"
+                    },
+                    "expired": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -141,21 +510,39 @@
                   "destructiveHint": true,
                   "idempotentHint": false,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_close",
                 "title": "Close Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Kill if running, join threads, free the session. Idempotent: repeat calls return ok, already_closed=true. Close every session you start; sessions persist across requests. A durable session is retired too: its owner-bound tombstone is persisted and its state dir files are removed before the id answers unknown_session with expired:true.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "type": "integer",
+                      "description": "Positive id from exec_start."
+                    }
+                  },
                   "required": [
                     "session_id"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "already_closed": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -163,21 +550,135 @@
                   "destructiveHint": true,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_wait",
                 "title": "Wait For Session",
-                "description": {
-                  "*str": null
-                },
+                "description": "Block until the session exits or timeout elapses (default 30s, max 300s). done reports process exit, not drained output: keep polling while has_more is true. Returns the exec_poll payload with deltas from the given offsets, including recovered, stdin_available, output_complete, tree_state and completion_reason for durable sessions.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "session_id": {
+                      "type": "integer",
+                      "description": "Positive id from exec_start."
+                    },
+                    "timeout": {
+                      "type": "integer",
+                      "description": "Max seconds to wait (1..300, default 30)."
+                    },
+                    "stdout_offset": {
+                      "type": "integer",
+                      "description": "Stdout byte offset to resume from (default 0)."
+                    },
+                    "stderr_offset": {
+                      "type": "integer",
+                      "description": "Stderr byte offset to resume from (default 0)."
+                    },
+                    "max_bytes": {
+                      "type": "integer",
+                      "minimum": 4,
+                      "maximum": 1048576,
+                      "description": "Per-stream raw byte page size; also bounded by MCP_NODE_MAX_OUT. Offsets advance only by consumed bytes."
+                    }
+                  },
                   "required": [
                     "session_id"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "done": {
+                      "type": "boolean"
+                    },
+                    "exit_code": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "stdout": {
+                      "type": "string"
+                    },
+                    "stderr": {
+                      "type": "string"
+                    },
+                    "stdout_offset": {
+                      "type": "integer"
+                    },
+                    "stderr_offset": {
+                      "type": "integer"
+                    },
+                    "truncated_stdout": {
+                      "type": "boolean"
+                    },
+                    "truncated_stderr": {
+                      "type": "boolean"
+                    },
+                    "lost_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "lost_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "duration_ms": {
+                      "type": "integer"
+                    },
+                    "duration_us": {
+                      "type": "integer"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "session_id": {
+                      "type": "integer"
+                    },
+                    "expired": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "has_more_stdout": {
+                      "type": "boolean"
+                    },
+                    "has_more_stderr": {
+                      "type": "boolean"
+                    },
+                    "has_more": {
+                      "type": "boolean"
+                    },
+                    "page_limited": {
+                      "type": "boolean"
+                    },
+                    "total_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "total_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "recovered": {
+                      "type": "boolean"
+                    },
+                    "stdin_available": {
+                      "type": "boolean"
+                    },
+                    "output_complete": {
+                      "type": "boolean"
+                    },
+                    "tree_state": {
+                      "type": "string"
+                    },
+                    "completion_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -185,40 +686,197 @@
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_list",
                 "title": "List Sessions",
-                "description": {
-                  "*str": null
-                },
+                "description": "List live sessions: session_id, pid, argv, done, exit_code, timestamps. No arguments. Recovers ids after a lost reply.",
                 "inputSchema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {}
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "sessions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "session_id": {
+                            "type": "integer"
+                          },
+                          "pid": {
+                            "type": "integer"
+                          },
+                          "argv": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "done": {
+                            "type": "boolean"
+                          },
+                          "exit_code": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "started_ms": {
+                            "type": "integer"
+                          },
+                          "ended_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "recovered": {
+                            "type": "boolean"
+                          },
+                          "stdin_available": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "session_id",
+                          "pid",
+                          "argv",
+                          "done",
+                          "exit_code",
+                          "started_ms",
+                          "ended_ms"
+                        ]
+                      }
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
                 },
                 "annotations": {
                   "readOnlyHint": true,
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "exec_shell",
                 "title": "Run Shell Script",
-                "description": {
-                  "*str": null
-                },
+                "description": "Run one script through one shell (POSIX: bash/sh/fish/zsh -c; Windows: cmd /c, powershell -c). Only for shell syntax: pipes, redirects, &&, globs; otherwise exec. Regex/quote-heavy scripts: write the script with write_file, then run it with exec (or exec ['python3','-c',...]) to avoid quoting bugs. timeout in seconds, default 120, clamped to [1, 1800]. Invalid UTF-8 in stdout/stderr becomes U+FFFD.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "script": {
+                      "type": "string",
+                      "description": "Script passed to the shell, e.g. \"du -sh /var/log | sort -h\"."
+                    },
+                    "shell": {
+                      "type": "string",
+                      "description": "POSIX: bash (default), sh, fish, zsh. Windows: cmd (default), powershell."
+                    },
+                    "timeout": {
+                      "type": "integer",
+                      "description": "Kill after this many seconds (1..1800, default 120)."
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Child working directory; omit to inherit."
+                    },
+                    "max_bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1048576,
+                      "description": "Per-stream raw byte cap after line selection; also bounded by MCP_NODE_MAX_OUT. Enables bounded shaping instead of OutputTooLong."
+                    },
+                    "head_lines": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Select first lines."
+                    },
+                    "tail_lines": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Select last lines; mutually exclusive with head_lines, including zero. LF delimits lines; a final partial line counts."
+                    }
+                  },
                   "required": [
                     "script"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "exit_code": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "stdout": {
+                      "type": "string"
+                    },
+                    "stderr": {
+                      "type": "string"
+                    },
+                    "duration_ms": {
+                      "type": "integer"
+                    },
+                    "duration_us": {
+                      "type": "integer"
+                    },
+                    "timeout": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "truncated_stdout": {
+                      "type": "boolean"
+                    },
+                    "truncated_stderr": {
+                      "type": "boolean"
+                    },
+                    "output_complete": {
+                      "type": "boolean"
+                    },
+                    "total_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "total_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "returned_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "returned_stderr_bytes": {
+                      "type": "integer"
+                    },
+                    "omitted_stdout_bytes": {
+                      "type": "integer"
+                    },
+                    "omitted_stderr_bytes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -226,21 +884,84 @@
                   "destructiveHint": true,
                   "idempotentHint": false,
                   "openWorldHint": true
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "read_file",
                 "title": "Read File",
-                "description": {
-                  "*str": null
-                },
+                "description": "Read a text file as UTF-8 (invalid bytes replaced): size, content, has_more. Two window modes, mutually exclusive: offset/limit count characters (default limit 200000), or line_offset (1-indexed)/line_limit select whole lines and add total_lines. Files over 64 MiB are rejected.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "File path; \"~\" expands to home."
+                    },
+                    "offset": {
+                      "type": "integer",
+                      "description": "Start character (default 0); not with line_offset/line_limit."
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Max characters (default 200000); not with line_offset/line_limit."
+                    },
+                    "line_offset": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "First line to return, 1-indexed (default 1)."
+                    },
+                    "line_limit": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Max lines to return (default: to end of file)."
+                    }
+                  },
                   "required": [
                     "path"
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "content": {
+                      "type": "string"
+                    },
+                    "has_more": {
+                      "type": "boolean"
+                    },
+                    "line_offset": {
+                      "type": "integer"
+                    },
+                    "line_limit": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "total_lines": {
+                      "type": "integer"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -248,22 +969,73 @@
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "write_file",
                 "title": "Write File",
-                "description": {
-                  "*str": null
-                },
+                "description": "Write a file, overwriting; creates parent dirs by default. Provide exactly one of: content (plain UTF-8 text: configs, scripts, JSON) or content_b64 (standard base64: binary). Returns size and sha256 of the written bytes.",
                 "inputSchema": {
                   "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "File path; \"~\" expands to home."
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "Plain UTF-8 text content; mutually exclusive with content_b64."
+                    },
+                    "content_b64": {
+                      "type": "string",
+                      "description": "Standard base64 file content; mutually exclusive with content."
+                    },
+                    "mode": {
+                      "type": "integer",
+                      "description": "POSIX permission bits for the new file, 0..0o7777 (default 0o644; ignored on Windows)."
+                    },
+                    "mkdirs": {
+                      "type": "boolean",
+                      "description": "Create missing parent directories (default true)."
+                    }
+                  },
                   "required": [
-                    "path",
-                    "content_b64"
+                    "path"
+                  ],
+                  "oneOf": [
+                    {
+                      "required": [
+                        "content"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "content_b64"
+                      ]
+                    }
+                  ]
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": "integer"
+                    },
+                    "sha256": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
                   ]
                 },
                 "annotations": {
@@ -271,28 +1043,179 @@
                   "destructiveHint": true,
                   "idempotentHint": false,
                   "openWorldHint": false
-                },
-                "outputSchema": {
-                  "type": "object"
                 }
               },
               {
                 "name": "list_dir",
                 "title": "List Directory",
-                "description": {
-                  "*str": null
-                },
+                "description": "List directory entries sorted by name: name, type (d dir, l symlink, f file), size in bytes, mtime in Unix seconds. Max 2000 per call; truncated=true if more.",
                 "inputSchema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "description": "Directory; \"~\" expands to home; default: working directory."
+                    }
+                  }
+                },
+                "outputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "string"
+                          },
+                          "size": {
+                            "type": "integer"
+                          },
+                          "mtime": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "type",
+                          "size",
+                          "mtime"
+                        ]
+                      }
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "has_more": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
                 },
                 "annotations": {
                   "readOnlyHint": true,
                   "destructiveHint": false,
                   "idempotentHint": true,
                   "openWorldHint": false
+                }
+              },
+              {
+                "name": "copy_path",
+                "title": "Copy Path",
+                "description": "Copy one file or directory to an exact new destination. Parent must exist; no overwrite, merge, links or special files. Directories require recursive=true and a policy mode cap including 0700. Parent traversal is refused. Windows returns AtomicPublishUnsupported. Server copy ceilings may be lower than schema maxima. Atomic visibility, not a point-in-time snapshot or crash durability. The directories count includes the copied root. checksum_format is content-sha256 for a single file, mcp-tree-v1 for a tree (sorted depth-first binary records under a domain-separator prefix). The destination receives private permissions (files 0600, directories 0700); source modes are not preserved.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "source": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "destination": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "recursive": {
+                      "type": "boolean",
+                      "default": false
+                    },
+                    "max_bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1073741824,
+                      "default": 67108864
+                    },
+                    "max_entries": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 10000,
+                      "default": 2000
+                    },
+                    "timeout": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 300,
+                      "default": 30
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "destination"
+                  ],
+                  "additionalProperties": false
                 },
                 "outputSchema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "destination": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "files": {
+                      "type": "integer"
+                    },
+                    "directories": {
+                      "type": "integer"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "sha256": {
+                      "type": "string"
+                    },
+                    "checksum_format": {
+                      "type": "string"
+                    },
+                    "consistency": {
+                      "type": "string"
+                    },
+                    "atomic_publish": {
+                      "type": "boolean"
+                    },
+                    "crash_durable": {
+                      "type": "boolean"
+                    },
+                    "duration_ms": {
+                      "type": "integer"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
+                },
+                "annotations": {
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": false
                 }
               }
             ]

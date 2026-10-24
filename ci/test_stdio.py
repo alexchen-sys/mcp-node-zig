@@ -27,7 +27,7 @@ BINARY = Path(sys.argv[1] if len(sys.argv) > 1
               else ROOT / 'zig-out' / 'bin' / ('mcp-node.exe' if os.name == 'nt' else 'mcp-node')).resolve()
 
 TIMEOUT_S = 20
-EXPECTED_TOOLS = 13
+EXPECTED_TOOLS = 14
 
 
 def base_env():
@@ -268,7 +268,119 @@ def case_default_mode_unchanged():
         node.kill()
 
 
+def tool_call(node, name, arguments):
+    response = node.call({'jsonrpc': '2.0', 'id': 42, 'method': 'tools/call',
+                          'params': {'name': name, 'arguments': arguments}})
+    if 'error' in response:
+        assert response['error']['code'] == -32602, response
+        return {'ok': False, 'error': 'InvalidParams'}
+    return response['result']['structuredContent']
+
+
+def case_shaped_exec_and_shell():
+    node = StdioNode(env_extra={'MCP_NODE_MAX_OUT': '64'})
+    try:
+        script = "import os; os.write(1,b'a\\r\\nb\\r\\nc'); os.write(2,b'err')"
+        shaped = tool_call(node, 'exec', {'argv': [sys.executable, '-c', script],
+                                         'tail_lines': 2, 'max_bytes': 4})
+        assert shaped['stdout'] == 'b\r\nc', shaped
+        assert shaped['stderr'] == 'err', shaped
+        assert shaped['total_stdout_bytes'] == 7, shaped
+        assert shaped['returned_stdout_bytes'] == 4, shaped
+        assert shaped['omitted_stdout_bytes'] == 3, shaped
+        assert shaped['truncated'] and shaped['truncated_stdout'], shaped
+        assert not shaped['truncated_stderr'], shaped
+        assert shaped['output_complete'] and shaped['exit_code'] == 0, shaped
+        if os.name != 'nt':
+            shaped = tool_call(node, 'exec_shell', {'shell': 'sh',
+                'script': "printf 'one\\ntwo\\nthree'; printf err >&2",
+                'head_lines': 1})
+            assert shaped['stdout'] == 'one\n' and shaped['stderr'] == 'err', shaped
+            assert shaped['total_stdout_bytes'] == 13, shaped
+            assert shaped['omitted_stdout_bytes'] == 9, shaped
+        argv = [sys.executable, '-c', "import os; os.write(1,b'x'*100000); os.write(2,b'y'*100000)"]
+        shaped = tool_call(node, 'exec', {'argv': argv, 'max_bytes': 0})
+        assert shaped['stdout'] == shaped['stderr'] == '', shaped
+        for stream in ('stdout', 'stderr'):
+            assert shaped['total_' + stream + '_bytes'] == 100000, shaped
+            assert shaped['omitted_' + stream + '_bytes'] == 100000, shaped
+        legacy = tool_call(node, 'exec', {'argv': argv})
+        assert legacy['error'] == 'OutputTooLong', legacy
+        assert 'output_complete' not in legacy, legacy
+        legacy = tool_call(node, 'exec', {'argv': [sys.executable, '-c', "print('ok')"]})
+        assert legacy['stdout'] == 'ok\n', legacy
+        assert 'total_stdout_bytes' not in legacy, legacy
+    finally:
+        node.kill()
+
+
+def case_shaped_validation_and_timeout():
+    node = StdioNode(env_extra={'MCP_NODE_MAX_OUT': '64'})
+    try:
+        for extra, error in [({'head_lines': 0, 'tail_lines': 0}, 'ConflictingOutputSelection'),
+                             ({'max_bytes': -1}, 'InvalidParams'),
+                             ({'max_bytes': True}, 'InvalidParams'),
+                             ({'head_lines': 1.5}, 'InvalidParams'),
+                             ({'max_bytes': 65}, 'BadOutputLimit')]:
+            # Invalid selectors must win over preflight/spawn errors.
+            got = tool_call(node, 'exec', {'argv': ['/missing-output-shape-test'], **extra})
+            assert got['error'] == error, got
+        got = tool_call(node, 'exec', {'argv': [sys.executable, '-c',
+            "import os,time; os.write(1,b'abcdef'); os.write(2,b'err'); time.sleep(30)"],
+            'timeout': 1, 'max_bytes': 4})
+        assert not got['ok'] and got['timeout'] and got['exit_code'] is None, got
+        assert not got['output_complete'], got
+        assert got['stdout'] == 'abcd' and got['stderr'] == 'err', got
+        assert got['total_stdout_bytes'] == 6 and got['omitted_stdout_bytes'] == 2, got
+        assert got['returned_stderr_bytes'] == 3 and got['omitted_stderr_bytes'] == 0, got
+    finally:
+        node.kill()
+
+
+def case_output_page_progression():
+    node = StdioNode(env_extra={'MCP_NODE_MAX_OUT': '64'})
+    sid = None
+    try:
+        expected = 'a💩é中z'
+        script = "import os; os.write(1,bytes.fromhex('%s')); os.write(2,b'123456')" % expected.encode().hex()
+        sid = tool_call(node, 'exec_start', {'argv': [sys.executable, '-c', script]})['session_id']
+        args = {'session_id': sid, 'max_bytes': 4}
+        pieces = []
+        err_pieces = []
+        for index in range(10):
+            page = tool_call(node, 'exec_wait' if index == 0 else 'exec_poll', args)
+            assert page['done'] and page['exit_code'] == 0, page
+            assert page['total_stdout_bytes'] == len(expected.encode()), page
+            assert not page['truncated_stdout'] and not page['truncated_stderr'], page
+            assert page['lost_stdout_bytes'] == page['lost_stderr_bytes'] == 0, page
+            pieces.append(page['stdout'])
+            err_pieces.append(page['stderr'])
+            if not page['has_more']:
+                assert not page['page_limited'], page
+                break
+            assert page['stdout_offset'] > args.get('stdout_offset', 0), page
+            args.update(stdout_offset=page['stdout_offset'], stderr_offset=page['stderr_offset'])
+        else:
+            raise AssertionError('pagination made no progress')
+        assert ''.join(pieces) == expected, pieces
+        assert ''.join(err_pieces) == '123456', err_pieces
+        assert page['stdout_offset'] == len(expected.encode()), page
+        assert page['stderr_offset'] == 6, page
+        legacy = tool_call(node, 'exec_poll', {'session_id': sid})
+        assert legacy['stdout'] == expected and 'has_more' not in legacy, legacy
+        for tool in ('exec_poll', 'exec_wait'):
+            assert tool_call(node, tool, {'session_id': sid, 'max_bytes': 3})['error'] == 'BadOutputLimit'
+            assert tool_call(node, tool, {'session_id': sid, 'tail_lines': 1})['error'] == 'InvalidParams'
+    finally:
+        if sid is not None:
+            tool_call(node, 'exec_close', {'session_id': sid})
+        node.kill()
+
+
 CASES = [
+    case_shaped_exec_and_shell,
+    case_shaped_validation_and_timeout,
+    case_output_page_progression,
     case_full_session,
     case_pipelined_burst_in_order,
     case_env_switch_and_immediate_eof,

@@ -14,7 +14,7 @@
       "request": {"jsonrpc": "2.0", "id": 113, "method": "tools/call", "params": {"name": "write_file", "arguments": {"path": "compat-write.txt"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 113, "result": {"content": [{"type": "text", "text": "{\"ok\":false,\"error\":\"MissingContent\"}"}], "structuredContent": {"ok": false, "error": "MissingContent"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 113, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingContent", "message": {"*str": null}}, "isError": true}}
       }
     },
     {

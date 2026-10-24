@@ -12,6 +12,20 @@
 //! secret can never issue REQs. The secret never crosses the wire and each
 //! side's fresh nonce prevents replay of a captured proof.
 //!
+//! Every frame AFTER the handshake (the first frame after WELCOME) also
+//! carries a 32-byte frame tag appended after the payload:
+//! HMAC-SHA256(K_dir, seq_be64 || header || payload), where K_dir
+//! comes from the handshake secret and both nonces (see FrameAuth) and seq
+//! counts frames per direction from 0. The header includes the payload
+//! length, so the length is signed too. A missing, wrong or out-of-order
+//! tag fails the read with error.FrameAuthFailed and the link is closed.
+//! TLS links carry the tags too: the wire format must not depend on the
+//! LOCAL transport of either end, because a TLS terminator (nginx stream,
+//! stunnel, HAProxy) between a TLS node and a plaintext hub would
+//! otherwise leave the two ends speaking different frame formats — the
+//! handshake still completes, the first tagged frame does not. The HMAC
+//! cost is negligible next to the TLS record layer that carries it.
+//!
 //! This module holds only the codec, the MAC, name validation, secret-file
 //! parsing and blocking frame I/O over a connected socket; the dial loop
 //! lives in node_link.zig and the relay in hub.zig.
@@ -130,6 +144,115 @@ pub fn verifyAuth(dir: Direction, secret: []const u8, hub_nonce: *const [NONCE_L
         if (std.fmt.hexToBytes(&got, auth_hex)) |_| true else |_| false;
     const same = std.crypto.timing_safe.eql([MAC_LEN]u8, got, expected);
     return well_formed and same;
+}
+
+// ---------------------------------------------------------------------------
+// Frame authentication for plaintext links
+// ---------------------------------------------------------------------------
+
+/// Which direction a frame key signs, in the same spirit as `Direction`:
+/// the two domain strings differ, so a tag computed with one key can never
+/// be reflected back as valid for the other direction.
+pub const FrameDir = enum {
+    /// Node-to-hub frames: the node signs, the hub verifies.
+    n2h,
+    /// Hub-to-node frames: the hub signs, the node verifies.
+    h2n,
+
+    fn domain(self: FrameDir) []const u8 {
+        return switch (self) {
+            .n2h => "mcpnz-frame-n2h",
+            .h2n => "mcpnz-frame-h2n",
+        };
+    }
+};
+
+/// Session key for one direction of a plaintext link:
+/// HMAC-SHA256(secret, domain || hub_nonce || node_nonce). Like the
+/// handshake MACs, both nonces are fixed-length and the variable-length
+/// input (none here) would come last, so the input is unambiguous.
+pub fn deriveFrameKey(dir: FrameDir, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8) [MAC_LEN]u8 {
+    var key: [MAC_LEN]u8 = undefined;
+    var h = HmacSha256.init(secret);
+    h.update(dir.domain());
+    h.update(hub_nonce);
+    h.update(node_nonce);
+    h.final(&key);
+    return key;
+}
+
+/// Per-link state that signs and verifies frame tags. Created once, right
+/// after the handshake proves the secret, on plaintext and TLS links
+/// alike (the tags ride inside the TLS records; see the module doc for why
+/// the format cannot depend on the local transport). One instance per
+/// link, never shared between links.
+///
+/// Locking: `tx_seq` is read and advanced only under the link's write
+/// mutex (the same one that serializes frame writers); `rx_seq` is touched
+/// only by the link's reader thread. Both start at 0: the first frame
+/// after WELCOME is sequence 0, and the receiver checks exact equality,
+/// so a replay, a duplicate or a reordered frame fails verification and
+/// the read returns error.FrameAuthFailed.
+pub const FrameAuth = struct {
+    /// Key for node-to-hub frames.
+    k_n2h: [MAC_LEN]u8,
+    /// Key for hub-to-node frames.
+    k_h2n: [MAC_LEN]u8,
+    /// Which end this state signs for: .node signs with k_n2h, .hub with
+    /// k_h2n, and each verifies with the opposite key.
+    role: Direction,
+
+    tx_seq: u64 = 0,
+    rx_seq: u64 = 0,
+
+    pub fn init(role: Direction, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8) FrameAuth {
+        return .{
+            .k_n2h = deriveFrameKey(.n2h, secret, hub_nonce, node_nonce),
+            .k_h2n = deriveFrameKey(.h2n, secret, hub_nonce, node_nonce),
+            .role = role,
+        };
+    }
+
+    fn signKey(self: *const FrameAuth) []const u8 {
+        return if (self.role == .node) &self.k_n2h else &self.k_h2n;
+    }
+
+    fn verifyKey(self: *const FrameAuth) []const u8 {
+        return if (self.role == .node) &self.k_h2n else &self.k_n2h;
+    }
+
+    /// tag = HMAC-SHA256(signKey, seq_be64 || header || parts...). The
+    /// payload streams through as parts, so no large buffer is copied just
+    /// to sign it.
+    pub fn computeTag(self: *const FrameAuth, out: *[MAC_LEN]u8, seq: u64, header: *const [HEADER_LEN]u8, parts: []const []const u8) void {
+        var h = HmacSha256.init(self.signKey());
+        updateFrameAuth(&h, seq, header, parts);
+        h.final(out);
+    }
+
+    /// Constant-time check of a received tag against the one expected for
+    /// `seq`. Callers pass their `rx_seq`, so a stale or future sequence
+    /// number fails here as well.
+    pub fn verifyTag(self: *const FrameAuth, seq: u64, header: *const [HEADER_LEN]u8, payload: []const u8, tag: *const [MAC_LEN]u8) bool {
+        var expected: [MAC_LEN]u8 = undefined;
+        var h = HmacSha256.init(self.verifyKey());
+        updateFrameAuth(&h, seq, header, &.{payload});
+        h.final(&expected);
+        return std.crypto.timing_safe.eql([MAC_LEN]u8, expected, tag.*);
+    }
+
+    pub fn secureZero(self: *FrameAuth) void {
+        std.crypto.secureZero(u8, &self.k_n2h);
+        std.crypto.secureZero(u8, &self.k_h2n);
+    }
+};
+
+fn updateFrameAuth(h: *HmacSha256, seq: u64, header: *const [HEADER_LEN]u8, parts: []const []const u8) void {
+    var seq_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_be, seq, .big);
+    h.update(&seq_be);
+    h.update(header);
+    for (parts) |p| h.update(p);
 }
 
 pub fn buildHello(arena: Allocator, secret: []const u8, hub_nonce: *const [NONCE_LEN]u8, node_nonce: *const [NONCE_LEN]u8, name: []const u8) ![]const u8 {
@@ -284,22 +407,57 @@ pub const FdConn = struct {
 /// Write one frame. Callers serialize writers per link (one mutex per
 /// link): header and payload go out as separate writes, so two concurrent
 /// writers would interleave. Small frames are coalesced into one write.
-pub fn writeFrame(fd: os.net.Handle, kind: FrameType, stream_id: u32, payload: []const u8, timeout_ms: u64) !void {
-    try writeFramePartsOn(FdConn{ .fd = fd }, kind, stream_id, &.{payload}, timeout_ms);
+/// With `auth` (links after the handshake) a 32-byte tag is appended after
+/// the payload — on plaintext and TLS links alike (see the module doc); the
+/// caller must hold the link's write mutex, which also guards `auth.tx_seq`.
+pub fn writeFrame(fd: os.net.Handle, auth: ?*FrameAuth, kind: FrameType, stream_id: u32, payload: []const u8, timeout_ms: u64) !void {
+    try writeFramePartsOn(FdConn{ .fd = fd }, auth, kind, stream_id, &.{payload}, timeout_ms);
 }
 
 /// Write one frame whose payload is the concatenation of `parts`.
-pub fn writeFrameParts(fd: os.net.Handle, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
-    try writeFramePartsOn(FdConn{ .fd = fd }, kind, stream_id, parts, timeout_ms);
+pub fn writeFrameParts(fd: os.net.Handle, auth: ?*FrameAuth, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
+    try writeFramePartsOn(FdConn{ .fd = fd }, auth, kind, stream_id, parts, timeout_ms);
 }
 
-pub fn writeFramePartsOn(conn: anytype, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
+const SMALL_PAYLOAD: usize = 512;
+
+pub fn writeFramePartsOn(conn: anytype, auth: ?*FrameAuth, kind: FrameType, stream_id: u32, parts: []const []const u8, timeout_ms: u64) !void {
     var total: usize = 0;
     for (parts) |p| total += p.len;
     if (total > MAX_PAYLOAD) return error.FrameTooLarge;
-    var small: [HEADER_LEN + 512]u8 = undefined;
+    var small: [HEADER_LEN + SMALL_PAYLOAD + MAC_LEN]u8 = undefined;
     encodeHeader(small[0..HEADER_LEN], .{ .len = @intCast(total), .kind = kind, .stream_id = stream_id });
-    if (total <= small.len - HEADER_LEN) {
+    if (auth) |a| {
+        // Sequence wraparound must never silently reuse a nonce: seq is a
+        // u64 counter folded into every tag, and at maxInt the next
+        // increment would wrap to 0 and re-sign the very first nonce
+        // under the same key (the TLS 1.3 2^64-1 rule). Refuse the frame
+        // instead of letting the release build wrap.
+        if (a.tx_seq == std.math.maxInt(u64)) return error.FrameAuthFailed;
+        const seq = a.tx_seq;
+        var tag: [MAC_LEN]u8 = undefined;
+        // Streaming HMAC: the payload parts are folded in one by one,
+        // never copied into a signing buffer.
+        a.computeTag(&tag, seq, small[0..HEADER_LEN], parts);
+        if (total <= SMALL_PAYLOAD) {
+            var off: usize = HEADER_LEN;
+            for (parts) |p| {
+                @memcpy(small[off .. off + p.len], p);
+                off += p.len;
+            }
+            @memcpy(small[off .. off + MAC_LEN], &tag);
+            try conn.write(small[0 .. off + MAC_LEN], timeout_ms);
+            try conn.flush(timeout_ms);
+        } else {
+            try conn.write(small[0..HEADER_LEN], timeout_ms);
+            for (parts) |p| try conn.write(p, timeout_ms);
+            try conn.write(&tag, timeout_ms);
+            try conn.flush(timeout_ms);
+        }
+        a.tx_seq = seq + 1;
+        return;
+    }
+    if (total <= SMALL_PAYLOAD) {
         var off: usize = HEADER_LEN;
         for (parts) |p| {
             @memcpy(small[off .. off + p.len], p);
@@ -331,34 +489,57 @@ fn readExact(conn: anytype, buf: []u8, idle_ms: u64) !void {
 }
 
 /// Read one frame; the payload is allocated from `gpa` (caller frees).
-pub fn readFrame(gpa: Allocator, fd: os.net.Handle, max_payload: u32, idle_ms: u64) !Frame {
-    return readFrameOn(gpa, FdConn{ .fd = fd }, max_payload, idle_ms);
+/// With `auth` (links after the handshake) a 32-byte tag follows the
+/// payload; it is read and verified, against the exact expected
+/// sequence number, before the frame is returned. Order: the header is
+/// decoded (type caps, length limits) before anything is allocated, then
+/// payload and tag are read, then the tag is verified.
+pub fn readFrame(gpa: Allocator, fd: os.net.Handle, auth: ?*FrameAuth, max_payload: u32, idle_ms: u64) !Frame {
+    return readFrameOn(gpa, FdConn{ .fd = fd }, auth, max_payload, idle_ms);
 }
 
-pub fn readFrameOn(gpa: Allocator, conn: anytype, max_payload: u32, idle_ms: u64) !Frame {
+pub fn readFrameOn(gpa: Allocator, conn: anytype, auth: ?*FrameAuth, max_payload: u32, idle_ms: u64) !Frame {
     var hdr: [HEADER_LEN]u8 = undefined;
     try readExact(conn, &hdr, idle_ms);
     const h = try decodeHeader(&hdr, max_payload);
     const payload = try gpa.alloc(u8, h.len);
     errdefer gpa.free(payload);
     try readExact(conn, payload, idle_ms);
+    if (auth) |a| {
+        // Same maxInt guard as the send side: the counter is exhausted,
+        // and the next increment would wrap and reuse the first nonce.
+        if (a.rx_seq == std.math.maxInt(u64)) return error.FrameAuthFailed;
+        var tag: [MAC_LEN]u8 = undefined;
+        try readExact(conn, &tag, idle_ms);
+        if (!a.verifyTag(a.rx_seq, &hdr, payload, &tag)) return error.FrameAuthFailed;
+        a.rx_seq += 1;
+    }
     return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
 }
 
 /// Read one frame under one absolute deadline of `budget_ms` counted from
 /// `started`: a peer dribbling one byte per read cannot stretch it. Used
 /// for the handshake, where an unauthenticated peer must finish in time.
-pub fn readFrameWithin(gpa: Allocator, fd: os.net.Handle, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
-    return readFrameWithinOn(gpa, FdConn{ .fd = fd }, max_payload, io, started, budget_ms);
+pub fn readFrameWithin(gpa: Allocator, fd: os.net.Handle, auth: ?*FrameAuth, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
+    return readFrameWithinOn(gpa, FdConn{ .fd = fd }, auth, max_payload, io, started, budget_ms);
 }
 
-pub fn readFrameWithinOn(gpa: Allocator, conn: anytype, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
+pub fn readFrameWithinOn(gpa: Allocator, conn: anytype, auth: ?*FrameAuth, max_payload: u32, io: std.Io, started: std.Io.Timestamp, budget_ms: u64) !Frame {
     var hdr: [HEADER_LEN]u8 = undefined;
     try readExactWithin(conn, &hdr, io, started, budget_ms);
     const h = try decodeHeader(&hdr, max_payload);
     const payload = try gpa.alloc(u8, h.len);
     errdefer gpa.free(payload);
     try readExactWithin(conn, payload, io, started, budget_ms);
+    if (auth) |a| {
+        // Same maxInt guard as the send side: the counter is exhausted,
+        // and the next increment would wrap and reuse the first nonce.
+        if (a.rx_seq == std.math.maxInt(u64)) return error.FrameAuthFailed;
+        var tag: [MAC_LEN]u8 = undefined;
+        try readExactWithin(conn, &tag, io, started, budget_ms);
+        if (!a.verifyTag(a.rx_seq, &hdr, payload, &tag)) return error.FrameAuthFailed;
+        a.rx_seq += 1;
+    }
     return .{ .kind = h.kind, .stream_id = h.stream_id, .payload = payload };
 }
 
@@ -433,7 +614,7 @@ test "link oversize ping is refused on the read path without reading the body" {
     var hdr: [HEADER_LEN]u8 = undefined;
     encodeHeader(&hdr, .{ .len = 1 << 20, .kind = .ping, .stream_id = 0 });
     var fake = Fake{ .bytes = &hdr };
-    try testing.expectError(error.FrameTooLarge, readFrameOn(testing.allocator, &fake, MAX_PAYLOAD, 1000));
+    try testing.expectError(error.FrameTooLarge, readFrameOn(testing.allocator, &fake, null, MAX_PAYLOAD, 1000));
 }
 
 test "link node names follow the documented alphabet and length" {
@@ -539,4 +720,164 @@ test "link resp payload split" {
     try testing.expectEqual(@as(u16, 502), r.status);
     try testing.expectEqualStrings("{}", r.body);
     try testing.expectError(error.BadResp, splitResp(&.{0x01}));
+}
+
+test "link frame key derivation matches golden HMAC vectors" {
+    // Fixed inputs: secret "s3cret", hub nonce 0x01..0x20, node nonce
+    // 0x20..0x01. Expected keys are HMAC-SHA256(secret,
+    // "mcpnz-frame-n2h"|"mcpnz-frame-h2n" || hub_nonce || node_nonce),
+    // computed independently.
+    var hub_nonce: [NONCE_LEN]u8 = undefined;
+    for (&hub_nonce, 1..) |*b, i| b.* = @intCast(i);
+    var node_nonce: [NONCE_LEN]u8 = undefined;
+    for (&node_nonce, 0..) |*b, i| b.* = @intCast(32 - @as(u32, @intCast(i)));
+    const k_n2h = deriveFrameKey(.n2h, "s3cret", &hub_nonce, &node_nonce);
+    const k_h2n = deriveFrameKey(.h2n, "s3cret", &hub_nonce, &node_nonce);
+    const want_n2h = "48ee86ed5120ae7df4205866096187a7bc98c3e98853d142c22a905f28616704";
+    const want_h2n = "4f8160feffa287bb953ed392c8a5330d3f49817eb65465128b13dbe07655e222";
+    try testing.expectEqualStrings(want_n2h, &std.fmt.bytesToHex(k_n2h, .lower));
+    try testing.expectEqualStrings(want_h2n, &std.fmt.bytesToHex(k_h2n, .lower));
+    // Different nonces or secret give different keys, and the two
+    // directions never collide.
+    try testing.expect(!std.mem.eql(u8, &k_n2h, &k_h2n));
+    var other = node_nonce;
+    other[0] ^= 1;
+    const k2 = deriveFrameKey(.n2h, "s3cret", &hub_nonce, &other);
+    try testing.expect(!std.mem.eql(u8, &k_n2h, &k2));
+    const k3 = deriveFrameKey(.n2h, "guess", &hub_nonce, &node_nonce);
+    try testing.expect(!std.mem.eql(u8, &k_n2h, &k3));
+}
+
+test "link frame tag: golden vector and parts streaming agree" {
+    var hub_nonce: [NONCE_LEN]u8 = undefined;
+    for (&hub_nonce, 1..) |*b, i| b.* = @intCast(i);
+    var node_nonce: [NONCE_LEN]u8 = undefined;
+    for (&node_nonce, 0..) |*b, i| b.* = @intCast(32 - @as(u32, @intCast(i)));
+    // Hub signs the first frame after WELCOME (seq 0): REQ sid 7 with the
+    // 24-byte ping body. Expected tag computed independently over
+    // seq_be64 || header || payload with K_h2n.
+    var fa = FrameAuth.init(.hub, "s3cret", &hub_nonce, &node_nonce);
+    var hdr: [HEADER_LEN]u8 = undefined;
+    const payload = "{\"jsonrpc\":\"2.0\",\"id\":1}";
+    encodeHeader(&hdr, .{ .len = @intCast(payload.len), .kind = .req, .stream_id = 7 });
+    var tag: [MAC_LEN]u8 = undefined;
+    fa.computeTag(&tag, 0, &hdr, &.{payload});
+    try testing.expectEqualStrings(
+        "9fb86983c46ec9873fbd6be480cae5c88f160a6b90e31612648e4c4c3b5395ec",
+        &std.fmt.bytesToHex(tag, .lower),
+    );
+    // The same payload split into parts gives the same tag (streaming
+    // HMAC over parts == one buffer). The hub signs with K_h2n, so only
+    // the node-side state (role .node, verify key K_h2n) accepts it; the
+    // hub's own verify key is K_n2h and must reject it.
+    var split: [MAC_LEN]u8 = undefined;
+    fa.computeTag(&split, 0, &hdr, &.{ payload[0..12], payload[12..] });
+    try testing.expectEqualSlices(u8, &tag, &split);
+    var node_side = FrameAuth.init(.node, "s3cret", &hub_nonce, &node_nonce);
+    try testing.expect(node_side.verifyTag(0, &hdr, payload, &tag));
+    try testing.expect(!fa.verifyTag(0, &hdr, payload, &tag));
+}
+
+test "link frame tag: tampering, wrong seq and direction are rejected" {
+    var hub_nonce: [NONCE_LEN]u8 = @splat(1);
+    var node_nonce: [NONCE_LEN]u8 = @splat(2);
+    // The node signs node-to-hub frames; the hub-side state verifies them.
+    var node_side = FrameAuth.init(.node, "s3cret", &hub_nonce, &node_nonce);
+    var hub_side = FrameAuth.init(.hub, "s3cret", &hub_nonce, &node_nonce);
+    var hdr: [HEADER_LEN]u8 = undefined;
+    const payload = "{\"x\":1}";
+    encodeHeader(&hdr, .{ .len = @intCast(payload.len), .kind = .resp, .stream_id = 3 });
+    var tag: [MAC_LEN]u8 = undefined;
+    node_side.computeTag(&tag, 0, &hdr, &.{payload});
+    try testing.expect(hub_side.verifyTag(0, &hdr, payload, &tag));
+    // bitflip in the payload after tagging
+    var bad_payload: [payload.len]u8 = undefined;
+    @memcpy(&bad_payload, payload);
+    bad_payload[0] ^= 1;
+    try testing.expect(!hub_side.verifyTag(0, &hdr, &bad_payload, &tag));
+    // bitflip in the header (stream id)
+    var bad_hdr: [HEADER_LEN]u8 = undefined;
+    @memcpy(&bad_hdr, &hdr);
+    bad_hdr[8] ^= 1;
+    try testing.expect(!hub_side.verifyTag(0, &bad_hdr, payload, &tag));
+    // wrong sequence number (replay or reorder)
+    try testing.expect(!hub_side.verifyTag(1, &hdr, payload, &tag));
+    // reflected direction: the node verifies hub-to-node frames only, so
+    // its own frame must not pass its own verification key
+    try testing.expect(!node_side.verifyTag(0, &hdr, payload, &tag));
+    // a tag from a different handshake (fresh nonces) is foreign
+    var node_nonce2: [NONCE_LEN]u8 = @splat(3);
+    var other = FrameAuth.init(.node, "s3cret", &hub_nonce, &node_nonce2);
+    var other_tag: [MAC_LEN]u8 = undefined;
+    other.computeTag(&other_tag, 0, &hdr, &.{payload});
+    try testing.expect(!hub_side.verifyTag(0, &hdr, payload, &other_tag));
+}
+
+test "link frame auth refuses the sequence wraparound at maxInt(u64)" {
+    var hub_nonce: [NONCE_LEN]u8 = @splat(1);
+    var node_nonce: [NONCE_LEN]u8 = @splat(2);
+
+    // Send side: even before signing, an exhausted counter refuses
+    // instead of wrapping to 0 and re-signing the very first nonce
+    // under the same key (the TLS 1.3 2^64-1 rule).
+    const Sink = struct {
+        n: usize = 0,
+        pub fn write(self: *@This(), bytes: []const u8, _: u64) !void {
+            self.n += bytes.len;
+        }
+        pub fn flush(_: *@This(), _: u64) !void {}
+    };
+    var tx = FrameAuth.init(.node, "s3cret", &hub_nonce, &node_nonce);
+    tx.tx_seq = std.math.maxInt(u64);
+    var sink = Sink{};
+    try testing.expectError(
+        error.FrameAuthFailed,
+        writeFramePartsOn(&sink, &tx, .req, 1, &.{"{}"}, 100),
+    );
+    try testing.expectEqual(@as(usize, 0), sink.n); // nothing went out
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), tx.tx_seq);
+
+    // Receive side: a frame honestly tagged for seq maxInt still gets
+    // refused — after it, the counter is exhausted and the link dies
+    // instead of wrapping. Both read paths share the guard.
+    const Fake = struct {
+        bytes: []const u8,
+        off: usize = 0,
+        pub fn readSome(self: *@This(), out: []u8, _: u64) !usize {
+            const n = @min(out.len, self.bytes.len - self.off);
+            @memcpy(out[0..n], self.bytes[self.off .. self.off + n]);
+            self.off += n;
+            return n;
+        }
+    };
+    var rx = FrameAuth.init(.hub, "s3cret", &hub_nonce, &node_nonce);
+    rx.rx_seq = std.math.maxInt(u64);
+    var hdr: [HEADER_LEN]u8 = undefined;
+    const payload = "{}";
+    encodeHeader(&hdr, .{ .len = @intCast(payload.len), .kind = .req, .stream_id = 1 });
+    var tag: [MAC_LEN]u8 = undefined;
+    var signer = FrameAuth.init(.node, "s3cret", &hub_nonce, &node_nonce);
+    signer.computeTag(&tag, std.math.maxInt(u64), &hdr, &.{payload});
+    var wire: [HEADER_LEN + payload.len + MAC_LEN]u8 = undefined;
+    @memcpy(wire[0..HEADER_LEN], &hdr);
+    @memcpy(wire[HEADER_LEN..][0..payload.len], payload);
+    @memcpy(wire[HEADER_LEN + payload.len ..], &tag);
+
+    var reader = Fake{ .bytes = &wire };
+    try testing.expectError(
+        error.FrameAuthFailed,
+        readFrameOn(testing.allocator, &reader, &rx, MAX_PAYLOAD, 100),
+    );
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), rx.rx_seq);
+
+    // Same frame through the absolute-deadline read path.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var reader2 = Fake{ .bytes = &wire };
+    try testing.expectError(
+        error.FrameAuthFailed,
+        readFrameWithinOn(testing.allocator, &reader2, &rx, MAX_PAYLOAD, io, std.Io.Clock.awake.now(io), 100),
+    );
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), rx.rx_seq);
 }

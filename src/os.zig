@@ -31,6 +31,9 @@ pub const darwin = @import("os/darwin.zig");
 pub const windows = @import("os/windows.zig");
 // fd+sysinfo: cross-platform file I/O helpers and per-OS sysinfo.
 pub const fd = @import("os/fd.zig");
+// secure: pinned-open pipeline (authorization and access over ONE
+// kernel-resolved object; closes the gate-to-open TOCTOU).
+pub const secure = @import("os/secure.zig");
 pub const sysinfo = @import("os/sysinfo.zig");
 
 /// net: connected-socket I/O, timeouts and socket options.

@@ -93,19 +93,29 @@ def meminfo():
     return out
 
 
+def loadavg():
+    """1/5/15 load averages only — the running/total and last-PID fields
+    of /proc/loadavg are host state, not bench evidence."""
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+    except OSError:
+        return None
+    return " ".join(parts[:3]) or None
+
+
 def main():
     bin_path = os.environ.get("MCPNZ_BIN")
     bin_stat = None
     if bin_path and os.path.exists(bin_path):
         st = os.stat(bin_path)
         sha = sh(["sha256sum", bin_path])
-        bin_stat = {"path": bin_path, "size_bytes": st.st_size,
+        bin_stat = {"path": os.path.basename(bin_path), "size_bytes": st.st_size,
                     "sha256": sha.split()[0] if sha else None,
                     "ldd": sh(["ldd", bin_path]) or "(static or no ldd)"}
     freqs, governors, cpufreq_note = cpufreq()
     out = {
         "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "hostname": sh(["hostname"]),
         "os": {
             "kernel": platform.release(),
             "distribution": sh(["bash", "-lc", ". /etc/os-release 2>/dev/null; echo $PRETTY_NAME"]),
@@ -126,15 +136,14 @@ def main():
             "SwapFree": meminfo().get("SwapFree"),
         },
         "load": {
-            "uptime": sh(["uptime"]),
-            "loadavg": open("/proc/loadavg").read().strip() if os.path.exists("/proc/loadavg") else None,
+            "loadavg": loadavg(),
             "vmstat_1s_x3": sh(["vmstat", "1", "3"]),
         },
         "tools": {
             "python": sys.version.split()[0],
             "node": sh(["node", "--version"]),
-            "uvx": sh(["uvx", "--version"]),
-            "npx": sh(["npx", "--version"]),
+            "uvx": sh([os.environ.get("UVX_BIN", "uvx"), "--version"]),
+            "npx": sh([os.environ.get("NPX_BIN", "npx"), "--version"]),
             "zig": sh([os.environ.get("ZIG_BIN", "zig"), "version"]),
         },
         "binary": bin_stat,

@@ -130,7 +130,7 @@ class Contracts(unittest.TestCase):
         self.assertEqual({t['name'] for t in self.node.rpc('tools/list')['tools']},
             {'sys_info', 'exec', 'exec_shell', 'exec_start', 'exec_poll', 'exec_wait',
              'exec_write', 'exec_kill', 'exec_close', 'exec_list', 'read_file',
-             'write_file', 'list_dir'})
+             'write_file', 'list_dir', 'copy_path'})
 
     def test_sys_info_and_ping(self):
         info = self.node.tool('sys_info')
@@ -264,10 +264,12 @@ class Contracts(unittest.TestCase):
         self.assertIn('structuredContent', result)
         self.assertIs(result['isError'], False)
         self.assertEqual(result['structuredContent']['stdout'], 'mirror-off\n')
-        # Domain error (isError stays false in the v0 quirk): structured-only.
+        # Domain error: since v0.5.0 the envelope carries isError True, and
+        # error results always keep the text mirror (even with mirror off).
         result = node.rpc('tools/call', {'name': 'read_file',
             'arguments': {'path': '/nonexistent-mcpnz-contract'}})
-        self.assertNotIn('content', result)
+        self.assertIs(result['isError'], True)
+        self.assertIn('content', result)
         self.assertEqual(result['structuredContent']['error'], 'FileNotFound')
         # isError result: text mirror survives the flag.
         result = node.rpc('tools/call', {'name': 'no_such_tool', 'arguments': {}})

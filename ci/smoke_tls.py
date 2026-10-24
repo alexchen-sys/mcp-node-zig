@@ -42,7 +42,7 @@ def run(env):
 
     status, reply = env.rpc('tlsnode', 'tools/list', {})
     tools = reply.get('result', {}).get('tools', []) if isinstance(reply, dict) else []
-    tr.check(status == 200 and len(tools) == 13, (status, len(tools)))
+    tr.check(status == 200 and len(tools) == 14, (status, len(tools)))
 
     # The interpreter running this script exists on every platform; echo does not.
     out = env.tool('tlsnode', 'exec', {

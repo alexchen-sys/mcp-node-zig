@@ -180,6 +180,11 @@ pub fn utf8LossyAlloc(arena: Allocator, data: []const u8) ![]const u8 {
 pub const CharSlice = struct { text: []const u8, has_more: bool };
 
 pub fn utf8CharSlice(s: []const u8, offset_chars: usize, limit_chars: usize) !CharSlice {
+    // Saturating end: offset+limit can exceed usize on adversarial input —
+    // a wrapping add would panic in safe builds, while saturating only
+    // blurs has_more in a regime the string cannot
+    // reach anyway (char_idx never exceeds s.len).
+    const end_chars = offset_chars +| limit_chars;
     var char_idx: usize = 0;
     var byte_idx: usize = 0;
     var start_byte: usize = 0;
@@ -190,7 +195,7 @@ pub fn utf8CharSlice(s: []const u8, offset_chars: usize, limit_chars: usize) !Ch
             start_byte = byte_idx;
             have_start = true;
         }
-        if (have_start and char_idx == offset_chars + limit_chars) {
+        if (have_start and char_idx == end_chars) {
             end_byte = byte_idx;
             return .{ .text = s[start_byte..end_byte], .has_more = true };
         }
@@ -236,6 +241,21 @@ test "float to int rejects non finite and out of range values" {
     try std.testing.expect(floatToI64(std.math.nan(f64)) == null);
     try std.testing.expect(floatToI64(1e300) == null);
     try std.testing.expectEqual(@as(i64, 42), floatToI64(42.0).?);
+}
+
+test "utf8 char slice saturates offset plus limit" {
+    // maxInt(usize)+10 would wrap/panic; saturating keeps the empty-slice
+    // contract for an unreachable window.
+    const far = try utf8CharSlice("abc", std.math.maxInt(usize), 10);
+    try std.testing.expectEqualStrings("", far.text);
+    try std.testing.expect(!far.has_more);
+    // Ordinary slicing is unchanged.
+    const mid = try utf8CharSlice("abc", 1, 1);
+    try std.testing.expectEqualStrings("b", mid.text);
+    try std.testing.expect(mid.has_more); // "c" sits beyond the limit
+    const all = try utf8CharSlice("abc", 0, 99);
+    try std.testing.expectEqualStrings("abc", all.text);
+    try std.testing.expect(!all.has_more);
 }
 
 test "json string encoder replaces invalid utf8 with replacement char" {

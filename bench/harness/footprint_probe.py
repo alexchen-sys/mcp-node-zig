@@ -49,6 +49,19 @@ def mib(b):
     return round(b / (1024 * 1024), 1) if b else None
 
 
+def norm_home(p):
+    if not p:
+        return p
+    home = os.path.normpath(os.path.expanduser("~"))
+    candidate = os.path.normpath(os.fspath(p))
+    if candidate == home:
+        return "~"
+    prefix = home if home.endswith(os.sep) else home + os.sep
+    if candidate.startswith(prefix):
+        return os.path.join("~", candidate[len(prefix):])
+    return p
+
+
 def probe_ours(bin_path, build_mode):
     st = os.stat(bin_path)
     # Honesty: the default build is fully static; the -Dtls-server build
@@ -116,18 +129,18 @@ def probe_tumf():
         "participant": "tumf/mcp-shell-server",
         "version": version,
         "channel": "uvx",
-        "venv": venv,
+        "venv": norm_home(venv),
         "venv_bytes": du_bytes(venv),
         "venv_mib": mib(du_bytes(venv)),
-        "uv_cache": uv_cache,
+        "uv_cache": norm_home(uv_cache),
         "uv_cache_bytes": du_bytes(uv_cache),
         "uv_cache_mib": mib(du_bytes(uv_cache)),
-        "interpreter": interp,
-        "interpreter_install": interp_install,
+        "interpreter": norm_home(interp),
+        "interpreter_install": norm_home(interp_install),
         "runtime_bytes": du_bytes(interp_install) if interp_install else (du_bytes(interp) if interp else None),
         "runtime_mib": mib(du_bytes(interp_install)) if interp_install else (mib(du_bytes(interp)) if interp else None),
         "runtime_kind": "Python interpreter uvx resolved for the venv",
-        "notes": "venv is the per-package environment uvx materializes under its cache; uv cache holds the wheels; the interpreter is uv-managed CPython when no system one matches",
+        "notes": "venv is the per-package environment uvx materializes under its cache (hardlinked wheel content); uv cache is host-wide and shared between packages, so it is reported for reference only and never summed into the env figure; the interpreter is uv-managed CPython when no system one matches",
     }
 
 
@@ -156,20 +169,31 @@ def probe_g0t4():
     cli.close()
 
     node_lib = "/usr/lib/node_modules"
+    # Only the modules the nodejs package itself ships (npm, corepack).
+    # Global `npm -g` installs live in the same directory but are NOT part
+    # of the Node.js runtime this server needs — counting them would bill
+    # the host operator's unrelated tooling to the participant.
+    bundled = [os.path.join(node_lib, d) for d in ("npm", "corepack")]
+    bundled = [d for d in bundled if os.path.isdir(d)]
+    bundled_bytes = sum(du_bytes(d) or 0 for d in bundled)
+    lib_total_bytes = du_bytes(node_lib)
+    exe_bytes = du_bytes(node_exe) or 0
     return {
         "participant": "g0t4/mcp-server-commands",
         "version": version,
         "channel": "npx",
-        "package_env": package_dir,
+        "package_env": norm_home(package_dir),
         "package_env_bytes": du_bytes(package_dir),
         "package_env_mib": mib(du_bytes(package_dir)),
         "node_exe": node_exe,
         "node_exe_bytes": du_bytes(node_exe),
-        "node_stdlib_bytes": du_bytes(node_lib),
-        "runtime_bytes": (du_bytes(node_exe) or 0) + (du_bytes(node_lib) or 0),
-        "runtime_mib": mib((du_bytes(node_exe) or 0) + (du_bytes(node_lib) or 0)),
-        "runtime_kind": "Node.js (system package: node binary + bundled npm modules)",
-        "notes": "package env is the npx cache dir for this package; runtime is the system Node.js install",
+        "node_bundled_modules": bundled,
+        "node_bundled_modules_bytes": bundled_bytes,
+        "node_modules_dir_total_bytes": lib_total_bytes,
+        "runtime_bytes": exe_bytes + bundled_bytes,
+        "runtime_mib": mib(exe_bytes + bundled_bytes),
+        "runtime_kind": "Node.js (system package: node binary + the npm/corepack the Node.js package ships; global npm installs on this host excluded)",
+        "notes": "package env is the npx cache dir for this package; runtime is the system Node.js install (node binary plus the modules the nodejs package ships); node_modules_dir_total records the whole directory for disclosure",
     }
 
 

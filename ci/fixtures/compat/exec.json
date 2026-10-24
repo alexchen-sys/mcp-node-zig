@@ -1,54 +1,244 @@
 {
   "description": "exec: fire-and-wait argv run. Payload keys: ok, exit_code, stdout, stderr, duration_ms, duration_us. Missing argv is a tool-domain error (ok=false + error name in structuredContent); a present argument with the wrong JSON type is a JSON-RPC -32602 Invalid params error.",
-  "platforms": ["posix"],
+  "platforms": [
+    "posix"
+  ],
   "platforms_reason": "golden argv use POSIX paths (/bin/echo, /bin/false); Windows goldens are future work",
   "cases": [
     {
       "name": "echo_success_zero_exit",
-      "request": {"jsonrpc": "2.0", "id": 45, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/bin/echo", "hello"]}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 45,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {
+            "argv": [
+              "/bin/echo",
+              "hello"
+            ]
+          }
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 45, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": true, "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 45,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": {
+                  "*str": null
+                }
+              }
+            ],
+            "structuredContent": {
+              "ok": true,
+              "exit_code": 0,
+              "stdout": "hello\n",
+              "stderr": "",
+              "duration_ms": {
+                "*int": null
+              },
+              "duration_us": {
+                "*int": null
+              }
+            },
+            "isError": false
+          }
+        }
       }
     },
     {
       "name": "false_nonzero_exit_ok_false",
-      "request": {"jsonrpc": "2.0", "id": 46, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/usr/bin/false"]}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 46,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {
+            "argv": [
+              "/usr/bin/false"
+            ]
+          }
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 46, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "exit_code": 1, "stdout": "", "stderr": "", "duration_ms": {"*int": null}, "duration_us": {"*int": null}}, "isError": false}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 46,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": {
+                  "*str": null
+                }
+              }
+            ],
+            "structuredContent": {
+              "ok": false,
+              "exit_code": 1,
+              "stdout": "",
+              "stderr": "",
+              "duration_ms": {
+                "*int": null
+              },
+              "duration_us": {
+                "*int": null
+              }
+            },
+            "isError": true
+          }
+        }
       }
     },
     {
       "name": "nonexistent_binary_file_not_found",
-      "request": {"jsonrpc": "2.0", "id": 47, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/nonexistent/mcpnz-compat"]}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 47,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {
+            "argv": [
+              "/nonexistent/mcpnz-compat"
+            ]
+          }
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 47, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "FileNotFound"}, "isError": false}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 47,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": {
+                  "*str": null
+                }
+              }
+            ],
+            "structuredContent": {
+              "ok": false,
+              "error": "FileNotFound",
+              "message": {
+                "*str": null
+              }
+            },
+            "isError": true
+          }
+        }
       }
     },
     {
       "name": "missing_argv",
-      "request": {"jsonrpc": "2.0", "id": 48, "method": "tools/call", "params": {"name": "exec", "arguments": {}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 48,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {}
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 48, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingArgv"}, "isError": false}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 48,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": {
+                  "*str": null
+                }
+              }
+            ],
+            "structuredContent": {
+              "ok": false,
+              "error": "MissingArgv",
+              "message": {
+                "*str": null
+              }
+            },
+            "isError": true
+          }
+        }
       }
     },
     {
       "name": "argv_not_array_bad_argv",
-      "request": {"jsonrpc": "2.0", "id": 49, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": "/bin/echo"}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 49,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {
+            "argv": "/bin/echo"
+          }
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 49, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "BadArgv", "message": "argv must be a non-empty array of strings"}, "isError": false}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 49,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": {
+                  "*str": null
+                }
+              }
+            ],
+            "structuredContent": {
+              "ok": false,
+              "error": "BadArgv",
+              "message": "argv must be a non-empty array of strings"
+            },
+            "isError": true
+          }
+        }
       }
     },
     {
       "name": "timeout_wrong_type_invalid_params",
-      "request": {"jsonrpc": "2.0", "id": 52, "method": "tools/call", "params": {"name": "exec", "arguments": {"argv": ["/usr/bin/true"], "timeout": "abc"}}},
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 52,
+        "method": "tools/call",
+        "params": {
+          "name": "exec",
+          "arguments": {
+            "argv": [
+              "/usr/bin/true"
+            ],
+            "timeout": "abc"
+          }
+        }
+      },
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 52, "error": {"code": -32602, "message": "Invalid params"}}
+        "response": {
+          "jsonrpc": "2.0",
+          "id": 52,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params"
+          }
+        }
       }
     }
   ]

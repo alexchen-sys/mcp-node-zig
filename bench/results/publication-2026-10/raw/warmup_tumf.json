@@ -8,11 +8,11 @@
  "ok": true,
  "boot_listen_ms": null,
  "initialize_handshake_ms": null,
- "cold_first_response_ms": 1114.194165,
- "ready_to_serve_ms": 1116.285464,
- "rtt_initialize_ms": 1114.138815,
- "rtt_tools_list_ms": 0.997269,
- "rtt_exec_ms": 0.98358,
+ "cold_first_response_ms": 553.054158,
+ "ready_to_serve_ms": 556.243903,
+ "rtt_initialize_ms": 553.012995,
+ "rtt_tools_list_ms": 1.282406,
+ "rtt_exec_ms": 1.763894,
  "tools_listed": 1,
  "exec_ok": false,
  "server_info": {
@@ -20,7 +20,7 @@
   "version": "1.30.0"
  },
  "harness": {
-  "python": "3.11.16",
+  "python": "3.12.3",
   "phase": "warmup",
   "tool": "exec",
   "tool_key": "argv",

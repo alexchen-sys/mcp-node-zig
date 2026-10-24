@@ -16,7 +16,7 @@
       "request": {"jsonrpc": "2.0", "id": 54, "method": "tools/call", "params": {"name": "exec_shell", "arguments": {}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 54, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingScript"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 54, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "MissingScript"}, "isError": true}}
       }
     },
     {
@@ -32,7 +32,7 @@
       "request": {"jsonrpc": "2.0", "id": 55, "method": "tools/call", "params": {"name": "exec_shell", "arguments": {"script": "echo hi", "shell": "csh"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 55, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "UnsupportedShell"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 55, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "UnsupportedShell"}, "isError": true}}
       }
     }
   ]

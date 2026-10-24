@@ -236,7 +236,7 @@
        "ok": false,
        "error": "MissingSession"
       },
-      "isError": false
+      "isError": true
      }
     }
    }
@@ -299,7 +299,7 @@
        "expired": false,
        "message": "no recently-live session with this id on this node (never started here, removed long ago, or the node restarted); exec_list shows live sessions"
       },
-      "isError": false
+      "isError": true
      }
     }
    }

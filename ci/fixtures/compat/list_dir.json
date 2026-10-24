@@ -38,7 +38,7 @@
       "request": {"jsonrpc": "2.0", "id": 121, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": "no-such-compat-dir"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 121, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "FileNotFound"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 121, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "FileNotFound", "message": {"*str": null}}, "isError": true}}
       }
     },
     {
@@ -46,7 +46,7 @@
       "request": {"jsonrpc": "2.0", "id": 122, "method": "tools/call", "params": {"name": "list_dir", "arguments": {"path": "compat-dir/a.txt"}}},
       "expect": {
         "status": 200,
-        "response": {"jsonrpc": "2.0", "id": 122, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "NotDirectory"}, "isError": false}}
+        "response": {"jsonrpc": "2.0", "id": 122, "result": {"content": [{"type": "text", "text": {"*str": null}}], "structuredContent": {"ok": false, "error": "NotDirectory"}, "isError": true}}
       }
     },
     {

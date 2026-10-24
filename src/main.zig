@@ -11,6 +11,7 @@ const node_link = @import("node_link.zig");
 const hub_mod = @import("hub.zig");
 const stdio = @import("stdio.zig");
 const audit = @import("audit.zig");
+const proc = @import("os/proc.zig");
 
 /// A peer disconnect must never kill the daemon via SIGPIPE. Protection is
 /// real on two layers: Io.Threaded installs an ignore handler for
@@ -58,6 +59,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
     defer threaded.deinit();
     const io = threaded.io();
+
+    // Darwin CLOEXEC fork gate (os/proc.zig): install the pthread_atfork
+    // hooks before any connection/session thread can race pipe creation
+    // against a fork. Comptime no-op on Linux/Windows; registration
+    // failure is fatal on purpose (the fd-injection window would reopen).
+    try proc.installDarwinForkGate();
 
     const arg_slice = try init.args.toSlice(arena);
     const cli_parsed = parseArgs(arg_slice) catch |err| {
@@ -109,10 +116,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
         cfg.audit = aw;
     }
 
+    // Rollback owner for the audit writer thread, at function scope:
+    // the writer borrows io and the config arena, so any later startup
+    // failure must stop+join it before those are destroyed. LIFO puts this
+    // errdefer AFTER the hub's (declared below), i.e. hub threads — the
+    // audit producers — stop first.
+    errdefer if (audit.fromCfg(&cfg)) |aw| audit.stop(aw);
+
+    var state_disk: ?*@import("durable.zig").Disk = null;
+    defer if (state_disk) |disk| {
+        disk.close();
+        std.heap.page_allocator.destroy(disk);
+    };
+    defer sessions.stopDurableSweep();
+    if (cfg.state_dir) |path| {
+        const disk = try std.heap.page_allocator.create(@import("durable.zig").Disk);
+        disk.* = @import("durable.zig").Disk.open(io, path, cfg.state_max_bytes) catch |err| {
+            std.heap.page_allocator.destroy(disk);
+            return err;
+        };
+        state_disk = disk;
+        sessions.disk = disk;
+        try @import("durable_session.zig").recover(&sessions, disk, audit.fromCfg(&cfg));
+        try sessions.startDurableSweep();
+    }
+
     if (cfg.mode == .stdio) {
         // stdio mode: no listener and no token; stdout carries only
         // JSON-RPC response lines, every log line goes to stderr.
         stdio.run(io, &cfg);
+        sessions.stopDurableSweep();
         if (audit.fromCfg(&cfg)) |aw| audit.stop(aw);
         return;
     }
@@ -123,6 +156,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         logLine("mcp-node connecting", ep.host, ep.port);
         var node = node_link.Node{ .io = io, .cfg = &cfg };
         node_link.run(&node);
+        sessions.stopDurableSweep();
         if (audit.fromCfg(&cfg)) |aw| audit.stop(aw);
         return;
     }
@@ -130,8 +164,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Hub mode: node links on their own listener; clients keep this one.
     var hub = hub_mod.Hub.init(io, &cfg, cfg.hub_secrets orelse .{ .single = "" });
     var hub_server: Io.net.Server = undefined;
+    // Function scope, not the if-block: errdefer dies at the end of its
+    // enclosing scope, so a block-scoped declaration would NOT cover the
+    // HTTP listener setup below. Once the hub is up, its accept/
+    // pinger threads borrow &hub, &cfg and io — retract them before any
+    // unwinding defer can destroy that state.
+    var hub_started = false;
+    errdefer if (hub_started) hub_mod.stop(&hub, &hub_server);
     if (cfg.mode == .hub) {
         try hub_mod.start(&hub, &hub_server);
+        hub_started = true;
         cfg.hub = &hub;
         const ep = cfg.hub_listen.?;
         logLine("mcp-node hub accepting node links", ep.host, ep.port);
@@ -300,6 +342,14 @@ fn parseArgs(argv: []const [:0]const u8) !Args {
             return .help;
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
             return .version;
+        } else if (std.mem.eql(u8, a, "--state-dir")) {
+            if (i + 1 >= argv.len or argv[i + 1].len == 0) return error.InvalidConfig;
+            i += 1;
+            cli.state_dir = argv[i];
+        } else if (std.mem.startsWith(u8, a, "--state-dir=")) {
+            const path = a["--state-dir=".len..];
+            if (path.len == 0) return error.InvalidConfig;
+            cli.state_dir = path;
         } else if (std.mem.eql(u8, a, "--stdio")) {
             cli.stdio = true;
         } else if (std.mem.eql(u8, a, "--connect")) {
@@ -360,7 +410,17 @@ test "discover module tests" {
     std.testing.refAllDecls(@import("hub.zig"));
     std.testing.refAllDecls(@import("stdio.zig"));
     std.testing.refAllDecls(@import("audit.zig"));
+    std.testing.refAllDecls(@import("durable.zig"));
     std.testing.refAllDecls(@import("policy.zig"));
+    std.testing.refAllDecls(@import("os/secure.zig"));
     if (@import("build_options").tls_server)
         std.testing.refAllDecls(@import("tls_server.zig"));
+}
+
+test "durable command line state directory empty values rejected" {
+    try std.testing.expectEqualStrings("/tmp/state", (try parseArgs(&.{ "mcp-node", "--state-dir", "/tmp/state" })).run.state_dir.?);
+    try std.testing.expectEqualStrings("/tmp/state", (try parseArgs(&.{ "mcp-node", "--state-dir=/tmp/state" })).run.state_dir.?);
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--state-dir" }));
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--state-dir", "" }));
+    try std.testing.expectError(error.InvalidConfig, parseArgs(&.{ "mcp-node", "--state-dir=" }));
 }

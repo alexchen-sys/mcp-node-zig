@@ -1,14 +1,16 @@
 # mcp-node v0 compatibility golden fixtures
 
-This directory freezes the v0 wire contract of all 13 MCP tools plus the
-`initialize` / `ping` / `tools/list` protocol methods. `ci/test_compat.py`
+This directory freezes the wire contract of the MCP tools plus the
+`initialize` / `ping` / `tools/list` protocol methods (`tools_list.json`
+pins all 14 tools in v0.5.0; the 13 v0 tools have individual `<tool>.json`
+files here and `copy_path` is covered by `ci/test_copy_path.py`). `ci/test_compat.py`
 replays every case against a real daemon (raw HTTP, JSON-RPC 2.0, one fresh
 daemon per fixture file) and deep-matches each response.
 
 ## Layout
 
-- `initialize.json`, `ping.json`, `tools_list.json` — protocol surface.
-- `<tool>.json` for each of the 13 tools: `sys_info`, `exec`, `exec_start`,
+- `initialize.json`, `ping.json`, `tools_list.json` — protocol surface (14 tools advertised in `tools/list`).
+- `<tool>.json` for each of the 13 v0 tools: `sys_info`, `exec`, `exec_start`,
   `exec_poll`, `exec_write`, `exec_kill`, `exec_close`, `exec_wait`,
   `exec_list`, `exec_shell`, `read_file`, `write_file`, `list_dir`.
 - `probe.py` — evidence/regeneration tool: boots the binary, replays the

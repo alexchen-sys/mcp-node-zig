@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CI provides RUNNER_TEMP; fall back to a scratch dir for local runs.
+RUNNER_TEMP="${RUNNER_TEMP:-$(mktemp -d)}"
 TF="$RUNNER_TEMP/mcp-node-ci-token"
 printf 'ci-test-token' > "$TF"
 export MCP_NODE_TOKEN_FILE="$TF"

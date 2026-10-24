@@ -98,12 +98,15 @@ pub fn writeAllFd(fd: fd_t, bytes: []const u8) WriteAllError!void {
                 else => return error.WriteFailed,
             }
         } else {
-            // libc POSIX path (macOS et al.).
-            // TODO(darwin): grade errno (EINTR retry vs hard failure) like the
-            // Linux branch; write(2) here is not the NOCANCEL variant, so
-            // EINTR is theoretically reachable.
+            // libc POSIX path (macOS et al.). write(2) here is not the
+            // NOCANCEL variant, so EINTR is reachable; retry it like the
+            // Linux branch above (and readFd) instead of failing the write.
             const rc = std.c.write(fd, bytes.ptr + off, bytes.len - off);
-            if (rc <= 0) return error.WriteFailed;
+            if (rc < 0) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return error.WriteFailed;
+            }
+            if (rc == 0) return error.WriteFailed; // nonzero count asked, nothing written
             off += @intCast(rc);
         }
     }

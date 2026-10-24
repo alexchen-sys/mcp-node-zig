@@ -48,9 +48,16 @@ pub const Config = struct {
     allowed_hosts: [][]const u8,
     allowed_origins: [][]const u8,
     max_out: usize,
+    copy_max_bytes: u64 = 67108864,
+    copy_max_entries: u32 = 2000,
     socket_timeout_s: u16,
     max_conn: u16,
     max_sessions: u16,
+    /// Established node-link admission cap: bounds the live
+    /// registry population — sockets, reader threads, TLS state. 0 in the
+    /// env means "use the default". Replacement of an existing name does
+    /// not consume additional admission.
+    max_node_links: u32 = 64,
     session_ttl_s: u32,
     max_inflight_bytes: u64,
     /// Emit the JSON payload as `content[0].text` (text mirror) in addition
@@ -59,6 +66,8 @@ pub const Config = struct {
     /// structured-capable clients into a single-copy result.
     /// Errors (`isError: true`) always carry text regardless of this flag.
     text_mirror: bool = true,
+    state_dir: ?[]const u8 = null,
+    state_max_bytes: u64 = 64 * 1024 * 1024,
     sessions: ?*session_mod.SessionStore = null,
     inflight: ?*InflightGate = null,
     mode: Mode = .listen,
@@ -143,6 +152,7 @@ pub fn loadConfig(arena: Allocator, io: Io) !Config {
 
 /// Command-line overrides. Each one wins over its environment variable.
 pub const Cli = struct {
+    state_dir: ?[]const u8 = null,
     /// `--connect host:port` (MCP_NODE_CONNECT).
     connect: ?[]const u8 = null,
     /// `--stdio` (MCP_NODE_STDIO=1).
@@ -181,12 +191,21 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
     }
     const mode: Mode = if (stdio) .stdio else if (connect_s != null) .node else if (hub_s != null) .hub else .listen;
 
+    const state_dir = cli.state_dir orelse getEnv(arena, "MCP_NODE_STATE_DIR");
+    if (state_dir) |path| {
+        if (mode == .hub or path.len == 0 or !std.fs.path.isAbsolute(path)) return error.InvalidConfig;
+    }
+    const state_max_bytes = std.fmt.parseInt(u64, getEnv(arena, "MCP_NODE_STATE_MAX_BYTES") orelse "67108864", 10) catch return error.InvalidConfig;
+
     const name = getEnv(arena, "MCP_NODE_NAME") orelse "mcp-node";
     const host = getEnv(arena, "MCP_NODE_HOST") orelse "127.0.0.1";
     const port_s = getEnv(arena, "MCP_NODE_PORT") orelse "8341";
     const port = try std.fmt.parseInt(u16, port_s, 10);
     const max_out_s = getEnv(arena, "MCP_NODE_MAX_OUT") orelse "400000";
     const max_out = try std.fmt.parseInt(usize, max_out_s, 10);
+    const copy_max_bytes = try std.fmt.parseInt(u64, getEnv(arena, "MCP_NODE_COPY_MAX_BYTES") orelse "67108864", 10);
+    const copy_max_entries = try std.fmt.parseInt(u32, getEnv(arena, "MCP_NODE_COPY_MAX_ENTRIES") orelse "2000", 10);
+    if (copy_max_bytes > 1073741824 or copy_max_entries == 0 or copy_max_entries > 10000) return error.InvalidConfig;
     const socket_timeout_s = getEnv(arena, "MCP_NODE_SOCKET_TIMEOUT_S") orelse "60";
     var socket_timeout = try std.fmt.parseInt(u16, socket_timeout_s, 10);
     if (socket_timeout == 0) socket_timeout = 60;
@@ -196,6 +215,9 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
     const max_sessions_s = getEnv(arena, "MCP_NODE_MAX_SESSIONS") orelse "64";
     var max_sessions = try std.fmt.parseInt(u16, max_sessions_s, 10);
     if (max_sessions == 0) max_sessions = 64;
+    const max_node_links_s = getEnv(arena, "MCP_NODE_MAX_LINKS") orelse "64";
+    var max_node_links = try std.fmt.parseInt(u32, max_node_links_s, 10);
+    if (max_node_links == 0) max_node_links = 64;
     const session_ttl_s = getEnv(arena, "MCP_NODE_SESSION_TTL_S") orelse "600";
     var session_ttl = try std.fmt.parseInt(u32, session_ttl_s, 10);
     if (session_ttl == 0) session_ttl = 600;
@@ -245,6 +267,8 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
     const hosts_s = getEnv(arena, "MCP_NODE_ALLOWED_HOSTS") orelse "127.0.0.1:*,localhost:*,[::1]:*";
     const origins_s = getEnv(arena, "MCP_NODE_ALLOWED_ORIGINS") orelse "http://127.0.0.1:*,http://localhost:*,http://[::1]:*";
     var cfg: Config = .{
+        .state_dir = state_dir,
+        .state_max_bytes = state_max_bytes,
         .name = name,
         .host = try arena.dupe(u8, host),
         .port = port,
@@ -252,9 +276,12 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
         .allowed_hosts = try util.splitCsv(arena, hosts_s),
         .allowed_origins = try util.splitCsv(arena, origins_s),
         .max_out = max_out,
+        .copy_max_bytes = copy_max_bytes,
+        .copy_max_entries = copy_max_entries,
         .socket_timeout_s = socket_timeout,
         .max_conn = max_conn,
         .max_sessions = max_sessions,
+        .max_node_links = max_node_links,
         .session_ttl_s = session_ttl,
         .max_inflight_bytes = max_inflight_bytes,
         .text_mirror = text_mirror,
@@ -412,7 +439,7 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
     }
     // Per-token argument-gating policy (off when MCP_NODE_POLICY_FILE is
     // unset: v0.3.1 behaviour). Strict interplay rules, all fail at startup
-    // with the variable named (design §2).
+    // with the variable named.
     if (getEnv(arena, "MCP_NODE_POLICY_FILE")) |pp| {
         if (pp.len != 0) {
             if (mode == .node or mode == .stdio) {
@@ -424,8 +451,7 @@ pub fn loadConfigCli(arena: Allocator, io: Io, cli: Cli) !Config {
                 // connected nodes, where no policy exists: a hub-side policy
                 // would gate only the hub's own tools/call and silently
                 // pass everything else — a false sense of security. Refuse
-                // at startup; run policies on listen nodes instead (review
-                // F5).
+                // at startup; run policies on listen nodes instead.
                 std.debug.print("MCP_NODE_POLICY_FILE cannot be combined with hub mode: relayed calls run on nodes that have no policy; run the policy on each node's listen listener instead\n", .{});
                 return error.InvalidConfig;
             }
@@ -1194,4 +1220,40 @@ test "config audit env parsing and the key/file pairing rule" {
     try testing.expectEqual(AuditArgsMode.full, tuned.audit_args);
     try testing.expectEqual(AuditOnFull.drop, tuned.audit_on_full);
     try testing.expectEqual(@as(u64, 1048576), tuned.audit_max_bytes);
+}
+
+test "durable config CLI wins absolute nonempty and hub refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    defer env_state.process_environ = .empty;
+    env_state.process_environ = try makeEnviron(a, &.{
+        .{ .key = "MCP_NODE_STATE_DIR", .value = "/tmp/env-state" },
+        .{ .key = "MCP_NODE_STATE_MAX_BYTES", .value = "123456" },
+    });
+    const cfg = try loadConfigCli(a, io, .{ .stdio = true, .state_dir = "/tmp/cli-state" });
+    try testing.expectEqualStrings("/tmp/cli-state", cfg.state_dir.?);
+    try testing.expectEqual(@as(u64, 123456), cfg.state_max_bytes);
+    try testing.expectError(error.InvalidConfig, loadConfigCli(a, io, .{ .stdio = true, .state_dir = "" }));
+    try testing.expectError(error.InvalidConfig, loadConfigCli(a, io, .{ .stdio = true, .state_dir = "relative" }));
+    env_state.process_environ = try makeEnviron(a, &.{
+        .{ .key = "MCP_NODE_HUB_LISTEN", .value = "127.0.0.1:9999" },
+        .{ .key = "MCP_NODE_STATE_DIR", .value = "/tmp/state" },
+    });
+    try testing.expectError(error.InvalidConfig, loadConfig(a, io));
+}
+
+test "durable config feature off defaults and invalid ceiling" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = Io.Threaded.global_single_threaded.io();
+    defer env_state.process_environ = .empty;
+    env_state.process_environ = .empty;
+    const cfg = try loadConfigCli(a, io, .{ .stdio = true });
+    try testing.expect(cfg.state_dir == null);
+    try testing.expectEqual(@as(u64, 67108864), cfg.state_max_bytes);
+    env_state.process_environ = try makeEnviron(a, &.{.{ .key = "MCP_NODE_STATE_MAX_BYTES", .value = "-1" }});
+    try testing.expectError(error.InvalidConfig, loadConfigCli(a, io, .{ .stdio = true }));
 }

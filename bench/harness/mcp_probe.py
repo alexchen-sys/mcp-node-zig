@@ -218,17 +218,17 @@ def do_bootstrap(part, runs, pause_s, js=None):
     }
     if samples:
         out["summary"] = {
-            "cold_first_response_ms": stats.summarize_samples(
+            "cold_first_response_ms": stats.latency_summary(
                 [s["cold_first_response_ms"] for s in samples]),
-            "boot_listen_ms": stats.summarize_samples(
+            "boot_listen_ms": stats.latency_summary(
                 [s["boot_listen_ms"] for s in samples
                  if s.get("boot_listen_ms") is not None]),
-            "initialize_handshake_ms": stats.summarize_samples(
+            "initialize_handshake_ms": stats.latency_summary(
                 [s["initialize_handshake_ms"] for s in samples
                  if s.get("initialize_handshake_ms") is not None]),
-            "ready_to_serve_ms": stats.summarize_samples(
+            "ready_to_serve_ms": stats.latency_summary(
                 [s["ready_to_serve_ms"] for s in samples]),
-            "rtt_exec_ms": stats.summarize_samples(
+            "rtt_exec_ms": stats.latency_summary(
                 [s["rtt_exec_ms"] for s in samples]),
         }
         out["server_info"] = samples[0].get("server_info", {})

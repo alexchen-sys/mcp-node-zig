@@ -116,8 +116,55 @@ pub fn setSocketReadTimeoutMs(handle: Handle, milliseconds: u64) SetTimeoutError
     } else {
         const tv = std.c.timeval{ .sec = @intCast(clamped / 1000), .usec = @intCast((clamped % 1000) * 1000) };
         const opt = std.mem.asBytes(&tv);
+
         if (std.c.setsockopt(handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, opt.ptr, @intCast(opt.len)) != 0)
             return error.SocketOptionFailed;
+    }
+}
+
+/// SO_SNDTIMEO twin of `setSocketReadTimeoutMs`. POSIX `socketWriteAll`
+/// carries the per-write bound as this socket option (its `timeout_ms`
+/// parameter is only honored on Windows, where the software deadline in
+/// the overlapped wait enforces it), so a caller that must cap one write
+/// tighter than the accept-time bound tightens the option for that write.
+/// Windows: no-op, same rationale as `setSocketReadTimeoutMs`.
+pub fn setSocketSendTimeoutMs(handle: Handle, milliseconds: u64) SetTimeoutError!void {
+    const clamped: u64 = @min(milliseconds, @as(u64, std.math.maxInt(u32)));
+    if (comptime builtin.os.tag == .linux) {
+        const tv = std.posix.timeval{ .sec = @intCast(clamped / 1000), .usec = @intCast((clamped % 1000) * 1000) };
+        const opt = std.mem.asBytes(&tv);
+        const snd = std.os.linux.setsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, @intCast(opt.len));
+        if (std.os.linux.errno(snd) != .SUCCESS) return error.SocketOptionFailed;
+    } else if (comptime builtin.os.tag == .windows) {
+        // No-op: the software deadline in socketWriteAll carries the bound.
+    } else {
+        const tv = std.c.timeval{ .sec = @intCast(clamped / 1000), .usec = @intCast((clamped % 1000) * 1000) };
+        const opt = std.mem.asBytes(&tv);
+        if (std.c.setsockopt(handle, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, opt.ptr, @intCast(opt.len)) != 0)
+            return error.SocketOptionFailed;
+    }
+}
+
+/// Current SO_SNDTIMEO in milliseconds. Returns null where the option is
+/// not how writes are bounded (Windows) or cannot be read back: callers
+/// then keep the accept-time bound. A result of 0 means "no bound" (a
+/// blocking send may wait forever) — treat it as larger than any budget.
+pub fn getSocketSendTimeoutMs(handle: Handle) ?u64 {
+    if (comptime builtin.os.tag == .linux) {
+        var tv: std.posix.timeval = undefined;
+        const opt = std.mem.asBytes(&tv);
+        var len: std.os.linux.socklen_t = @intCast(opt.len);
+        const rc = std.os.linux.getsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.SNDTIMEO, opt.ptr, &len);
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+        return @as(u64, @intCast(tv.sec)) * 1000 + @as(u64, @intCast(tv.usec)) / 1000;
+    } else if (comptime builtin.os.tag == .windows) {
+        return null;
+    } else {
+        var tv: std.c.timeval = undefined;
+        var len: std.c.socklen_t = @sizeOf(std.c.timeval);
+        const opt = std.mem.asBytes(&tv);
+        if (std.c.getsockopt(handle, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, opt.ptr, &len) != 0) return null;
+        return @as(u64, @intCast(tv.sec)) * 1000 + @as(u64, @intCast(tv.usec)) / 1000;
     }
 }
 
@@ -242,6 +289,147 @@ pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.
         .socket = .{ .handle = fd, .address = Threaded.addressFromPosix(&storage) },
         .options = {},
     };
+}
+
+/// Set a listen socket non-blocking (POSIX): the hub accept loop polls
+/// before accepting, and a non-blocking listen fd turns the poll-to-accept
+/// race (a reset drained the pending queue) into EAGAIN instead of a
+/// parked thread. Accepted sockets do NOT inherit the flag, so link reads
+/// keep their blocking+timeout semantics. POSIX-only: the Windows accept
+/// path keeps the blocking std call and the self-connect wake.
+pub fn setListenNonBlocking(handle: Handle) SetTimeoutError!void {
+    if (comptime builtin.os.tag == .windows) {
+        var one: c_ulong = 1;
+        if (winsock.ioctlsocket(@ptrCast(handle), winsock.FIONBIO, &one) != 0) return error.SocketOptionFailed;
+        return;
+    }
+    if (comptime builtin.os.tag == .linux) {
+        const fl = std.os.linux.fcntl(handle, std.os.linux.F.GETFL, 0);
+        if (std.os.linux.errno(fl) != .SUCCESS) return error.SocketOptionFailed;
+        const nonblock: usize = 1 << @bitOffsetOf(std.os.linux.O, "NONBLOCK");
+        const rc = std.os.linux.fcntl(handle, std.os.linux.F.SETFL, fl | nonblock);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.SocketOptionFailed;
+    } else {
+        const fl = std.c.fcntl(handle, std.c.F.GETFL, @as(c_int, 0));
+        if (fl == -1) return error.SocketOptionFailed;
+        const nonblock: c_int = 1 << @bitOffsetOf(std.c.O, "NONBLOCK");
+        if (std.c.fcntl(handle, std.c.F.SETFL, @as(c_int, fl | nonblock)) != 0) return error.SocketOptionFailed;
+    }
+}
+
+// --- Windows socket polling (hub accept loop wake) --------------------------
+
+/// Minimal WSAPoll binding (ws2_32 is always linked in networking builds).
+/// The hub accept loop polls the listener together with a pre-created
+/// loopback wake connection, so stop() retracts the thread without
+/// allocating a socket at teardown time. POLLRDNORM on a listen
+/// socket means a pending connection; on the wake receiver it means the
+/// stop byte landed.
+pub const WSAPOLLFD = extern struct {
+    fd: Handle,
+    events: c_short,
+    revents: c_short,
+};
+pub const POLLRDNORM: c_short = 0x0100;
+pub const POLLERR: c_short = 0x0001;
+pub const POLLHUP: c_short = 0x0002;
+pub const POLLNVAL: c_short = 0x0004;
+
+extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, nfds: c_ulong, timeout: c_int) c_int;
+
+/// Raw winsock bindings for the hub accept loop on Windows: non-blocking
+/// listen socket mode and raw accept, so the poll-to-accept race (queue
+/// drained by a reset) returns "nothing pending" instead of parking the
+/// accept thread beyond the reach of the shutdown wake.
+const winsock = struct {
+    const ws = std.os.windows.ws2_32;
+    pub const invalid: std.os.windows.HANDLE = @ptrFromInt(~@as(usize, 0));
+    pub const FIONBIO: c_long = -2147195266; // 0x8004667E as signed long
+    pub extern "ws2_32" fn accept(s: std.os.windows.HANDLE, addr: ?*ws.sockaddr, addrlen: ?*c_int) std.os.windows.HANDLE;
+    pub extern "ws2_32" fn ioctlsocket(s: std.os.windows.HANDLE, cmd: c_long, argp: *c_ulong) c_int;
+};
+
+/// Peer address from a winsock sockaddr (accept-derived).
+fn ipFromWsa(storage: *const std.os.windows.ws2_32.sockaddr.storage) std.Io.net.IpAddress {
+    const ws = std.os.windows.ws2_32;
+    if (storage.family == ws.AF.INET) {
+        const in: *const ws.sockaddr.in = @ptrCast(@alignCast(storage));
+        return .{ .ip4 = .{
+            .bytes = @bitCast(in.addr),
+            .port = std.mem.bigToNative(u16, in.port),
+        } };
+    }
+    const in6: *const ws.sockaddr.in6 = @ptrCast(@alignCast(storage));
+    return .{ .ip6 = .{
+        .port = std.mem.bigToNative(u16, in6.port),
+        .bytes = in6.addr,
+        .flow = in6.flowinfo,
+        .interface = .{ .index = in6.scope_id },
+    } };
+}
+
+/// Poll sockets (Windows only). Returns the WSAPoll result: >0 ready
+/// count, 0 tick, <0 failure (callers back off and re-check stopping).
+pub fn wsaPoll(fds: []WSAPOLLFD, timeout_ms: c_int) c_int {
+    if (comptime builtin.os.tag != .windows) @compileError("wsaPoll is Windows-only");
+    return WSAPoll(fds.ptr, @intCast(fds.len), timeout_ms);
+}
+
+/// Raw non-blocking accept (POSIX) for the hub accept loop, called only
+/// after poll reported the listener readable. null means the pending queue
+/// drained first (a reset between poll and accept) — the caller loops back
+/// to poll. NEVER routed through std's Io.net accept: its EAGAIN maps to a
+/// debug panic (see the module doc). The accepted socket is blocking with
+/// CLOEXEC, exactly like std's accept would produce.
+pub fn acceptNonBlocking(listen_fd: Handle) ?std.Io.net.Stream {
+    if (comptime builtin.os.tag == .windows) {
+        var storage: std.os.windows.ws2_32.sockaddr.storage = .{ .family = 0 };
+        var len: c_int = @sizeOf(std.os.windows.ws2_32.sockaddr.storage);
+        const s = winsock.accept(@ptrCast(listen_fd), @ptrCast(&storage), &len);
+        if (s == winsock.invalid) return null; // WSAEWOULDBLOCK: queue drained
+        // A raw-accepted socket may inherit the listen socket's FIONBIO
+        // mode; force blocking — link I/O relies on blocking reads with
+        // software deadlines (see the module doc).
+        var zero: c_ulong = 0;
+        _ = winsock.ioctlsocket(s, winsock.FIONBIO, &zero);
+        return .{ .socket = .{
+            .handle = @ptrCast(s),
+            .address = ipFromWsa(&storage),
+        } };
+    }
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+    if (comptime builtin.os.tag == .linux) {
+        while (true) {
+            const rc = std.os.linux.accept4(listen_fd, &storage.any, &len, std.os.linux.SOCK.CLOEXEC);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return .{ .socket = .{
+                    .handle = @intCast(rc),
+                    .address = std.Io.Threaded.addressFromPosix(&storage),
+                } },
+                .INTR => continue,
+                // AGAIN (queue drained) or any other failure: back to poll,
+                // whose tick/backoff owns persistent-error behavior.
+                else => return null,
+            }
+        }
+    } else {
+        while (true) {
+            const fd = std.c.accept(listen_fd, &storage.any, &len);
+            if (fd != -1) {
+                // Accepted sockets on Darwin do not inherit CLOEXEC.
+                _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+                return .{ .socket = .{
+                    .handle = fd,
+                    .address = std.Io.Threaded.addressFromPosix(&storage),
+                } };
+            }
+            if (comptime @hasDecl(std.c, "_errno")) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            }
+            return null;
+        }
+    }
 }
 
 /// Half-close the send side (FIN after any queued response bytes) while the

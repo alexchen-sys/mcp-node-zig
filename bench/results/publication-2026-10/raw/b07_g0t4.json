@@ -11,9 +11,9 @@
   "version": "0.8.2",
   "description": "Run commands on this linux machine"
  },
- "instance_a_rss_kib": 158688,
- "instance_b_rss_kib": 159896,
- "second_agent_cost_kib": 159896,
- "two_agents_total_kib": 318584,
+ "instance_a_rss_kib": 150464,
+ "instance_b_rss_kib": 151400,
+ "second_agent_cost_kib": 151400,
+ "two_agents_total_kib": 301864,
  "phase": "per_connection"
 }

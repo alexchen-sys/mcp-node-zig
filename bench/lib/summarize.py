@@ -39,12 +39,6 @@ def fmt(v, nd=1):
     return str(v)
 
 
-def cv_flag(summary):
-    if not summary or summary.get("cv_pct") is None:
-        return ""
-    return " (!)" if summary["cv_pct"] > 10 else ""
-
-
 def pp3(summary):
     """Compact p50/p90/p99 triple for a summarize dict."""
     if not summary or not summary.get("n"):
@@ -74,65 +68,34 @@ def failures_of(p):
 
 # ------------------------------------------------------------------ env
 
-def governor_of(env):
-    cpu = (env or {}).get("cpu", {})
-    gpp = cpu.get("governor_per_policy")
-    if gpp:
-        return "/".join(sorted(set(gpp.values())))
-    return cpu.get("governor")
-
-
-def freq_stats(env):
-    f = (env or {}).get("cpu", {}).get("cpu_freq_mhz_observed")
-    if not f:
-        return None, None
-    return round(min(f), 1), round(max(f), 1)
+def mem_gib_of(env):
+    kb = (env or {}).get("memory", {}).get("MemTotal") or ""
+    try:
+        return round(int(kb.split()[0]) / 1048576)
+    except (ValueError, IndexError):
+        return None
 
 
 def env_paragraph(results, public=False):
     env = load(results, "env.json")
     if not env:
         return ["_(no env.json — run the suite)_"]
-    env_end = load(results, "env_end.json")
     cpu = env.get("cpu", {})
     out = []
-    gov_start = governor_of(env)
-    freq_lo, freq_hi = freq_stats(env)
-    gov_txt = gov_start if gov_start else (cpu.get("cpufreq_note") or "unknown")
-    freq_txt = f", observed {freq_lo}-{freq_hi} MHz" if freq_lo is not None else ""
+    mem_gib = mem_gib_of(env)
+    mem_txt = f", ~{mem_gib} GiB RAM" if mem_gib else ""
+    kernel = env.get("os", {}).get("kernel")
+    distro = env.get("os", {}).get("distribution")
     if public:
-        out.append(f"- Stand: {env.get('hostname')} — {cpu.get('model')}, "
-                   f"{cpu.get('cores')} cores, governor {gov_txt}{freq_txt}; "
-                   f"kernel {env.get('os', {}).get('kernel')}; "
-                   f"binary sha256 {(env.get('binary') or {}).get('sha256')}; "
-                   f"passports: {env.get('date_utc')}.")
-        if cpu.get("cpufreq_note"):
-            out.append(f"- cpufreq: {cpu['cpufreq_note']} (frequency/governor "
-                       "reported, never changed).")
+        out.append(f"- Stand: {cpu.get('cores')} vCPU {cpu.get('model')}{mem_txt}; "
+                   f"kernel {kernel} ({distro}); Zig {env.get('tools', {}).get('zig', '0.16.0')} (`ReleaseSafe`).")
+        loadavg = str(env.get("load", {}).get("loadavg") or "").split()
+        if len(loadavg) >= 3:
+            out.append(f"- Host load (1/5/15 min): {' / '.join(loadavg[:3])}. "
+                       "CV is reported for every timed latency table (b01, b02, b05); compare high-CV series by p50/p90 rather than mean.")
     else:
-        out.append(f"stand: {env.get('hostname')} — {cpu.get('model')}, {cpu.get('cores')} cores, "
-                   f"governor {gov_txt}{freq_txt}; kernel {env.get('os', {}).get('kernel')}; "
-                   f"{env.get('date_utc')}")
-    if env_end:
-        gov_end = governor_of(env_end)
-        end_lo, end_hi = freq_stats(env_end)
-        drift = []
-        if gov_start and gov_end and gov_start != gov_end:
-            drift.append(f"governor changed: {gov_start} -> {gov_end}")
-        if freq_lo is not None and end_lo is not None:
-            drift.append(f"observed frequency range changed: {freq_lo}-{freq_hi} MHz "
-                         f"-> {end_lo}-{end_hi} MHz")
-        end_freq_txt = f", observed {end_lo}-{end_hi} MHz" if end_lo is not None else ""
-        if public:
-            out.append(f"- End of run: governor {gov_end or 'unknown'}{end_freq_txt}; "
-                       f"start was governor {gov_start or 'unknown'}"
-                       + (f", {freq_lo}-{freq_hi} MHz" if freq_lo is not None else "")
-                       + (f" — DRIFT: {'; '.join(drift)}" if drift else " — no drift."))
-        else:
-            out.append(f"end of run: governor {gov_end or 'unknown'}{end_freq_txt} "
-                       f"(start: {gov_start or 'unknown'}"
-                       + (f", {freq_lo}-{freq_hi} MHz" if freq_lo is not None else "")
-                       + (f"; DRIFT: {'; '.join(drift)} (!)" if drift else "") + ")")
+        out.append(f"stand: {cpu.get('cores')} vCPU {cpu.get('model')}{mem_txt}; "
+                   f"kernel {kernel}; {env.get('date_utc')}")
     return out
 
 
@@ -149,25 +112,30 @@ def b01_table(results, public):
                    "min…max ms | mean ± σ ms | CV% |")
         out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     else:
-        out.append("| participant | median ms | p90 ms | p95 ms | p99 ms | mean ± σ ms | "
+        out.append("| participant | p50 ms | p90 ms | p95 ms | p99 ms | mean ± σ ms | "
                    "min…max ms | CV% | runs ok |")
         out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    hists = []
     for key, p in b01["participants"].items():
         s = (p.get("summary") or {}).get("cold_first_response_ms", {})
         nfail = failures_of(p)
         name = NAMES.get(key, key)
+        hl = hist_line(s)
+        if hl:
+            hists.append(f"_{name} cold-start histogram (ms, [floor, ceil) count): {hl}_")
         if public:
             out.append(f"| {name} | {s.get('n', 0)} | {nfail} | {fmt(s.get('p50', s.get('median')))} | "
                        f"{fmt(s.get('p90'))} | {fmt(s.get('p95'))} | {fmt(s.get('p99'))} | "
                        f"{fmt(s.get('min'))}…{fmt(s.get('max'))} | "
                        f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} | "
-                       f"{fmt(s.get('cv_pct'))}{cv_flag(s)} |")
+                       f"{fmt(s.get('cv_pct'))} |")
         else:
-            out.append(f"| {name} | {fmt(s.get('median'))} | {fmt(s.get('p90'))} | "
+            out.append(f"| {name} | {fmt(s.get('p50', s.get('median')))} | {fmt(s.get('p90'))} | "
                        f"{fmt(s.get('p95'))} | {fmt(s.get('p99'))} | "
                        f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} | "
                        f"{fmt(s.get('min'))}…{fmt(s.get('max'))} | "
-                       f"{fmt(s.get('cv_pct'))}{cv_flag(s)} | {s.get('n', 0)}/{(s.get('n') or 0) + nfail} |")
+                       f"{fmt(s.get('cv_pct'))} | {s.get('n', 0)}/{(s.get('n') or 0) + nfail} |")
+    out += hists
     return out
 
 
@@ -210,21 +178,25 @@ def b02_section(results, public):
     n = b02.get("node", {})
     cs = c.get("summary", {})
     ns = (n.get("summary") or {}).get("link_established_ms")
-    out.append("| phase | N ok | failures | p50 ms | p90 ms | p99 ms | min…max ms | mean ± σ ms |")
-    out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    out.append("| phase | N ok | failures | p50 ms | p90 ms | p95 ms | p99 ms | min…max ms | mean ± σ ms | CV% |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for label, key in (("TCP connect", "tcp_connect_ms"),
                        ("TLS 1.3 handshake", "tls_handshake_ms"),
                        ("total (connect+handshake)", "total_ms")):
         s = cs.get(key) or {}
         out.append(f"| {label} | {s.get('n', 0)} | {c.get('failures', 0)} | "
                    f"{fmt(s.get('p50', s.get('median')))} | {fmt(s.get('p90'))} | "
+                   f"{fmt(s.get('p95'))} | "
                    f"{fmt(s.get('p99'))} | {fmt(s.get('min'))}…{fmt(s.get('max'))} | "
-                   f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} |")
+                   f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} | "
+                   f"{fmt(s.get('cv_pct'))} |")
     if ns:
         out.append(f"| node link established (spawn→registered) | {ns.get('n', 0)} | "
                    f"{n.get('failures', 0)} | {fmt(ns.get('p50'))} | {fmt(ns.get('p90'))} | "
+                   f"{fmt(ns.get('p95'))} | "
                    f"{fmt(ns.get('p99'))} | {fmt(ns.get('min'))}…{fmt(ns.get('max'))} | "
-                   f"{fmt(ns.get('mean'))} ± {fmt(ns.get('sigma'))} |")
+                   f"{fmt(ns.get('mean'))} ± {fmt(ns.get('sigma'))} | "
+                   f"{fmt(ns.get('cv_pct'))} |")
     if c.get("tls_versions"):
         out.append(f"_negotiated: {json.dumps(c['tls_versions'], sort_keys=True)}; "
                    f"ciphers: {json.dumps(c.get('ciphers', {}), sort_keys=True)}_")
@@ -264,6 +236,7 @@ def b05_table(results, public):
         out.append("| participant | p50 ms | p90 ms | p95 ms | p99 ms | mean ± σ ms | "
                    "min…max ms | CV% |")
         out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    hists = []
     for key, p in b05["participants"].items():
         s = p.get("summary") or {}
         name = NAMES.get(key, key)
@@ -273,22 +246,18 @@ def b05_table(results, public):
                        f"{fmt(s.get('p90'))} | {fmt(s.get('p95'))} | {fmt(s.get('p99'))} | "
                        f"{fmt(s.get('min'))}…{fmt(s.get('max'))} | "
                        f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} | "
-                       f"{fmt(s.get('cv_pct'))}{cv_flag(s)} |")
+                       f"{fmt(s.get('cv_pct'))} |")
         else:
             out.append(f"| {name} | {fmt(s.get('p50'))} | {fmt(s.get('p90'))} | "
                        f"{fmt(s.get('p95'))} | {fmt(s.get('p99'))} | "
                        f"{fmt(s.get('mean'))} ± {fmt(s.get('sigma'))} | "
                        f"{fmt(s.get('min'))}…{fmt(s.get('max'))} | "
-                       f"{fmt(s.get('cv_pct'))}{cv_flag(s)} |")
+                       f"{fmt(s.get('cv_pct'))} |")
         hl = hist_line(s)
-        if public and hl:
-            out.append(f"| {name} histogram (ms) | | | | | | | "
-                       f"{_hist_md(hl)} | | |")
+        if hl:
+            hists.append(f"_{name} histogram (ms, [floor, ceil) count): {hl}_")
+    out += hists
     return out
-
-
-def _hist_md(hl):
-    return hl.replace("|", "/")
 
 
 def b07_section(results, public):
@@ -302,8 +271,11 @@ def b07_section(results, public):
         base = ours_raw.get("base_rss_kib")
         after = ours_raw.get("rss_kib_after_close")
         rec = ours_raw.get("recovered_delta_kib")
-        recovery = ("returned to base" if ours_raw.get("recovered")
-                    else f"still +{fmt(rec, 0)} KiB above base")
+        if ours_raw.get("recovered"):
+            recovery = ("returned to base" if not rec else
+                        f"{fmt(abs(rec), 0)} KiB {'below' if rec < 0 else 'above'} base")
+        else:
+            recovery = f"still +{fmt(rec, 0)} KiB above base"
         out.append(f"- mcp-node-zig: base RSS {fmt(base, 0)} KiB; "
                    f"ΔRSS per connection ≈ {fmt(d, 1)} KiB over "
                    f"{ours_raw.get('connections_total')} connections; "
@@ -324,17 +296,21 @@ def b08_section(results, public):
     out.append("| participant | artifact | env MiB | runtime MiB |")
     out.append("| --- | --- | --- | --- |")
     o = b08.get("ours", {})
-    out.append(f"| mcp-node-zig | one binary {fmt(o.get('binary_mib'), 2)} MiB | 0 | 0 |")
+    out.append(f"| mcp-node-zig | one binary {fmt(o.get('binary_mib'), 1)} MiB | 0 | 0 |")
     t = b08.get("tumf", {})
     if t.get("venv_mib") is not None:
         out.append(f"| {t.get('participant')} | venv {fmt(t.get('venv_mib'))} MiB | "
-                   f"{fmt((t.get('venv_mib') or 0) + (t.get('uv_cache_mib') or 0))} "
-                   "(venv + uv cache) | "
+                   f"{fmt(t.get('venv_mib'))} (materialized venv) | "
                    f"{fmt(t.get('runtime_mib'))} |")
     g = b08.get("g0t4", {})
     if g.get("package_env_mib") is not None:
         out.append(f"| {g.get('participant')} | npx env {fmt(g.get('package_env_mib'))} MiB | "
                    f"{fmt(g.get('package_env_mib'))} | {fmt(g.get('runtime_mib'))} |")
+    out.append("")
+    out.append("_env is the per-package environment the launch channel materializes (uvx venv /"
+               " npx cache dir); host-wide shared caches and unrelated global installs are not"
+               " billed to a participant. runtime is the language interpreter the channel needs"
+               " (uv-managed CPython; system Node.js = node binary + the npm/corepack the Node.js package ships)._")
     return out
 
 

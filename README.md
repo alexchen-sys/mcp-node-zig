@@ -6,13 +6,13 @@
 
 English | [Русский](README.ru.md) | [中文](README.zh.md)
 
-Your servers call home. Your agent gets a structured shell on any machine, even behind NAT — you keep the keys, the perimeter and the kill switch.
+Your servers call home. Your agent gets a structured shell on any machine, even behind NAT; you keep the keys, the perimeter and the kill switch.
 
-![mcp-node-zig: a node behind NAT dials out to a hub, the hub runs a command on it](assets/demo.gif)
+![mcp-node-zig: cold start, an exec round-trip and a live session listing against a local node (v0.5.0)](assets/demo.gif)
 
 mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your agent can run commands, drive long-running sessions and read or write files there. The node dials out to a hub you run (the same binary), so the machine opens no inbound ports, no SSH key ever reaches the agent, and no third-party cloud sits in the path. The link is mutually authenticated with HMAC-SHA256 and runs over TLS, the hub rate-limits handshakes per source, and every tool call can land in a tamper-evident audit log.
 
-**1.9 ms** cold start · **0.62 MiB** idle RSS · **8.70 MiB** on disk · **0.7 ms** p50 exec round-trip ([benchmarks](BENCHMARKS.md))
+**2.0 ms** cold start · **1.2 ms** p50 exec round-trip · **1.57 MiB** idle RSS · **9.6 MiB** binary ([benchmarks](BENCHMARKS.md))
 
 ## Install
 
@@ -20,12 +20,12 @@ mcp-node-zig is one static binary that speaks MCP. Put it on a machine and your 
 curl -fsSL https://raw.githubusercontent.com/alexchen-sys/mcp-node-zig/main/install.sh | sh
 ```
 
-The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server, add `MCP_NODE_FLAVOR=tls` (Linux and macOS releases). Pin a version with `MCP_NODE_VERSION=0.4.0`, change the target directory with `PREFIX=/some/dir`.
+The script detects the platform, downloads the latest release, verifies it against `SHA256SUMS.txt` and installs to `/usr/local/bin` (or `~/.local/bin`). For a hub with the built-in TLS server, add `MCP_NODE_FLAVOR=tls` (Linux and macOS releases). Pin a version with `MCP_NODE_VERSION=0.5.0`, change the target directory with `PREFIX=/some/dir`.
 
 Manual install, Linux x86_64:
 
 ```sh
-curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.4.0/mcp-node-v0.4.0-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.5.0/mcp-node-v0.5.0-x86_64-linux.tar.gz | tar xz
 ```
 
 Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zig/releases): `aarch64-linux`, `aarch64-macos`, `x86_64-windows`. Each release ships `SHA256SUMS.txt`, signed with [cosign](https://github.com/sigstore/cosign) keyless (Sigstore); `install.sh` verifies the signature when cosign is on your PATH.
@@ -34,7 +34,7 @@ Other targets on the [releases page](https://github.com/alexchen-sys/mcp-node-zi
 
 ```sh
 openssl rand -hex 32 > token
-./mcp-node-v0.4.0-x86_64-linux/mcp-node &
+./mcp-node-v0.5.0-x86_64-linux/mcp-node &
 
 curl -sS http://127.0.0.1:8341/mcp \
   -H 'Content-Type: application/json' \
@@ -53,10 +53,10 @@ claude mcp add --transport http mcp-node http://127.0.0.1:8341/mcp \
 <summary>Windows (PowerShell)</summary>
 
 ```powershell
-curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.4.0/mcp-node-v0.4.0-x86_64-windows.zip
+curl.exe -L -o mcp-node.zip https://github.com/alexchen-sys/mcp-node-zig/releases/download/v0.5.0/mcp-node-v0.5.0-x86_64-windows.zip
 Expand-Archive mcp-node.zip
 [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') | Set-Content -NoNewline -Encoding Ascii token
-.\mcp-node-v0.4.0-x86_64-windows\mcp-node.exe
+.\mcp-node-v0.5.0-x86_64-windows\mcp-node.exe
 ```
 
 From a second window:
@@ -74,7 +74,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8341/mcp -Method Post -ContentType "appl
 - **Keys stay with you.** The agent holds a token for the node, never an SSH key. Stop the node and access is gone; rotate the token and every old copy stops working.
 - **Nothing to provision.** No Node, no Python, no OpenSSH, no keys to distribute. Copy one file and run it.
 - **Processes outlive requests.** Start a build, disconnect, come back and read the output by offset.
-- **Cheap to keep running.** Under 1 MiB idle. Each extra connected agent adds about 288 KiB, not a second ~190 MiB server process.
+- **Cheap to keep running.** 1.57 MiB idle. Each extra connected agent adds about 304 KiB, not a second ~100–150 MiB server process.
 - **No shell unless you ask.** `exec` passes argv verbatim. `exec_shell` is the one explicit shell layer.
 - **Kills the whole tree.** Process groups on POSIX, Job Objects on Windows. No orphaned children holding pipes.
 - **Every call on the record.** Turn on the audit log and each tool call leaves an HMAC-chained JSONL line that `audit-verify` checks offline.
@@ -91,7 +91,7 @@ mcp-node is an execution API for agents. Through SSH, an agent gets one string t
 - **argv without a shell.** No second round of quoting for a remote shell to reparse. A shell is used only when you ask for `exec_shell`.
 - **Structured results.** `stdout`, `stderr`, `exit_code`, `truncated_*` and timings as JSON, with per-call timeouts.
 - **Sessions that outlive the request.** `exec_start`, then `exec_poll` by byte offset, `exec_write` to stdin, `exec_wait` up to 300 s, `exec_kill` for the whole tree. A dropped connection doesn't kill the build.
-- **Verified file writes.** `write_file` takes base64 and returns the SHA-256 of what landed on disk.
+- **Verified file writes.** `write_file` takes plain text or base64 and returns the SHA-256 of what landed on disk.
 - **A self-describing interface.** Any MCP client discovers the tools from `tools/list`; nothing to teach the agent.
 
 For remote machines, [reverse connect](#reverse-connect-no-inbound-ports) replaces the tunnel: no sshd on the target and no key in the agent's hands. Where SSH is already in place, the two pair up: the node listens on `127.0.0.1` and you forward the port (`ssh -L 8341:127.0.0.1:8341 host`).
@@ -128,7 +128,9 @@ with `--stdio` (or `MCP_NODE_STDIO=1`). Messages are newline-delimited
 JSON-RPC: one request per line on stdin, one response per line on stdout.
 There is no listener and no token, since whoever holds the pipes started the
 process. Logs go to stderr only; the node exits 0 when stdin closes and kills
-any sessions still running.
+any non-durable sessions still running (durable sessions are exactly the
+opt-in exception: they detach and survive, see
+[Durable sessions](#durable-sessions)).
 
 ```json
 {
@@ -165,18 +167,19 @@ Details and the threat model: [docs/audit-log.md](docs/audit-log.md).
 | Tool | Does |
 | --- | --- |
 | `sys_info` | hostname, OS, load, memory, uptime |
-| `exec` | run argv to completion, no shell |
-| `exec_shell` | run a script via `bash`/`sh`/`fish`/`zsh`, or `cmd`/`powershell` on Windows |
+| `exec` | run argv to completion, no shell; `max_bytes`/`head_lines`/`tail_lines` shape long output |
+| `exec_shell` | run a script via `bash`/`sh`/`fish`/`zsh`, or `cmd`/`powershell` on Windows; same shaping as `exec` |
 | `exec_start` | start a long-running process as a session |
-| `exec_poll` | read session output from byte offsets |
+| `exec_poll` | read session output from byte offsets, `max_bytes` pages |
 | `exec_wait` | block until the session exits or `timeout` (default 30 s, max 300 s) |
 | `exec_write` | write base64 bytes to stdin; `eof=true` closes it |
 | `exec_kill` | kill the session's process tree |
 | `exec_close` | free the session; idempotent |
 | `exec_list` | list live sessions |
-| `read_file` | read UTF-8 text with offset/limit |
-| `write_file` | write base64 content, create parent dirs, return SHA-256 |
+| `read_file` | read UTF-8 text with offset/limit or `line_offset`/`line_limit` line windows |
+| `write_file` | write plain text (`content`) or base64 (`content_b64`), create parent dirs, return SHA-256 |
 | `list_dir` | list entries with type, size, mtime |
+| `copy_path` | copy a file or directory tree to an exact new destination; staged and atomically published, never overwrites |
 
 Full schemas via `tools/list`. `exec` and `exec_shell` timeouts default to 120 s, clamped to 1–1800 s.
 
@@ -188,22 +191,51 @@ capture keeps running while nobody polls, and after a reconnect the same
 `session_id` continues from the byte offsets of your last reply (no gaps,
 no duplicates). `exec_list` recovers ids when a reply was lost.
 
-Honest limits: sessions do **not** survive a node process restart (crash,
-OOM kill, reboot) — state is in-memory and every old id then answers
-`unknown_session`. Output per stream is capped at `MCP_NODE_MAX_OUT`
-bytes; once the cap is hit the head is kept, the flag `truncated_*` is set
-and the counter `lost_*_bytes` reports exactly how many later bytes were
-dropped — never a silent loss. Finished sessions are reaped
-`MCP_NODE_SESSION_TTL_S` after they finish; live ones are never reaped by
-time.
+By default, sessions live in memory (`unknown_session` after a node process
+restart such as a crash, OOM kill or reboot). Output per stream is capped at `MCP_NODE_MAX_OUT`
+bytes; once the cap is hit the head is kept, `truncated_*` is set,
+and `lost_*_bytes` reports how many subsequent bytes were dropped.
+Finished sessions are reaped `MCP_NODE_SESSION_TTL_S` after completion;
+running sessions are not reaped by time.
 
-An unknown or expired `session_id` answers
-`{"ok": false, "error": "unknown_session", "session_id": ..., "expired": ..., "message": ...}` —
-a structured tool result, never a bare JSON-RPC `-32602`. `expired: true`
+### Opt-in disk durability (`durable: true`)
+
+With `MCP_NODE_STATE_DIR` (or `--state-dir`) configured, `exec_start` accepts
+`"durable": true`: the child's stdout/stderr are appended to per-session log
+files on disk from the moment of spawn, and the session record commits before
+the child starts writing. After a node restart the node recovers the session:
+`exec_poll` on the same id returns `recovered: true` with byte-exact deltas
+from your offsets, and `exec_kill` continues to work because every signal is gated on a
+verified process identity (PID + start-time + boot id). The leader is
+signaled through pidfd, which cannot target a recycled PID. A narrow race
+remains if a process group is torn down and its ID is recreated between the
+identity check and the group signal.
+
+Data at rest: `argv`, `cwd` and the full stdout/stderr logs persist in
+**plaintext** under the state dir (treat it like shell history when commands may output secrets).
+It stays on the local disk and requires `0700` permissions.
+
+Recovered sessions report degraded capabilities explicitly in their status fields:
+`stdin_available: false` (`exec_write` returns `StdinUnavailable`), and when
+an orphaned child exited while the node was down, `exit_code` is `null`
+with `completion_reason: "orphaned_exit"`. Records bound to another
+token remain isolated by owner hash. Owner binding applies to
+policy-token identities; with no policy configured every request shares the
+default zero owner. A durable session closed
+or reaped returns `unknown_session` with `expired: true` for a bounded
+recency window. `durable: true` without a state dir is refused as
+`DurabilityDisabled`; the state dir itself must be private (`0700`) and is
+locked against concurrent node processes (`StateDirLocked`). `MCP_NODE_STATE_MAX_BYTES`
+(default 64 MiB) caps total local state storage. In v0.5.0 durable sessions are Linux-only; other
+platforms return `DurabilityUnsupported`.
+
+An unknown or expired `session_id` returns
+`{"ok": false, "error": "unknown_session", "session_id": ..., "expired": ..., "message": ...}`
+as a structured tool result (`isError: true`) rather than a protocol-level JSON-RPC `-32602`. `expired: true`
 means this node recently held the session and closed, reaped or evicted
 it (a bounded recency window: ids removed long ago are forgotten and
 answer `expired: false`, as do ids this node never had or that pre-date a
-node restart — the message says so). `exec_close` keeps its idempotent
+node restart; the message says so). `exec_close` keeps its idempotent
 `{"ok": true, "already_closed": true}` for the same case.
 
 ## Clients
@@ -252,7 +284,7 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 ## Security
 
 - **Token required.** The server refuses to start with a missing or empty token file. Comparison is constant-time.
-- **Per-token argument gating (optional).** `MCP_NODE_POLICY_FILE` constrains what each client token may do at the argument level — argv[0] allowlists, path prefixes for reads/writes/cwd, timeout and write-mode caps, token-owned sessions. See [argument gating](docs/arg-gating.md).
+- **Per-token argument gating (optional).** `MCP_NODE_POLICY_FILE` constrains what each client token may do at the argument level: argv[0] allowlists, path prefixes for reads/writes/cwd, timeout and write-mode caps, token-owned sessions. See [argument gating](docs/arg-gating.md).
 - **Loopback by default.** It binds `127.0.0.1`. To expose it, set `MCP_NODE_HOST` and add the `host:port` clients use to `MCP_NODE_ALLOWED_HOSTS`.
 - **Host and Origin checked** before the body is parsed: unknown Host gets 421, unknown Origin gets 403.
 - **TLS on the wire.** The node link runs over TLS, served by the hub itself in a `-Dtls-server` build or by any terminator. The local HTTP API stays on loopback; to expose it, front it with a reverse proxy, tunnel or VPN, for example `caddy reverse-proxy --from node.example.com --to 127.0.0.1:8341`.
@@ -263,19 +295,65 @@ Clients that only speak stdio: run the node itself with `--stdio` (see [stdio mo
 - **Whoever holds the client token runs commands.** On a plain node that means the node; on a hub the token reaches every connected node, so treat the hub token as the sum of them.
 - **The hub sees everything.** TLS ends on it (or in front of it), so it handles every request and response in plaintext, and a hub that holds a node's secret can run anything on that node.
 - **A node secret is a shell on that node and owns its name.** With `name:secret` lines each name has its own secret; a single shared secret lets any holder connect under any name, including one not yet taken.
-- **The handshake authenticates, it does not protect the link.** Hub and node prove the secret with HMAC-SHA256 over fresh nonces, but later frames are neither encrypted nor integrity-protected: over plain TCP an active relay can read and change them.
+- **The handshake authenticates, and every later frame is tagged.** Hub and node prove the secret with HMAC-SHA256 over fresh nonces, and post-handshake frames carry per-direction HMAC-SHA256 tags with strict sequence numbers, so an active relay cannot forge, reorder, or replay them. Plain TCP frames are still not encrypted: a relay can read (not change) them.
 - **Use TLS across anything you don't control.** `MCP_NODE_CONNECT_TLS=1` makes the node verify the certificate chain and server name, with no switch to turn that off. A binary built with `-Dtls-server` serves TLS on the hub's link port itself (see [Reverse connect](#reverse-connect-no-inbound-ports)); otherwise terminate TLS in front of that port and keep it on loopback.
 - **Plain TCP links are for the same host or a trusted LAN.**
 - **Handshake limits are per source address.** The hub runs at most 16 unauthenticated handshakes in total and 4 from one IPv4 address or IPv6 /64; 8 failed handshakes within a minute block that source for a minute. 127.0.0.1 and ::1 are exempt, so behind a local TLS terminator every peer looks the same: set per-IP limits there (nginx `limit_conn`) and firewall the public port to known sources where you can. With the built-in TLS server the hub sees the real peer address, so these limits work fully.
 - **Scopes are opt-in, not a sandbox.** Without `MCP_NODE_POLICY_FILE` every token can call every tool; with it, each token gets its own tool list and argument limits ([argument gating](docs/arg-gating.md)). An allowed interpreter is still arbitrary code.
 - **Out of scope:** sandboxing and a compromised hub or node host. The node runs with the full rights of its OS user. (The audit log detects record tampering; it cannot defend against an attacker who controls the host.)
 
+## Token permissions
+
+`MCP_NODE_POLICY_FILE` turns one shared token into a set of tokens, each
+with its own tool list and argument boundaries:
+
+```json
+{
+  "version": 1,
+  "tokens": [
+    {
+      "file": "/etc/mcp-node/tokens/build",
+      "tools": ["sys_info", "exec", "read_file", "list_dir"],
+      "exec_argv0": ["/usr/bin/git", "/usr/bin/make"],
+      "exec_cwd": ["/srv/build"],
+      "max_timeout_s": 120,
+      "read_paths": ["/srv/build"],
+      "read_deny": ["/srv/build/keys"]
+    },
+    {"file": "/etc/mcp-node/tokens/admin", "allow_all": true}
+  ]
+}
+```
+
+The node checks every call before anything runs: a denied `exec` never
+starts, a denied write never opens the file. Policy bounds argv[0], `cwd`,
+read and write paths, the timeout ceiling and the mode of created files.
+Paths are canonicalized (symlinks, `..`) and compared per whole segment.
+Sessions belong to the token that opened them. A denial comes back as
+`{"ok": false, "error": "PolicyDenied", "reason": ...}` and lands in the
+audit log as a `policy.deny` event. Token values never appear in the
+policy or the log.
+
+Without the variable the node behaves as before. With a policy set, the
+node's own token (`MCP_NODE_TOKEN_FILE`) must itself be one of the
+`tokens[].file` entries; the node refuses to start with `InvalidConfig`
+otherwise. The parser is strict: an
+unknown key or a contradiction stops startup. A hub does not take a
+policy, because the `/n/<name>/mcp` route forwards bodies to nodes
+verbatim; policy lives on each node. An allowed interpreter (`python3`,
+`bash`) still means arbitrary code. Details and limits:
+[docs/arg-gating.md](docs/arg-gating.md).
+
 ## Configuration
 
-Environment variables only.
+Environment variables, plus two command-line flags: `--connect` (reverse
+connect target) and `--state-dir` (durable session journal; same as
+`MCP_NODE_STATE_DIR`, the flag wins).
 
 | Variable | Default |
 | --- | --- |
+| `MCP_NODE_STATE_DIR` | unset; when set (or `--state-dir` given), `exec_start` accepts `durable:true` and sessions survive a node restart. The directory must be private (`0700`), node-owned, and is locked for the node's lifetime |
+| `MCP_NODE_STATE_MAX_BYTES` | `67108864` (64 MiB); aggregate admission budget for durable sessions (per-session reservation: 2 x output cap + 80 KiB; the node checks spool sizes on every refresh and on a 1 Hz sweep, and a session whose combined logs outgrow the reservation is killed with a verified identity and answers `completion_reason: "output_cap"`. The cap is best-effort: a writer can overshoot between checks, and output written while the node is down is reconciled, not prevented, at the next start) |
 | `MCP_NODE_HOST` | `127.0.0.1` (IP literal) |
 | `MCP_NODE_PORT` | `8341` |
 | `MCP_NODE_TOKEN_FILE` | `./token` |
@@ -296,10 +374,10 @@ Environment variables only.
 | `MCP_NODE_AUDIT_KEY_FILE` | unset; HMAC key for the audit chain (0600), separate from token and link secret |
 | `MCP_NODE_AUDIT_ARGS` | `summary`; `full` logs full argv and paths, never contents |
 | `MCP_NODE_AUDIT_ON_FULL` | `block`; `drop` sheds records under a stuck disk with a chained `dropped` marker |
-| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864`; past this the file rotates to `<file>.<first-seq>` and the chain continues |
+| `MCP_NODE_AUDIT_MAX_BYTES` | `67108864`; past this the file rotates to `<file>.<chain-gen>.<first-seq>` (never replacing an existing file) and the chain continues |
 
 `mcp-node --version` prints the version, `--help` the flags; any other
-argument than these, `--connect` and `--stdio` is an error. The one
+argument than these, `--connect`, `--stdio` and `--state-dir` is an error. The one
 subcommand is `mcp-node audit-verify [--anchor] <file>...`, which checks an
 audit log chain offline.
 
@@ -319,9 +397,9 @@ Reverse-connect variables (`MCP_NODE_CONNECT*`, `MCP_NODE_HUB_*`) are listed in
 
 ## Roadmap
 
-Shipped: reverse connect with a mutual HMAC handshake, TLS on the node link (every platform), per-source handshake limits, the tamper-evident audit log, per-token tool and argument scopes, exec sessions that survive a dropped link or hub restart, cosign-signed releases with build provenance.
+Shipped: reverse connect with a mutual HMAC handshake plus authenticated, sequence-checked frames, TLS on the node link (every platform), per-source handshake limits, the tamper-evident audit log, per-token tool and argument scopes, exec sessions that survive a dropped link or hub restart, durable exec sessions that survive a node restart (opt-in, Linux), cosign-signed releases with build provenance.
 
-Next: sessions that survive a node restart (on-disk state), per-node keypairs instead of shared secrets, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
+Next: per-node keypairs instead of shared secrets, durable sessions on macOS/Windows, and a PTY for interactive TUIs. The API is `0.x` and may still change before 1.0.
 
 ## Build from source
 

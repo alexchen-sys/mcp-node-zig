@@ -3,31 +3,31 @@
  "label": "warm server, tools/call exec argv [uname -a], N=10000 round-trips",
  "participants": {
   "ours": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_ours.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b05_ours.json",
    "argv": [
-    "/root/repo/zig-out/bin/mcp-node"
+    "zig-out/bin/mcp-node"
    ],
    "transport": "http",
    "server_info": {
     "name": "mcp-node",
-    "version": "0.3.1"
+    "version": "0.5.0"
    },
    "runs": 10000,
    "failures": 0,
    "summary": {
     "n": 10000,
     "unit": "ms",
-    "mean": 1.521,
-    "sigma": 0.428,
-    "min": 0.836,
-    "max": 4.459,
-    "median": 1.615,
-    "p90": 2.007,
-    "p95": 2.204,
-    "p99": 2.518,
-    "cv_pct": 28.16,
-    "ci95_half": 0.008,
-    "p50": 1.615,
+    "mean": 1.408,
+    "sigma": 1.356,
+    "min": 0.905,
+    "max": 77.469,
+    "median": 1.173,
+    "p90": 1.758,
+    "p95": 2.183,
+    "p99": 5.167,
+    "cv_pct": 96.3,
+    "ci95_half": 0.027,
+    "p50": 1.173,
     "histogram": {
      "unit": "ms",
      "n": 10000,
@@ -35,33 +35,57 @@
       {
        "floor": 0.0,
        "ceil": 1.0,
-       "count": 1732,
-       "share_pct": 17.32
+       "count": 703,
+       "share_pct": 7.03
       },
       {
        "floor": 1.0,
        "ceil": 2.0,
-       "count": 7240,
-       "share_pct": 72.4
+       "count": 8641,
+       "share_pct": 86.41
       },
       {
        "floor": 2.0,
        "ceil": 4.0,
-       "count": 1026,
-       "share_pct": 10.26
+       "count": 510,
+       "share_pct": 5.1
       },
       {
        "floor": 4.0,
        "ceil": 8.0,
-       "count": 2,
-       "share_pct": 0.02
+       "count": 85,
+       "share_pct": 0.85
+      },
+      {
+       "floor": 8.0,
+       "ceil": 16.0,
+       "count": 48,
+       "share_pct": 0.48
+      },
+      {
+       "floor": 16.0,
+       "ceil": 32.0,
+       "count": 11,
+       "share_pct": 0.11
+      },
+      {
+       "floor": 32.0,
+       "ceil": 64.0,
+       "count": 1,
+       "share_pct": 0.01
+      },
+      {
+       "floor": 64.0,
+       "ceil": 128.0,
+       "count": 1,
+       "share_pct": 0.01
       }
      ]
     }
    }
   },
   "tumf": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_tumf.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b05_tumf.json",
    "argv": [
     "uvx",
     "mcp-shell-server"
@@ -76,17 +100,17 @@
    "summary": {
     "n": 10000,
     "unit": "ms",
-    "mean": 2.572,
-    "sigma": 0.388,
-    "min": 2.006,
-    "max": 18.593,
-    "median": 2.462,
-    "p90": 3.026,
-    "p95": 3.203,
-    "p99": 3.779,
-    "cv_pct": 15.1,
-    "ci95_half": 0.008,
-    "p50": 2.462,
+    "mean": 5.679,
+    "sigma": 1.82,
+    "min": 3.104,
+    "max": 32.166,
+    "median": 5.139,
+    "p90": 8.263,
+    "p95": 9.211,
+    "p99": 11.204,
+    "cv_pct": 32.06,
+    "ci95_half": 0.036,
+    "p50": 5.139,
     "histogram": {
      "unit": "ms",
      "n": 10000,
@@ -106,24 +130,30 @@
       {
        "floor": 2.0,
        "ceil": 4.0,
-       "count": 9931,
-       "share_pct": 99.31
+       "count": 1155,
+       "share_pct": 11.55
       },
       {
        "floor": 4.0,
        "ceil": 8.0,
-       "count": 68,
-       "share_pct": 0.68
+       "count": 7690,
+       "share_pct": 76.9
       },
       {
        "floor": 8.0,
        "ceil": 16.0,
-       "count": 0,
-       "share_pct": 0.0
+       "count": 1145,
+       "share_pct": 11.45
       },
       {
        "floor": 16.0,
        "ceil": 32.0,
+       "count": 9,
+       "share_pct": 0.09
+      },
+      {
+       "floor": 32.0,
+       "ceil": 64.0,
        "count": 1,
        "share_pct": 0.01
       }
@@ -132,7 +162,7 @@
    }
   },
   "g0t4": {
-   "raw_file": "/root/repo/bench/results/publication-2026-10/raw/b05_g0t4.json",
+   "raw_file": "bench/results/publication-2026-10/raw/b05_g0t4.json",
    "argv": [
     "npx",
     "-y",
@@ -149,17 +179,17 @@
    "summary": {
     "n": 10000,
     "unit": "ms",
-    "mean": 2.407,
-    "sigma": 0.604,
-    "min": 1.297,
-    "max": 5.943,
-    "median": 2.437,
-    "p90": 3.127,
-    "p95": 3.309,
-    "p99": 3.737,
-    "cv_pct": 25.11,
-    "ci95_half": 0.012,
-    "p50": 2.437,
+    "mean": 2.63,
+    "sigma": 1.359,
+    "min": 1.438,
+    "max": 22.316,
+    "median": 2.093,
+    "p90": 4.317,
+    "p95": 5.17,
+    "p99": 7.342,
+    "cv_pct": 51.66,
+    "ci95_half": 0.027,
+    "p50": 2.093,
     "histogram": {
      "unit": "ms",
      "n": 10000,
@@ -173,20 +203,32 @@
       {
        "floor": 1.0,
        "ceil": 2.0,
-       "count": 2745,
-       "share_pct": 27.45
+       "count": 4511,
+       "share_pct": 45.11
       },
       {
        "floor": 2.0,
        "ceil": 4.0,
-       "count": 7208,
-       "share_pct": 72.08
+       "count": 4179,
+       "share_pct": 41.79
       },
       {
        "floor": 4.0,
        "ceil": 8.0,
-       "count": 47,
-       "share_pct": 0.47
+       "count": 1241,
+       "share_pct": 12.41
+      },
+      {
+       "floor": 8.0,
+       "ceil": 16.0,
+       "count": 62,
+       "share_pct": 0.62
+      },
+      {
+       "floor": 16.0,
+       "ceil": 32.0,
+       "count": 7,
+       "share_pct": 0.07
       }
      ]
     }
