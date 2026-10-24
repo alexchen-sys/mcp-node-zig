@@ -642,7 +642,7 @@ fn openPrefixDarwin(io: Io, prefix: []const u8) OpenError!fd_t {
 fn postCheckDarwin(fd: fd_t, pin: Pin) error{ PathDenied, PathEscape }!void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = fdRealPathDarwin(fd, &buf) catch |err| {
-        if (builtin.is_test) std.debug.print("F_GETPATH failed: {s}, canon='{s}'\n", .{ @errorName(err), pin.canon });
+        if (builtin.os.tag == .macos) std.debug.print("F_GETPATH failed: {s}, canon='{s}'\n", .{ @errorName(err), pin.canon });
         return error.PathEscape;
     };
     const real = buf[0..n];
@@ -650,7 +650,7 @@ fn postCheckDarwin(fd: fd_t, pin: Pin) error{ PathDenied, PathEscape }!void {
         if (pathUnderPrefix(real, d)) return error.PathDenied;
     }
     if (!std.mem.eql(u8, real, pin.canon)) {
-        if (builtin.is_test) std.debug.print("Darwin pin mismatch: real='{s}', canon='{s}'\n", .{ real, pin.canon });
+        if (builtin.os.tag == .macos) std.debug.print("Darwin pin mismatch: real='{s}', canon='{s}'\n", .{ real, pin.canon });
         return error.PathEscape;
     }
 }

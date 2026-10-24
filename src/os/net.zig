@@ -252,7 +252,6 @@ pub const ListenError = error{ AddressInUse, ListenFailed };
 /// does not block a fresh listener.
 pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.Server {
     if (comptime builtin.os.tag == .windows) {
-        ensureNetworking(io) catch return error.ListenFailed;
         return addr.listen(io, .{}) catch |err| switch (err) {
             error.AddressInUse => error.AddressInUse,
             else => error.ListenFailed,
@@ -301,11 +300,8 @@ pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.
 /// self-connect wake.
 pub fn setListenNonBlocking(handle: Handle) SetTimeoutError!void {
     if (comptime builtin.os.tag == .windows) {
-        var one: c_ulong = 1;
-        if (winsock.ioctlsocket(@ptrCast(handle), winsock.FIONBIO, &one) != 0) {
-            if (builtin.is_test) std.debug.print("FIONBIO WSA error {d}, handle type {s}\n", .{ winsock.WSAGetLastError(), @typeName(@TypeOf(handle)) });
-            return error.SocketOptionFailed;
-        }
+        // std Windows sockets are AFD handles; FIONBIO accepts only SOCKET.
+        // Hub.start uses std's blocking AFD accept on this target instead.
         return;
     }
     if (comptime builtin.os.tag == .linux) {
@@ -356,26 +352,6 @@ const winsock = struct {
     pub extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *anyopaque) c_int;
 };
 
-var winsock_mutex: std.Io.Mutex = .init;
-var winsock_ready = false;
-
-/// Raw winsock calls need their own process reference. std's Io listener
-/// does not establish one for this module. Keep the reference until process
-/// exit; Windows reclaims it with the process and concurrent std users stay
-/// valid even if they release their own reference.
-pub fn ensureNetworking(io: std.Io) error{SocketOptionFailed}!void {
-    if (comptime builtin.os.tag != .windows) return;
-    winsock_mutex.lockUncancelable(io);
-    defer winsock_mutex.unlock(io);
-    if (winsock_ready) return;
-    // WSADATA is 400 bytes on 64-bit Windows. The oversized aligned buffer
-    // avoids duplicating its version-dependent layout; only the return code
-    // is needed here.
-    var wsa_data: [512]u8 align(8) = undefined;
-    if (winsock.WSAStartup(0x0202, &wsa_data) != 0) return error.SocketOptionFailed;
-    winsock_ready = true;
-}
-
 /// Peer address from a winsock sockaddr (accept-derived).
 fn ipFromWsa(storage: *const std.os.windows.ws2_32.sockaddr.storage) std.Io.net.IpAddress {
     const ws = std.os.windows.ws2_32;
@@ -410,19 +386,8 @@ pub fn wsaPoll(fds: []WSAPOLLFD, timeout_ms: c_int) c_int {
 /// CLOEXEC, exactly like std's accept would produce.
 pub fn acceptNonBlocking(listen_fd: Handle) ?std.Io.net.Stream {
     if (comptime builtin.os.tag == .windows) {
-        var storage: std.os.windows.ws2_32.sockaddr.storage = .{ .family = 0 };
-        var len: c_int = @sizeOf(std.os.windows.ws2_32.sockaddr.storage);
-        const s = winsock.accept(@ptrCast(listen_fd), @ptrCast(&storage), &len);
-        if (s == winsock.invalid) return null; // WSAEWOULDBLOCK: queue drained
-        // A raw-accepted socket may inherit the listen socket's FIONBIO
-        // mode; force blocking — link I/O relies on blocking reads with
-        // software deadlines (see the module doc).
-        var zero: c_ulong = 0;
-        _ = winsock.ioctlsocket(s, winsock.FIONBIO, &zero);
-        return .{ .socket = .{
-            .handle = @ptrCast(s),
-            .address = ipFromWsa(&storage),
-        } };
+        // AFD handles require Server.accept(); hub uses that path directly.
+        unreachable;
     }
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);

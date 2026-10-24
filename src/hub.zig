@@ -1128,37 +1128,20 @@ fn acceptLoop(hub: *Hub, server: *Io.net.Server) void {
             }
             continue;
         }
-        // Windows: WSAPoll the listener and the pre-created wake channel:
-        // stop() lands one byte on it, so retracting this thread
-        // never needs a fresh socket. The 1 s tick is a fallback only.
-        var pfds: [2]os.net.WSAPOLLFD = .{
-            .{ .fd = server.socket.handle, .events = os.net.POLLRDNORM, .revents = 0 },
-            .{ .fd = if (hub.wake_recv) |*st| st.socket.handle else server.socket.handle, .events = if (hub.wake_recv != null) os.net.POLLRDNORM else 0, .revents = 0 },
-        };
-        if (os.net.wsaPoll(&pfds, 1000) < 0) {
-            if (!hub.stopping.load(.acquire)) os.sleepMs(ACCEPT_BACKOFF_MS);
+        // Windows std sockets are AFD handles, not Winsock SOCKETs.
+        // Use the matching backend for accept; stop() self-connects to
+        // release this blocking call before joining the thread.
+        const stream = server.accept(hub.io) catch |err| {
+            if (hub.stopping.load(.acquire)) return;
+            std.debug.print("hub accept failed: {s}\n", .{@errorName(err)});
+            os.sleepMs(ACCEPT_BACKOFF_MS);
             continue;
+        };
+        if (hub.stopping.load(.acquire)) {
+            stream.close(hub.io);
+            return;
         }
-        if (hub.stopping.load(.acquire)) return;
-        if (hub.wake_recv != null and pfds[1].revents != 0) return; // wake byte
-        if (pfds[0].revents & os.net.POLLRDNORM == 0) {
-            if (pfds[0].revents & (os.net.POLLERR | os.net.POLLHUP | os.net.POLLNVAL) != 0) {
-                std.debug.print("hub listener poll failed\n", .{});
-                os.sleepMs(ACCEPT_BACKOFF_MS);
-            }
-            continue; // tick
-        }
-        // Raw non-blocking accepts (FIONBIO listener, set in start): a
-        // queue drained between poll and accept answers null instead of
-        // parking this thread beyond the wake's reach. std's
-        // Io.net accept is never used on this socket.
-        while (os.net.acceptNonBlocking(server.socket.handle)) |stream| {
-            if (hub.stopping.load(.acquire)) {
-                stream.close(hub.io);
-                return;
-            }
-            adopt(hub, stream);
-        }
+        adopt(hub, stream);
     }
 }
 
@@ -1186,25 +1169,20 @@ pub fn start(hub: *Hub, server: *Io.net.Server) !void {
         }
     }
     const addr = try Io.net.IpAddress.parse(ep.host, ep.port);
-    // The accept loop's wake channel exists before any thread: stop() must
-    // never depend on allocating a fresh socket under teardown. POSIX uses
-    // a pipe; Windows a pre-connected loopback pair.
-    if (comptime builtin.os.tag == .windows) {
-        const loop = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        var wls = try os.net.listenTcp(hub.io, loop);
-        defer wls.deinit(hub.io); // the established pair outlives its listener
-        hub.wake_send = try wls.socket.address.connect(hub.io, .{ .mode = .stream });
-        hub.wake_recv = try wls.accept(hub.io);
-    } else {
+    // POSIX uses a pre-created pipe because acceptLoop polls it with the
+    // listener. Windows uses std's blocking AFD accept and stop() releases
+    // it with a loopback self-connect.
+    if (comptime builtin.os.tag != .windows) {
         const pair = proc.createWakePipe() orelse return error.WakePipeFailed;
         hub.wake_rfd = pair[0];
         hub.wake_wfd = pair[1];
     }
     server.* = try os.net.listenTcp(hub.io, addr); // no SO_REUSEPORT, see os.net
     server_opt = server;
-    // The accept loop polls and then accepts raw/non-blocking: the listen
-    // fd must not block between poll and accept (queue drained by a reset).
-    try os.net.setListenNonBlocking(server.socket.handle);
+    if (comptime builtin.os.tag != .windows) {
+        // Drain-after-poll must never park when a reset empties the queue.
+        try os.net.setListenNonBlocking(server.socket.handle);
+    }
     const a = try std.Thread.spawn(.{}, acceptLoop, .{ hub, server });
     hub.accept_thread = a;
     const p = try std.Thread.spawn(.{}, pinger, .{hub});
@@ -1224,15 +1202,11 @@ pub fn stop(hub: *Hub, server: ?*Io.net.Server) void {
     hub.stopping.store(true, .release);
     hub.mutex.unlock(hub.io);
     hub.killAll();
-    // Wake the parked accept without allocating anything at teardown time.
-    // POSIX: one byte into the pre-created wake pipe (non-blocking; a full
-    // pipe means "already signaled"). Windows: one byte over the
-    // pre-connected loopback pair; the self-connect remains only as the
-    // fallback for a hub whose wake-channel creation failed.
+    // POSIX writes to the pre-created wake pipe. Windows releases std's
+    // blocking AFD accept with one loopback connection; acceptLoop closes
+    // that stream after observing `stopping`.
     if (comptime builtin.os.tag == .windows) {
-        if (hub.wake_send) |*st| {
-            os.net.socketWriteAll(st.socket.handle, "!", 1000) catch {};
-        } else if (server) |srv| {
+        if (server) |srv| {
             if (srv.socket.address.connect(hub.io, .{ .mode = .stream })) |st2| {
                 st2.close(hub.io);
             } else |_| {}

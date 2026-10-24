@@ -59,7 +59,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = env_state.process_environ });
     defer threaded.deinit();
     const io = threaded.io();
-    try os.net.ensureNetworking(io);
 
     // Darwin CLOEXEC fork gate (os/proc.zig): install the pthread_atfork
     // hooks before any connection/session thread can race pipe creation
