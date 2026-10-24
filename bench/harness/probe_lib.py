@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, __file__.rsplit("/", 2)[0] + "/lib")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import stats  # noqa: E402
 
 PROC_VERSION = "2024-11-05"

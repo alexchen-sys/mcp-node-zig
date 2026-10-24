@@ -491,7 +491,6 @@ fn openSocketAfd(family: windows.ws2_32.ADDRESS_FAMILY) !windows.HANDLE {
         @sizeOf(windows.AFD.OPEN_PACKET.FULL_EA_INFORMATION),
     );
     if (status != .SUCCESS) {
-        if (builtin.is_test) std.debug.print("AFD endpoint NTSTATUS 0x{x}\n", .{@intFromEnum(status)});
         return error.SocketOptionFailed;
     }
     return handle;
@@ -505,18 +504,14 @@ fn acceptWindowsAfd(listen_fd: Handle) ?std.Io.net.Stream {
         remote: std.Io.Threaded.PosixAddress,
     };
     var storage: Storage = undefined;
-    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.WAIT_FOR_LISTEN, null, std.mem.asBytes(&storage), null) catch |err| {
-        if (builtin.is_test) std.debug.print("AFD wait failed: {s}\n", .{@errorName(err)});
-        return null;
-    };
+    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.WAIT_FOR_LISTEN, null, std.mem.asBytes(&storage), null) catch return null;
     const accepted = openSocketAfd(storage.remote.any.family) catch return null;
     var info = windows.AFD.ACCEPT_INFO{
         .UseSAN = .FALSE,
         .Sequence = storage.info.Sequence,
         .AcceptHandle = accepted,
     };
-    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.ACCEPT, std.mem.asBytes(&info), null, null) catch |err| {
-        if (builtin.is_test) std.debug.print("AFD accept failed: {s}\n", .{@errorName(err)});
+    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.ACCEPT, std.mem.asBytes(&info), null, null) catch {
         windows.CloseHandle(accepted);
         return null;
     };
@@ -535,10 +530,7 @@ fn afdSocketIoOut(handle: windows.HANDLE, code: windows.CTL_CODE, in: ?[]const u
     switch (status) {
         .SUCCESS => return iosb.Information,
         .PENDING => {},
-        else => |s| {
-            if (builtin.is_test) std.debug.print("AFD ioctl NTSTATUS 0x{x}\n", .{@intFromEnum(s)});
-            return windows.unexpectedStatus(s);
-        },
+        else => |s| return windows.unexpectedStatus(s),
     }
     const timeout: ?windows.LARGE_INTEGER = if (timeout_ms) |ms| -@as(windows.LARGE_INTEGER, @intCast(ms * 10_000)) else null;
     switch (windows.ntdll.NtWaitForSingleObject(event, .FALSE, if (timeout) |*t| t else null)) {
@@ -551,10 +543,7 @@ fn afdSocketIoOut(handle: windows.HANDLE, code: windows.CTL_CODE, in: ?[]const u
         },
         else => |s| return windows.unexpectedStatus(s),
     }
-    if (iosb.u.Status != .SUCCESS) {
-        if (builtin.is_test) std.debug.print("AFD completion NTSTATUS 0x{x}\n", .{@intFromEnum(iosb.u.Status)});
-        return windows.unexpectedStatus(iosb.u.Status);
-    }
+    if (iosb.u.Status != .SUCCESS) return windows.unexpectedStatus(iosb.u.Status);
     return iosb.Information;
 }
 

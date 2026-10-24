@@ -20,11 +20,8 @@ class CopyPath(unittest.TestCase):
         self.root = self.node.root
 
     def call(self, **args):
-        result = self.node.tool('copy_path', dict(source=str(self.root / 'src'),
-                                                destination=str(self.root / 'dst'), **args))
-        if result.get('error') == 'PathEscape':
-            print(self.node.logs(), flush=True)
-        return result
+        return self.node.tool('copy_path', dict(source=str(self.root / 'src'),
+                                               destination=str(self.root / 'dst'), **args))
 
     def clean_stage(self):
         self.assertFalse(list(self.root.glob('.mcpnz-copy-*')))
@@ -150,8 +147,6 @@ class CopyPolicyAudit(unittest.TestCase):
             node.secret = token.read_text()
             try:
                 ok = node.tool('copy_path', {'source': str(src / 'a'), 'destination': str(dst / 'a')})
-                if ok.get('error') == 'PathEscape':
-                    print(node.logs(), flush=True)
                 self.assertTrue(ok['ok'], ok)
                 denied = node.tool('copy_path', {'source': str(dst / 'a'), 'destination': str(dst / 'b')})
                 self.assertEqual(denied['error'], 'PolicyDenied')
