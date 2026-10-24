@@ -579,7 +579,6 @@ fn openPinnedLinux(io: Io, pin: Pin, access: Access, wopts: WriteOpts) OpenError
 
 /// fcntl(2) with F_GETPATH (Darwin): writes the vnode path of `fd`.
 const F_GETPATH: c_int = 50;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: ?[*]u8) callconv(.c) c_int;
 
 extern "c" fn mkdirat(dirfd: c_int, path: [*:0]const u8, mode: std.c.mode_t) callconv(.c) c_int;
 
@@ -604,8 +603,8 @@ fn decodeGetPath(rc: c_int, buf: []const u8) error{PathEscape}!usize {
 fn fdRealPathDarwin(fd: fd_t, buf: *[std.fs.max_path_bytes]u8) !usize {
     comptime if (std.fs.max_path_bytes < darwin_max_path_len)
         @compileError("F_GETPATH buffer below MAXPATHLEN: bump the call-site buffers");
-    const rc = fcntl(@intCast(fd), F_GETPATH, buf[0..].ptr);
-    if (builtin.os.tag == .macos) std.debug.print("F_GETPATH raw: fd={d}, rc={d}, errno={d}\n", .{ fd, rc, std.c._errno().* });
+    const rc = std.c.fcntl(@intCast(fd), F_GETPATH, buf[0..].ptr);
+    if (builtin.os.tag == .macos and rc != 0) std.debug.print("F_GETPATH raw: fd={d}, rc={d}, errno={d}\n", .{ fd, rc, std.c._errno().* });
     return decodeGetPath(rc, buf);
 }
 

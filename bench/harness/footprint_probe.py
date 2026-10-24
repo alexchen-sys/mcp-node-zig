@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_lib as pl  # noqa: E402
 
 
