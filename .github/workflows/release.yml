@@ -136,7 +136,7 @@ jobs:
           Copy-Item "zig-out/bin/${{ matrix.binary }}", "LICENSE", "README.md" "dist/$pkg/"
           Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
           $h = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
-          "$h  $pkg.zip" | Out-File -FilePath "dist/$pkg.zip.sha256" -Encoding ascii -NoNewline
+          "$h  $pkg.zip" | Out-File -FilePath "dist/$pkg.zip.sha256" -Encoding ascii
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -169,6 +169,15 @@ jobs:
           set -euo pipefail
           cat ./*.sha256 > SHA256SUMS.txt
           rm ./*.sha256
+          python3 - <<'PY'
+          from pathlib import Path
+          lines = Path("SHA256SUMS.txt").read_text().splitlines()
+          assert len(lines) == 8, f"expected 8 release checksums, got {len(lines)}"
+          for line in lines:
+              digest, name = line.split("  ", 1)
+              assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest), line
+              assert Path(name).is_file(), name
+          PY
           cat SHA256SUMS.txt
 
       - name: Install cosign
