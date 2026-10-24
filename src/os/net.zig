@@ -302,7 +302,10 @@ pub fn listenTcp(io: std.Io, addr: std.Io.net.IpAddress) ListenError!std.Io.net.
 pub fn setListenNonBlocking(handle: Handle) SetTimeoutError!void {
     if (comptime builtin.os.tag == .windows) {
         var one: c_ulong = 1;
-        if (winsock.ioctlsocket(@ptrCast(handle), winsock.FIONBIO, &one) != 0) return error.SocketOptionFailed;
+        if (winsock.ioctlsocket(@ptrCast(handle), winsock.FIONBIO, &one) != 0) {
+            if (builtin.is_test) std.debug.print("FIONBIO WSA error {d}, handle type {s}\n", .{ winsock.WSAGetLastError(), @typeName(@TypeOf(handle)) });
+            return error.SocketOptionFailed;
+        }
         return;
     }
     if (comptime builtin.os.tag == .linux) {
@@ -349,6 +352,7 @@ const winsock = struct {
     pub const FIONBIO: c_long = -2147195266; // 0x8004667E as signed long
     pub extern "ws2_32" fn accept(s: std.os.windows.HANDLE, addr: ?*ws.sockaddr, addrlen: ?*c_int) std.os.windows.HANDLE;
     pub extern "ws2_32" fn ioctlsocket(s: std.os.windows.HANDLE, cmd: c_long, argp: *c_ulong) c_int;
+    pub extern "ws2_32" fn WSAGetLastError() c_int;
     pub extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *anyopaque) c_int;
 };
 
