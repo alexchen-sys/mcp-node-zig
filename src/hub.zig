@@ -2030,8 +2030,11 @@ test "hub stop retracts infrastructure threads and closes the listener" {
     try start(&fx.hub, &server);
     try testing.expect(fx.hub.accept_thread != null);
     try testing.expect(fx.hub.pinger_thread != null);
-    // The accept loop's wake does not depend on allocating a socket.
-    try testing.expect(fx.hub.wake_wfd != null);
+    // POSIX has a dedicated wake pipe; Windows closes the AFD listener
+    // to retract accept during stop.
+    if (comptime builtin.os.tag != .windows) {
+        try testing.expect(fx.hub.wake_wfd != null);
+    }
     const bound = server.socket.address;
 
     // The startup-rollback entry point: threads join, the listener closes.

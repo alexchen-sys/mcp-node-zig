@@ -531,9 +531,7 @@ fn afdSocketIoOut(handle: windows.HANDLE, code: windows.CTL_CODE, in: ?[]const u
     }
     defer windows.CloseHandle(event);
     var iosb: windows.IO_STATUS_BLOCK = undefined;
-    const status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code,
-        if (in) |b| b.ptr else null, if (in) |b| @intCast(b.len) else 0,
-        if (out) |b| b.ptr else null, if (out) |b| @intCast(b.len) else 0);
+    const status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code, if (in) |b| b.ptr else null, if (in) |b| @intCast(b.len) else 0, if (out) |b| b.ptr else null, if (out) |b| @intCast(b.len) else 0);
     switch (status) {
         .SUCCESS => return iosb.Information,
         .PENDING => {},
