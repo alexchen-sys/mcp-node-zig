@@ -50,7 +50,7 @@ def wait_dead(pid, timeout=10.0):
     while time.time() < deadline:
         try:
             stat = Path('/proc/%d/stat' % pid).read_bytes()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return True
         end = stat.rindex(b')')
         state = stat[end + 2:end + 3]
