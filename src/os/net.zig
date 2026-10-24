@@ -553,3 +553,29 @@ fn socketOptionAfd(handle: windows.HANDLE, level: i32, opt_name: u32, opt_val: [
     };
     _ = try afdSocketIo(handle, windows.IOCTL.AFD.SOCKOPT, &info, null);
 }
+
+fn testNonblock(handle: Handle) !bool {
+    if (comptime builtin.os.tag == .linux) {
+        const flags = std.os.linux.fcntl(handle, std.os.linux.F.GETFL, 0);
+        if (std.os.linux.errno(flags) != .SUCCESS) return error.SocketOptionFailed;
+        return flags & (1 << @bitOffsetOf(std.os.linux.O, "NONBLOCK")) != 0;
+    }
+    const flags = std.c.fcntl(handle, std.c.F.GETFL, @as(c_int, 0));
+    if (flags == -1) return error.SocketOptionFailed;
+    return flags & (1 << @bitOffsetOf(std.c.O, "NONBLOCK")) != 0;
+}
+
+test "accepted POSIX sockets stay blocking on a nonblocking listener" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listenTcp(io, loopback);
+    defer listener.deinit(io);
+    try setListenNonBlocking(listener.socket.handle);
+
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const accepted = acceptNonBlocking(listener.socket.handle) orelse return error.AcceptFailed;
+    defer accepted.close(io);
+    try std.testing.expect(!(try testNonblock(accepted.socket.handle)));
+}
