@@ -108,7 +108,7 @@ class Node:
 
     def __init__(self, **config):
         self.temp = tempfile.TemporaryDirectory(prefix='mcp-regress-')
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.secret = secrets.token_hex(24)
         auth = self.root / 'auth-fixture'
         auth.write_text(self.secret)

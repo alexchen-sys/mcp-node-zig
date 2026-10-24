@@ -127,7 +127,7 @@ class CopyPath(unittest.TestCase):
 class CopyPolicyAudit(unittest.TestCase):
     def test_dual_roots_descendant_denies_and_audit(self):
         with tempfile.TemporaryDirectory(prefix='mcp-copy-policy-') as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             src, dst = root / 'read', root / 'write'
             src.mkdir(); dst.mkdir()
             (src / 'a').write_text('never log this content')

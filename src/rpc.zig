@@ -649,7 +649,7 @@ test "rpc notification tools/call executes the method and answers 202" {
     try std.testing.expectEqual(@as(u16, 202), note_e.status);
     try std.testing.expectEqual(@as(usize, 0), note_e.body.len);
     const n2 = try tmp.dir.readFileAlloc(io, "n2.txt", arena, .limited(64));
-    try std.testing.expectEqualStrings("NOTIFIED", n2);
+    try std.testing.expectEqualStrings("NOTIFIED", std.mem.trimEnd(u8, n2, "\r\n"));
 
     // Notifications with no executor side effects keep the 202/empty shape.
     const note_ping = try handleRpc(arena, io, &cfg, "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
