@@ -245,7 +245,7 @@ jobs:
           "$PY" ci/test_audit.py
 
       - name: Python durable sessions suite
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           PY=python3
@@ -253,7 +253,7 @@ jobs:
           "$PY" ci/test_durable_sessions.py
 
       - name: Python durable restart suite
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           PY=python3

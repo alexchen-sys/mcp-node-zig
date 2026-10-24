@@ -1311,11 +1311,11 @@ test "policy: normalizeLexical resolves traversal and collapses" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectEqualStrings("/a/b", try normalizeLexical(arena, "/a/x/../b"));
-    try testing.expectEqualStrings("/a/b", try normalizeLexical(arena, "/a/./b//"));
-    try testing.expectEqualStrings("/", try normalizeLexical(arena, "/.."));
-    try testing.expectEqualStrings("/etc/passwd", try normalizeLexical(arena, "/etc/../etc/passwd"));
-    try testing.expectEqualStrings("/a", try normalizeLexical(arena, "/a/b/.."));
+    try testing.expectEqualStrings("/a/b", try normalizeLexicalSty(arena, "/a/x/../b", .posix));
+    try testing.expectEqualStrings("/a/b", try normalizeLexicalSty(arena, "/a/./b//", .posix));
+    try testing.expectEqualStrings("/", try normalizeLexicalSty(arena, "/..", .posix));
+    try testing.expectEqualStrings("/etc/passwd", try normalizeLexicalSty(arena, "/etc/../etc/passwd", .posix));
+    try testing.expectEqualStrings("/a", try normalizeLexicalSty(arena, "/a/b/..", .posix));
 }
 
 test "policy: pathHasPrefix is segment aligned" {
@@ -1702,6 +1702,8 @@ test "policy: argument-type grammar matches the tool layer" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = Io.Threaded.global_single_threaded.io();
+    const write_root = if (builtin.os.tag == .windows) "C:\\srv" else "/srv";
+    const write_file = if (builtin.os.tag == .windows) "C:\\srv\\f" else "/srv/f";
 
     const pol = TokenPolicy{
         .file = "f",
@@ -1711,7 +1713,7 @@ test "policy: argument-type grammar matches the tool layer" {
         .max_timeout_s = 10,
         .write_max_mode = 0o644,
         .read_paths = &.{},
-        .write_paths = &.{"/srv"},
+        .write_paths = &.{write_root},
         .read_deny = &.{},
         .write_deny = &.{},
         .cwd_deny = &.{},
@@ -1721,13 +1723,13 @@ test "policy: argument-type grammar matches the tool layer" {
     // mode as an integral float converts and is checked (420.0 == 0o644 ok;
     // 2533.0 == 0o4755 over the cap -> denied).
     var args_ok: std.json.ObjectMap = .empty;
-    try args_ok.put(arena, "path", .{ .string = "/srv/f" });
+    try args_ok.put(arena, "path", .{ .string = write_file });
     try args_ok.put(arena, "content_b64", .{ .string = "aGk=" });
     try args_ok.put(arena, "mode", .{ .float = 420.0 });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_ok }) == null);
 
     var args_setuid: std.json.ObjectMap = .empty;
-    try args_setuid.put(arena, "path", .{ .string = "/srv/f" });
+    try args_setuid.put(arena, "path", .{ .string = write_file });
     try args_setuid.put(arena, "content_b64", .{ .string = "aGk=" });
     try args_setuid.put(arena, "mode", .{ .float = 2533.0 });
     if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_setuid })) |d| {
@@ -1736,7 +1738,7 @@ test "policy: argument-type grammar matches the tool layer" {
 
     // negative mode: denied, never a @intCast panic.
     var args_neg: std.json.ObjectMap = .empty;
-    try args_neg.put(arena, "path", .{ .string = "/srv/f" });
+    try args_neg.put(arena, "path", .{ .string = write_file });
     try args_neg.put(arena, "content_b64", .{ .string = "aGk=" });
     try args_neg.put(arena, "mode", .{ .integer = -1 });
     if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_neg })) |d| {
@@ -1745,7 +1747,7 @@ test "policy: argument-type grammar matches the tool layer" {
 
     // wrong-type mode: bad_argument_type, not a silent skip.
     var args_str: std.json.ObjectMap = .empty;
-    try args_str.put(arena, "path", .{ .string = "/srv/f" });
+    try args_str.put(arena, "path", .{ .string = write_file });
     try args_str.put(arena, "content_b64", .{ .string = "aGk=" });
     try args_str.put(arena, "mode", .{ .string = "0644" });
     if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_str })) |d| {
@@ -1755,7 +1757,7 @@ test "policy: argument-type grammar matches the tool layer" {
     // omitted mode: the tool default 0644 is cap-checked; a 0600 cap
     // refuses an omitted mode, 0644 passes.
     var args_nomode: std.json.ObjectMap = .empty;
-    try args_nomode.put(arena, "path", .{ .string = "/srv/f" });
+    try args_nomode.put(arena, "path", .{ .string = write_file });
     try args_nomode.put(arena, "content_b64", .{ .string = "aGk=" });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_nomode }) == null);
     var pol600 = pol;
@@ -1769,7 +1771,7 @@ test "policy: argument-type grammar matches the tool layer" {
     // against the cap instead of refusing with bad_argument_type: that
     // default is allowed under a 0644 cap, refused under 0600.
     var args_mode_null: std.json.ObjectMap = .empty;
-    try args_mode_null.put(arena, "path", .{ .string = "/srv/f" });
+    try args_mode_null.put(arena, "path", .{ .string = write_file });
     try args_mode_null.put(arena, "content_b64", .{ .string = "aGk=" });
     try args_mode_null.put(arena, "mode", Value.null);
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_mode_null }) == null);
@@ -1782,22 +1784,22 @@ test "policy: argument-type grammar matches the tool layer" {
     // and without a policy file); the gate only refuses
     // present-but-wrong-typed content fields.
     var args_text: std.json.ObjectMap = .empty;
-    try args_text.put(arena, "path", .{ .string = "/srv/f" });
+    try args_text.put(arena, "path", .{ .string = write_file });
     try args_text.put(arena, "content", .{ .string = "plain" });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_text }) == null);
 
     var args_both: std.json.ObjectMap = .empty;
-    try args_both.put(arena, "path", .{ .string = "/srv/f" });
+    try args_both.put(arena, "path", .{ .string = write_file });
     try args_both.put(arena, "content", .{ .string = "plain" });
     try args_both.put(arena, "content_b64", .{ .string = "aGk=" });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_both }) == null);
 
     var args_neither: std.json.ObjectMap = .empty;
-    try args_neither.put(arena, "path", .{ .string = "/srv/f" });
+    try args_neither.put(arena, "path", .{ .string = write_file });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_neither }) == null);
 
     var args_badtype: std.json.ObjectMap = .empty;
-    try args_badtype.put(arena, "path", .{ .string = "/srv/f" });
+    try args_badtype.put(arena, "path", .{ .string = write_file });
     try args_badtype.put(arena, "content", .{ .integer = 7 });
     if (checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_badtype })) |d| {
         try testing.expectEqualStrings("bad_argument_type", d.reason_tag);
@@ -1806,7 +1808,7 @@ test "policy: argument-type grammar matches the tool layer" {
 
     // Explicit null content counts as absent: content_b64 alone passes.
     var args_null_text: std.json.ObjectMap = .empty;
-    try args_null_text.put(arena, "path", .{ .string = "/srv/f" });
+    try args_null_text.put(arena, "path", .{ .string = write_file });
     try args_null_text.put(arena, "content", Value.null);
     try args_null_text.put(arena, "content_b64", .{ .string = "aGk=" });
     try testing.expect(checkCall(arena, io, undefined, &pol, "write_file", .{ .object = args_null_text }) == null);

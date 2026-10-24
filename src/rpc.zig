@@ -4,6 +4,7 @@
 //! in main.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
@@ -618,12 +619,21 @@ test "rpc notification tools/call executes the method and answers 202" {
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try arena.dupe(u8, buf[0..try tmp.dir.realPathFile(io, ".", &buf)]);
+    // JSON strings cannot contain raw Windows backslashes (notably \t).
+    // Forward slashes are valid Windows paths and keep the request literal.
+    const json_root = if (builtin.os.tag == .windows) blk: {
+        const p = try arena.dupe(u8, root);
+        for (p) |*c| if (c.* == '\\') {
+            c.* = '/';
+        };
+        break :blk p;
+    } else root;
 
     // write_file as a notification: the file must materialize even though
     // the transport answer is 202 with an empty body (the result is
     // discarded, the execution is not). Answering 202 before the dispatch
     // would report success with the method never executed.
-    const note_write = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"{s}/note.txt\",\"content_b64\":\"aGk=\"}}}}}}", .{root});
+    const note_write = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"{s}/note.txt\",\"content_b64\":\"aGk=\"}}}}}}", .{json_root});
     const note_w = try handleRpc(arena, io, &cfg, note_write);
     try std.testing.expectEqual(@as(u16, 202), note_w.status);
     try std.testing.expectEqual(@as(usize, 0), note_w.body.len);
@@ -631,7 +641,10 @@ test "rpc notification tools/call executes the method and answers 202" {
     try std.testing.expectEqualStrings("hi", written);
 
     // exec as a notification: side effect observable, answer still 202.
-    const note_exec = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{{\"name\":\"exec\",\"arguments\":{{\"argv\":[\"/bin/sh\",\"-c\",\"printf NOTIFIED > {s}/n2.txt\"]}}}}}}", .{root});
+    const note_exec = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{{\"name\":\"exec\",\"arguments\":{{\"argv\":[\"cmd.exe\",\"/d\",\"/c\",\"echo NOTIFIED>{s}/n2.txt\"]}}}}}}", .{json_root})
+    else
+        try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{{\"name\":\"exec\",\"arguments\":{{\"argv\":[\"/bin/sh\",\"-c\",\"printf NOTIFIED > {s}/n2.txt\"]}}}}}}", .{root});
     const note_e = try handleRpc(arena, io, &cfg, note_exec);
     try std.testing.expectEqual(@as(u16, 202), note_e.status);
     try std.testing.expectEqual(@as(usize, 0), note_e.body.len);
@@ -645,7 +658,7 @@ test "rpc notification tools/call executes the method and answers 202" {
 
     // Regular requests are not regressed: same write_file WITH an id
     // answers 200 with a serialized result.
-    const req_write = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"{s}/note2.txt\",\"content_b64\":\"eW8=\"}}}}}}", .{root});
+    const req_write = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"{s}/note2.txt\",\"content_b64\":\"eW8=\"}}}}}}", .{json_root});
     const req_w = try handleRpc(arena, io, &cfg, req_write);
     try std.testing.expectEqual(@as(u16, 200), req_w.status);
     const req_parsed = try std.json.parseFromSliceLeaky(Value, arena, req_w.body, .{});
