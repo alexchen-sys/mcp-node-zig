@@ -386,8 +386,7 @@ pub fn wsaPoll(fds: []WSAPOLLFD, timeout_ms: c_int) c_int {
 /// CLOEXEC, exactly like std's accept would produce.
 pub fn acceptNonBlocking(listen_fd: Handle) ?std.Io.net.Stream {
     if (comptime builtin.os.tag == .windows) {
-        // AFD handles require Server.accept(); hub uses that path directly.
-        unreachable;
+        return acceptWindowsAfd(listen_fd);
     }
     var storage: std.Io.Threaded.PosixAddress = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
@@ -466,6 +465,100 @@ pub fn shutdownSend(handle: Handle) void {
 const max_ioctl_chunk: usize = 1 << 30;
 
 const windows = std.os.windows;
+
+fn openSocketAfd(family: windows.ws2_32.ADDRESS_FAMILY) !windows.HANDLE {
+    var handle: windows.HANDLE = undefined;
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    const status = windows.ntdll.NtCreateFile(
+        &handle,
+        .{ .STANDARD = .{ .RIGHTS = .{ .WRITE_DAC = true }, .SYNCHRONIZE = true }, .GENERIC = .{ .WRITE = true, .READ = true } },
+        &.{ .ObjectName = @constCast(&windows.UNICODE_STRING.init(windows.AFD.DEVICE_NAME ++ .{ '\\', 'E', 'n', 'd', 'p', 'o', 'i', 'n', 't' })) },
+        &iosb,
+        null,
+        .{},
+        .{ .READ = true, .WRITE = true },
+        .OPEN_IF,
+        .{ .IO = .ASYNCHRONOUS },
+        &windows.AFD.OPEN_PACKET.FULL_EA_INFORMATION{ .Value = .{
+            .EndpointType = .{ .CONNECTIONLESS = false, .MESSAGEMODE = false, .RAW = false },
+            .GroupID = 0,
+            .AddressFamily = family,
+            .SocketType = windows.ws2_32.SOCK.STREAM,
+            .Protocol = windows.ws2_32.IPPROTO.TCP,
+            .TransportDeviceNameLength = 0,
+            .TransportDeviceName = undefined,
+        } },
+        @sizeOf(windows.AFD.OPEN_PACKET.FULL_EA_INFORMATION),
+    );
+    if (status != .SUCCESS) {
+        if (builtin.is_test) std.debug.print("AFD endpoint NTSTATUS 0x{x}\n", .{@intFromEnum(status)});
+        return error.SocketOptionFailed;
+    }
+    return handle;
+}
+
+/// AFD's three-step accept, matching Zig 0.16's Threaded backend. This keeps
+/// accepted handles compatible with the AFD read/write/shutdown helpers.
+fn acceptWindowsAfd(listen_fd: Handle) ?std.Io.net.Stream {
+    const Storage = extern struct {
+        info: windows.AFD.LISTEN_RESPONSE_INFO,
+        remote: std.Io.Threaded.PosixAddress,
+    };
+    var storage: Storage = undefined;
+    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.WAIT_FOR_LISTEN, null, std.mem.asBytes(&storage), null) catch |err| {
+        if (builtin.is_test) std.debug.print("AFD wait failed: {s}\n", .{@errorName(err)});
+        return null;
+    };
+    const accepted = openSocketAfd(storage.remote.any.family) catch return null;
+    var info = windows.AFD.ACCEPT_INFO{
+        .UseSAN = .FALSE,
+        .Sequence = storage.info.Sequence,
+        .AcceptHandle = accepted,
+    };
+    _ = afdSocketIoOut(listen_fd, windows.IOCTL.AFD.ACCEPT, std.mem.asBytes(&info), null, null) catch |err| {
+        if (builtin.is_test) std.debug.print("AFD accept failed: {s}\n", .{@errorName(err)});
+        windows.CloseHandle(accepted);
+        return null;
+    };
+    return .{ .socket = .{ .handle = accepted, .address = std.Io.Threaded.addressFromPosix(&storage.remote) } };
+}
+
+fn afdSocketIoOut(handle: windows.HANDLE, code: windows.CTL_CODE, in: ?[]const u8, out: ?[]u8, timeout_ms: ?u64) !usize {
+    var event: windows.HANDLE = undefined;
+    switch (windows.ntdll.NtCreateEvent(&event, windows.ACCESS_MASK.Specific.Event.ALL_ACCESS, null, .Notification, .FALSE)) {
+        .SUCCESS => {},
+        else => |status| return windows.unexpectedStatus(status),
+    }
+    defer windows.CloseHandle(event);
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    const status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code,
+        if (in) |b| b.ptr else null, if (in) |b| @intCast(b.len) else 0,
+        if (out) |b| b.ptr else null, if (out) |b| @intCast(b.len) else 0);
+    switch (status) {
+        .SUCCESS => return iosb.Information,
+        .PENDING => {},
+        else => |s| {
+            if (builtin.is_test) std.debug.print("AFD ioctl NTSTATUS 0x{x}\n", .{@intFromEnum(s)});
+            return windows.unexpectedStatus(s);
+        },
+    }
+    const timeout: ?windows.LARGE_INTEGER = if (timeout_ms) |ms| -@as(windows.LARGE_INTEGER, @intCast(ms * 10_000)) else null;
+    switch (windows.ntdll.NtWaitForSingleObject(event, .FALSE, if (timeout) |*t| t else null)) {
+        .SUCCESS => {},
+        .TIMEOUT => {
+            var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
+            _ = windows.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+            _ = windows.ntdll.NtWaitForSingleObject(event, .FALSE, null);
+            return error.Timeout;
+        },
+        else => |s| return windows.unexpectedStatus(s),
+    }
+    if (iosb.u.Status != .SUCCESS) {
+        if (builtin.is_test) std.debug.print("AFD completion NTSTATUS 0x{x}\n", .{@intFromEnum(iosb.u.Status)});
+        return windows.unexpectedStatus(iosb.u.Status);
+    }
+    return iosb.Information;
+}
 
 /// Issue one overlapped AFD ioctl against a socket handle and wait for it
 /// with an optional deadline. Returns the number of transferred bytes

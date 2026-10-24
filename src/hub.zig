@@ -1128,12 +1128,9 @@ fn acceptLoop(hub: *Hub, server: *Io.net.Server) void {
             }
             continue;
         }
-        // Windows std sockets are AFD handles, not Winsock SOCKETs.
-        // Use the matching backend for accept; stop() self-connects to
-        // release this blocking call before joining the thread.
-        const stream = server.accept(hub.io) catch |err| {
+        // Windows AFD cancellation releases the pending accept in stop().
+        const stream = os.net.acceptNonBlocking(server.socket.handle) orelse {
             if (hub.stopping.load(.acquire)) return;
-            std.debug.print("hub accept failed: {s}\n", .{@errorName(err)});
             os.sleepMs(ACCEPT_BACKOFF_MS);
             continue;
         };
@@ -1202,15 +1199,10 @@ pub fn stop(hub: *Hub, server: ?*Io.net.Server) void {
     hub.stopping.store(true, .release);
     hub.mutex.unlock(hub.io);
     hub.killAll();
-    // POSIX writes to the pre-created wake pipe. Windows releases std's
-    // blocking AFD accept with one loopback connection; acceptLoop closes
-    // that stream after observing `stopping`.
+    // POSIX writes to the pre-created wake pipe. Windows cancels the
+    // listener's pending AFD accept before joining its thread.
     if (comptime builtin.os.tag == .windows) {
-        if (server) |srv| {
-            if (srv.socket.address.connect(hub.io, .{ .mode = .stream })) |st2| {
-                st2.close(hub.io);
-            } else |_| {}
-        }
+        if (server) |srv| srv.deinit(hub.io);
     } else if (hub.wake_wfd) |wfd| {
         var byte = [_]u8{1};
         os.writeAllFd(wfd, &byte) catch {};
@@ -1229,7 +1221,9 @@ pub fn stop(hub: *Hub, server: ?*Io.net.Server) void {
     // every borrower of hub/cfg/io exits on its own. A deadline here would
     // only authorize freeing state a live thread still borrows.
     while (hub.threads.load(.acquire) != 0) os.sleepMs(5);
-    if (server) |srv| srv.deinit(hub.io);
+    if (server) |srv| {
+        if (comptime builtin.os.tag != .windows) srv.deinit(hub.io);
+    }
     if (comptime builtin.os.tag == .windows) {
         if (hub.wake_send) |*st| {
             st.close(hub.io);

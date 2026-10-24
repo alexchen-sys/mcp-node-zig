@@ -605,6 +605,7 @@ fn fdRealPathDarwin(fd: fd_t, buf: *[std.fs.max_path_bytes]u8) !usize {
     comptime if (std.fs.max_path_bytes < darwin_max_path_len)
         @compileError("F_GETPATH buffer below MAXPATHLEN: bump the call-site buffers");
     const rc = fcntl(@intCast(fd), F_GETPATH, buf[0..].ptr);
+    if (builtin.os.tag == .macos) std.debug.print("F_GETPATH raw: fd={d}, rc={d}, errno={d}\n", .{ fd, rc, std.c._errno().* });
     return decodeGetPath(rc, buf);
 }
 
